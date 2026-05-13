@@ -19,6 +19,7 @@ ROW_OFFSET="${AIR_ROW_OFFSET:-2}"
 COL_OFFSET="${AIR_COL_OFFSET:-0}"
 HERD_ROWS="${AIR_HERD_ROWS:-1}"
 HERD_COLS="${AIR_HERD_COLS:-1}"
+STACK_SIZE="${AIR_STACK_SIZE:-1024}"
 
 AIR_OPT_DIAG_FLAGS=()
 if [[ "${AIR_VERBOSE_DIAGNOSTICS:-0}" != "1" ]]; then
@@ -54,13 +55,11 @@ check_count_ge() {
   echo "ok: $label count $actual >= $expected"
 }
 
-compile_air_fixture() {
+lower_air_fixture_to_dma() {
   local input="$1"
   local stem="$2"
 
   DMA_IR="$OUT_DIR/$stem.dma.mlir"
-  CHANNEL_IR="$OUT_DIR/$stem.channel.mlir"
-  AIE_IR="$OUT_DIR/$stem.aie.mlir"
 
   air-opt "${AIR_OPT_DIAG_FLAGS[@]}" "$input" \
     --air-par-to-launch='depth=0 has-air-segment=true' \
@@ -73,8 +72,17 @@ compile_air_fixture() {
 
   check_contains "$DMA_IR" 'air\.herd' 'air.herd after parallel-to-herd'
   check_contains "$DMA_IR" 'air\.dma_memcpy_nd' 'air.dma_memcpy_nd after copy lowering'
+}
 
-  air-opt "${AIR_OPT_DIAG_FLAGS[@]}" "$DMA_IR" \
+compile_air_dma_fixture() {
+  local input="$1"
+  local stem="$2"
+
+  DMA_IR="$input"
+  CHANNEL_IR="$OUT_DIR/$stem.channel.mlir"
+  AIE_IR="$OUT_DIR/$stem.aie.mlir"
+
+  air-opt "${AIR_OPT_DIAG_FLAGS[@]}" "$input" \
     --air-dependency \
     --air-dma-to-channel \
     --canonicalize \
@@ -86,7 +94,7 @@ compile_air_fixture() {
   check_contains "$CHANNEL_IR" 'air\.channel\.get' 'air.channel.get after channel lowering'
 
   air-opt "${AIR_OPT_DIAG_FLAGS[@]}" "$CHANNEL_IR" \
-    --air-to-aie="device=$DEVICE row-offset=$ROW_OFFSET col-offset=$COL_OFFSET" \
+    --air-to-aie="device=$DEVICE row-offset=$ROW_OFFSET col-offset=$COL_OFFSET stack-size=$STACK_SIZE emit-while-loop=true" \
     --canonicalize \
     --cse \
     -o "$AIE_IR"
@@ -98,4 +106,12 @@ compile_air_fixture() {
   echo "  $DMA_IR"
   echo "  $CHANNEL_IR"
   echo "  $AIE_IR"
+}
+
+compile_air_fixture() {
+  local input="$1"
+  local stem="$2"
+
+  lower_air_fixture_to_dma "$input" "$stem"
+  compile_air_dma_fixture "$DMA_IR" "$stem"
 }

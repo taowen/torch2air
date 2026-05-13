@@ -2,6 +2,7 @@
 .cache/
 __pycache__/
 *.py[cod]
+*.egg-info/
 
 # Generated AIR spike outputs.
 examples/amd_aie_experiments/generated/

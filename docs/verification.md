@@ -105,7 +105,7 @@ Verified checks:
   `PASS!`.
 
 Conclusion: AIR can preserve an explicit multi-copy tile schedule well enough
-for `AirVariant` templates to control DMA order.
+for tiled MLIR templates to control DMA order before lowering.
 
 ## Spike 4: Double Buffering Skeleton
 
@@ -159,8 +159,169 @@ Verified checks:
   `PASS!`.
 
 Conclusion: packed Q4_K weights do not need to be host-dequantized for this
-path. `AirVariant` needs an external-kernel/link field for practical quantized
-core kernels.
+path. Practical quantized kernels may eventually need a native compute boundary,
+but that should not replace the tiled MLIR artifact as the export product.
+
+Note: this is a lower-level historical fixture for validating a native Q4_K
+compute body. It is not the `models.quantized_qwen3` export path. The model path
+below emits tiled MLIR directly and does not use a `.cc` kernel.
+
+## Quantized Qwen3: Generated Embed Tokens
+
+Run:
+
+```bash
+scripts/verify-quantized-qwen3-stage.sh embed_tokens
+```
+
+Useful scale-up variants:
+
+```bash
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens
+
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens
+
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh input_layernorm
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh input_layernorm
+
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh
+
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
+```
+
+Inputs:
+
+```text
+/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf
+tensor: model.embed_tokens.weight
+format: GGUF Q4_K
+physical shape: [151936, 144] uint32
+```
+
+Generated artifacts:
+
+```text
+src/models/quantized_qwen3/generated/run_embed_tokens.mlir
+src/models/quantized_qwen3/generated/lowered/quantized_qwen3_embed_tokens.dma.mlir
+src/models/quantized_qwen3/generated/lowered/quantized_qwen3_embed_tokens.channel.mlir
+src/models/quantized_qwen3/generated/lowered/quantized_qwen3_embed_tokens.aie.mlir
+.cache/npu-spikes/quantized-qwen3-embed_tokens-*/run_embed_tokens.xclbin
+.cache/npu-spikes/quantized-qwen3-embed_tokens-*/run_embed_tokens.insts.bin
+```
+
+Verified checks:
+
+- `models.quantized_qwen3.export.export_one(...)` uses `torch.export` and walks
+  `program.graph_module.graph.nodes` directly.
+- The generated artifact is tiled pre-AIR MLIR with `scf.parallel`,
+  `memref.subview`, L1 `memref.alloc`, and `memref.copy`.
+- `air-opt` lowers it to `air.herd`, `air.dma_memcpy_nd`, channels, and
+  `aie.device(npu2)`.
+- Runtime compilation uses `air-opt --air-to-std --airrt-to-npu` followed by
+  `aiecc --aie-generate-xclbin --aie-generate-npu-insts`.
+- Hardware execution uses MLIR-AIR's `air.backend.xrt.XRTBackend` directly; no
+  torch2air pyxrt wrapper is introduced.
+- The NPU reads real packed Q4_K rows from GGUF. It decodes per-subblock
+  scale/min bytes and q4 nibbles inside the tiled MLIR body.
+- The block-level f16 `d` and `dmin` values are temporarily host-decoded into a
+  small f32 side input because the current AIE scalar f16 conversion path
+  produced incorrect values. Full Q4_K value dequantization is still done by the
+  NPU tile.
+- `input_layernorm` consumes a hidden-state memref directly and writes the
+  normalized hidden-state memref. There is no graph/manifest/`.npy` handoff.
+- `pipeline_embed_norm` exports and lowers the two stages independently,
+  generates a stitched AIR module for inspection, and runs the stage xclbins
+  with a shared `pyxrt.bo` hidden buffer. The hidden state is copied back only
+  after both NPU kernels finish so the verifier can check it.
+- `embed_tokens_input_layernorm` is a fused L1 handoff spike. It keeps the
+  dequantized embedding values in L1 and feeds RMSNorm without writing an
+  intermediate global hidden buffer.
+
+Latest real NPU results:
+
+```text
+2026-05-13:
+
+1 token, 1 Q4_K block, hidden_size 256:
+  max_abs 0
+  allclose True rtol=1e-05 atol=1e-06
+  mean_ms 1.067
+
+1 token, 4 Q4_K blocks, hidden_size 1024:
+  max_abs 0
+  allclose True rtol=1e-05 atol=1e-06
+  mean_ms 1.415
+
+2 tokens, 4 Q4_K blocks each, hidden_size 1024:
+  max_abs 0
+  allclose True rtol=1e-05 atol=1e-06
+  mean_ms 2.025
+
+input_layernorm, 1 token, hidden_size 1024:
+  max_abs 1.6689301e-06
+  allclose True rtol=0.0001 atol=1e-05
+  mean_ms 1.588
+
+input_layernorm, 2 tokens, hidden_size 1024:
+  max_abs 1.6689301e-06
+  allclose True rtol=0.0001 atol=1e-05
+  mean_ms 1.779
+
+embed_tokens_input_layernorm fused L1 handoff, 1 token, 1 Q4_K block:
+  max_abs 2.3841858e-07
+  allclose True rtol=0.0001 atol=1e-05
+  mean_ms 1.199
+
+2026-05-14:
+
+pipeline_embed_norm shared BO handoff, 1 token, hidden_size 1024:
+  hidden_max_abs 0
+  max_abs 1.6689301e-06
+  allclose True rtol=0.0001 atol=1e-05
+  mean_ms 2.285
+
+pipeline_embed_norm shared BO handoff, 2 tokens, hidden_size 1024:
+  hidden_max_abs 0
+  max_abs 1.6689301e-06
+  allclose True rtol=0.0001 atol=1e-05
+  mean_ms 3.007
+```
+
+Notes:
+
+- `air-place-herds` currently prints `No valid placement found` diagnostics for
+  the 1x4 and 2x4 variants, but still produces AIE IR, xclbin/insts, and a
+  passing hardware result. Track this as a placement diagnostic issue, not as a
+  runtime failure.
+- Passing `aie.runtime_sequence`/`aiex.dma_configure_task_for` MLIR directly to
+  `aiecc` is required for this flow. Pre-lowering to `aiex.npu` instructions
+  before `aiecc` produced a hanging run.
+- Full hidden `embed_tokens_input_layernorm` fusion is not enabled yet. The
+  naive single-core full fusion either overflows program memory when fully
+  unrolled, or produces invalid values when the Q4_K block copy/store loop uses
+  dynamic block offsets. The working full-hidden path is currently
+  `embed_tokens` followed by `input_layernorm`, with a direct hidden memref stage
+  boundary.
+- The stitched AIR module for `embed_tokens -> input_layernorm` is generated and
+  contains two `air.launch` regions with the expected arg-map handoff. Running
+  that exact stitched module through the upstream ELF path is blocked in this
+  Python 3.12 environment because `pyxrt` does not expose `elf`/`ext`. Running
+  it through `aircc --output-format=xclbin` currently overflows program memory
+  for the full Q4_K embedding body. The verified hardware path therefore uses
+  two xclbins and one shared `pyxrt.bo` for the intermediate hidden buffer.
 
 ## Spike 6: FlashAttention Schedule Skeleton
 

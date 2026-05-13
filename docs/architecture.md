@@ -1,64 +1,90 @@
 # torch2air Architecture
 
-`torch2air` should be the AIR backend sibling of `torch2vk`.
+`torch2air` is the AIR backend workspace for PyTorch-exported models. Keep it
+close to how `torch2vk` actually works: model export scripts call a local
+`export_one(...)` helper several times with concrete modules and arguments.
+That helper uses `torch.export`, walks the exported PyTorch object directly, and
+renders files from templates.
 
-The frontend shape is intentionally simple:
+Do not build an intermediate graph format, registry system, manifest layer, or
+runtime abstraction until a concrete model export proves that one is needed.
+
+## Shape
+
+The intended flow is:
 
 ```text
-PyTorch nn.Module
-  -> torch.export / FX graph
-  -> aten op or small-pattern lookup table
-  -> AIR variant templates
-  -> mlir-air tools
+models.quantized_qwen3.export
+  -> export_one(name, module, args, kwargs, ...)
+  -> torch.export.export(...)
+  -> iterate exported_program.graph_module.graph.nodes
+  -> render Jinja templates for tiled pre-AIR MLIR
+  -> lower with air-opt / aircc
+  -> run with existing XRT tooling
 ```
 
-The main difference from `torch2vk` is the backend artifact:
+`torch.export.ExportedProgram` is the source of truth. Do not wrap it in a
+torch2air graph object. If code needs nodes, it should iterate:
 
-```text
-torch2vk:  aten node -> ShaderVariant -> GLSL / Vulkan dispatch
-torch2air: aten node -> AirVariant    -> tiled MLIR-AIR / AIR runtime dispatch
+```python
+program = torch.export.export(module, args, kwargs=kwargs, strict=False)
+for node in program.graph_module.graph.nodes:
+    ...
 ```
 
-This project should not be a second generic graph compiler. It should export
-real PyTorch modules, inspect the exported aten graph, and replace each known op
-or fused pattern with an AIR implementation.
+## Repository Layout
 
-## Repository Shape
-
-Planned layout:
+Current project layout should stay small:
 
 ```text
-torch2air/
-  mlir-air/                         # future git submodule: Xilinx/mlir-air
-  docs/
-    architecture.md
-  src/torch2air/
+src/
+  torch2air/
     export/
-      __init__.py
-      graph.py                      # torch.export / FX graph normalization
-      registry.py                   # aten target -> AirVariant factory
-      air_codegen.py                # dispatch + AIR file emission
-      templates/                    # textual MLIR-AIR templates
+      templates.py          # small Jinja helpers only
+      kernels/              # reusable tiled MLIR kernel templates
     weights/
-      gguf.py                       # exact packed weight metadata/readers
-    runtime/
-      xrt.py                        # host-side AIR/XRT loading
+      gguf.py               # GGUF tensor metadata and packed reads
   models/
     quantized_qwen3/
-      export.py
-      generated/
-  scripts/
-    build-air-tools.sh
-    export-quantized-qwen3.sh
-    run-quantized-qwen3-air.sh
+      export.py             # model-specific export_one(...) calls
+      quantization.py       # model-specific quantized tensor naming
+      reference.py          # PyTorch ROCm reference, when implemented
+      run.py                # thin CLI dispatch for model runners
+      run_embed_tokens.py   # embed_tokens XRT execution and reference check
+      generated/            # ignored generated files
+scripts/
+  install-air-tools.sh
+  install-python-deps.sh
+  export-quantized-qwen3.sh
+  run-quantized-qwen3-npu.sh
 ```
 
-Only this architecture document exists after the repository reset. The layout
-above is the target shape for the next implementation pass.
+Avoid adding `torch2air.export.graph`, `torch2air.export.registry`, or
+`torch2air.runtime.xrt` unless implementation pressure makes the missing module
+obvious.
 
-## Export API
+## Export Style
 
-The model-level export should stay close to the existing `torch2vk` pattern:
+Each model owns its export script. The script may define a local helper like:
+
+```python
+def export_one(
+    name: str,
+    module: torch.nn.Module,
+    args: tuple[torch.Tensor, ...],
+    kwargs: dict[str, object] | None = None,
+    *,
+    weight_prefix: str = "",
+    shape_exprs: dict[int, str] | None = None,
+) -> None:
+    program = torch.export.export(module, args, kwargs=kwargs, strict=False)
+    for node in program.graph_module.graph.nodes:
+        # Inspect aten target, tensor_meta, args, kwargs directly.
+        ...
+    # Render generated tiled MLIR directly from this context.
+```
+
+Then the model export calls it explicitly:
 
 ```python
 export_one(
@@ -74,189 +100,136 @@ export_one(
         "attention_mask": None,
     },
     weight_prefix="model.layers.0.",
-    kv_inject=KVCacheInjectHint(phase="prefill", max_seq_len=max_seq),
-    reference_tensors="model_tensors().text_layers[layer_idx]",
-    reference_name="qwen3.prefill.layer.{layer_idx}",
-    export_registry=Q4_K_M_REGISTRY,
-    weight_quantization=quantized_weights,
-    shape_exprs=layer_shape_exprs,
+    shape_exprs={prompt_len: "sequence_length"},
 )
 ```
 
-`torch.export` is used to discover the aten graph, shapes, names, and call
-boundaries. It is not expected to express packed GGUF math exactly. Packed
-weight handling belongs to the AIR variant selected from the registry.
-
-## Registry
-
-`torch2air.export.registry` should mirror `torch2vk.export.registry`.
-
-Conceptual API:
-
-```python
-@dataclass(frozen=True, slots=True)
-class AirBinding:
-    target: str
-    factory: Callable[[torch.fx.Node, AirContext], AirVariant | None]
-
-
-class AirRegistry:
-    def resolve(self, node: torch.fx.Node, context: AirContext) -> AirVariant | None:
-        ...
-```
-
-Default registry:
-
-```python
-DEFAULT_REGISTRY = AirRegistry(
-    [
-        AirBinding("aten.linear.default", make_linear_variant),
-        AirBinding("aten.mul.Tensor", make_elementwise_variant),
-        AirBinding("aten.add.Tensor", make_elementwise_variant),
-        AirBinding("aten.mean.dim", make_reduce_variant),
-        AirBinding("aten.rsqrt.default", make_elementwise_variant),
-        AirBinding("aten.silu.default", make_elementwise_variant),
-        AirBinding("aten.scaled_dot_product_attention.default", make_sdpa_variant),
-        AirBinding("aten.embedding.default", make_embedding_variant),
-    ]
-)
-```
-
-Quantized registries override only the ops whose implementation changes:
-
-```python
-Q4_K_M_REGISTRY = AirRegistry(
-    [
-        AirBinding("aten.linear.default", make_q4_k_m_linear_variant),
-        AirBinding("aten.embedding.default", make_q4_k_m_embedding_variant),
-        # Remaining bindings can reuse DEFAULT_REGISTRY factories.
-    ]
-)
-```
-
-This is the important simplification: `torch2air` does not need a separate
-"model IR" and "logical linalg IR" layer before AIR. The exported aten graph is
-the control structure, and the registry maps nodes or small patterns to backend
-variants.
-
-## AirVariant
-
-`AirVariant` is the AIR equivalent of `ShaderVariant`.
-
-It should carry:
-
-- `name`: stable generated artifact name
-- `target`: matched aten target or fused pattern name
-- `inputs` and `outputs`: buffer contracts
-- `weight_bindings`: disk weight names and packed formats
-- `template`: textual MLIR-AIR template path or renderer
-- `tile_config`: tile sizes, herd shape, memory spaces, and buffering mode
-- `runtime_entry`: symbol name used by the host runner
-
-Example:
-
-```python
-AirVariant(
-    name="q4_k_m_linear_1x4096x4096_tile8",
-    target="aten.linear.default",
-    inputs=[AirBuffer("x", "1xSx4096xf16")],
-    outputs=[AirBuffer("y", "1xSx4096xf16")],
-    weight_bindings=[
-        PackedWeight("weight", "model.layers.0.self_attn.q_proj.weight", "Q4_K_M"),
-    ],
-    template="templates/q4_k_m_linear.air.mlir.j2",
-    tile_config=TileConfig(m_tile=1, n_tile=8, k_tile=1024, cols=8),
-    runtime_entry="q4_k_m_linear",
-)
-```
-
-The AIR template is allowed to contain explicit tiling, `air.herd`, local
-buffers, and DMA operations. That is equivalent to a `torch2vk` shader carrying
-its own workgroup layout and memory-access strategy.
+This keeps decisions local and visible. If Qwen3 needs special handling for a
+specific aten op, add that handling near the model exporter first. Extract a
+shared helper only after the second real model needs the same code.
 
 ## Generated Files
 
-For one exported function, generate a small manifest and the AIR artifacts:
+Generate only files that are consumed by the next step. Do not write
+`graph.json` or `export_manifest.json` just because they are convenient debug
+containers.
+
+For early Qwen3 work, acceptable generated files are concrete implementation
+artifacts, for example:
 
 ```text
-models/quantized_qwen3/generated/
-  run_text_layer.graph.json
-  run_text_layer.manifest.json
-  run_text_layer_000_q4_k_m_linear.tiled.mlir
-  run_text_layer_000_q4_k_m_linear.air.mlir
-  run_text_layer_001_rmsnorm.tiled.mlir
-  run_text_layer_001_rmsnorm.air.mlir
+src/models/quantized_qwen3/generated/
+  run_text_layer.mlir
 ```
 
-`.graph.json` records the normalized aten graph for debugging.
+The generated model artifact is tiled MLIR, not hand-written AIR dialect and
+not a Python AIR builder. It should look like the spike fixtures:
+`scf.parallel`, `memref.subview`, `memref.alloc(..., 2)`, `memref.copy`, and
+tile-local `linalg`/`arith`/`scf` work. `air-opt` is responsible for lowering
+that into `air.launch`, `air.herd`, `air.dma_memcpy_nd`, channels, and AIE IR.
 
-`.manifest.json` records inputs, outputs, weights, AIR files, and runtime entry
-symbols.
+Reusable operator bodies belong under `torch2air.export.kernels`. The model
+package chooses a stage and passes concrete Qwen3 shapes, tensor names, and
+module metadata; it should not own a growing library of generic operator
+templates.
 
-`.tiled.mlir` / `.air.mlir` are the backend artifacts. In simple cases the
-variant can emit `.air.mlir` directly. When a helper pass is useful, it can emit
-`.tiled.mlir` first and run `air-opt`.
+Do not put model-stage compute in ad hoc `.cc` files. A separate native kernel
+should only appear after a measured reason makes that boundary necessary.
 
-## Tiling Policy
+If a debug dump is useful while developing, make it opt-in and keep it out of
+the default export path.
 
-Tiling should live in each AIR variant, not in a global optimizer.
+## Weights
 
-For example, Q4_K linear can use an AIR template that already knows:
+GGUF packed weights are real inputs to the AIR path. `torch2air.weights.gguf`
+owns reading GGUF metadata and packed byte ranges. The export path should record
+or reference GGUF tensor names only where needed by generated code.
 
-```text
-activation tile: f16 [sequence_tile, k_tile]
-weight tile:     packed Q4_K_M bytes for [n_tile, k_tile]
-output tile:     f16 [sequence_tile, n_tile]
-herd shape:      columns/rows selected for the target NPU
-copy schedule:   global -> local, compute, local -> global
-```
+Do not host-dequantize Q4_K weight values for NPU execution. The NPU path should
+consume the packed blocks and decode the quantized values inside the generated
+tile body.
 
-This is still the same style as `torch2vk`: the backend implementation owns the
-low-level schedule. The registry only decides which implementation a node gets.
+The current `quantized_qwen3.embed_tokens` runner has one temporary exception:
+the GGUF Q4_K block-level f16 values `d` and `dmin` are decoded on the host into
+a small `block_f16_scales` f32 input. The NPU still reads real packed Q4_K
+blocks and decodes the per-subblock scale/min bytes and q4 nibbles. This keeps
+the first tiled MLIR stage runnable while the AIE f16 scalar conversion issue is
+isolated. Remove this exception once f16-to-f32 lowering is validated.
 
-## Quantized Qwen3 First
+Host-side full dequantization is allowed only for reference checks or tests.
 
-The first useful target should be `models/quantized_qwen3`.
+## Operator Handoff
 
-Initial scope:
+Default stage boundaries use explicit memref arguments, so the next stage can
+consume the previous stage's output buffer directly. Do not insert graph JSON,
+manifest objects, `.npy` files, or host-side repacking between operators.
 
-- Export one real `nn.Module` layer with `torch.export`.
-- Load real GGUF metadata and packed weight names.
-- Use `Q4_K_M_REGISTRY` for text layer linear/embedding ops.
-- Emit AIR variants that consume packed bytes on the NPU path.
-- Compare against PyTorch ROCm at the module boundary.
+For adjacent Qwen3 stages, keep the model export simple and official-looking:
+generate each operator as its own tiled MLIR stage, then connect the stages with
+the existing AIR/XRT mechanisms. The current full-hidden
+`embed_tokens -> input_layernorm` path runs two stage xclbins with one shared
+`pyxrt.bo` for the hidden-state memref. That avoids a host-side intermediate
+copy while staying inside pyxrt's device, kernel, BO, and run concepts.
 
-No host-side dequantization should be part of the AIR execution path. Host code
-may package buffers and run reference PyTorch ROCm, but the NPU kernel should see
-the same packed weight format that is on disk.
+The exporter also generates a stitched AIR module in the same style as
+MLIR-AIR's upstream llama multi-launch examples: independent stage bodies are
+renamed and connected by an arg map. On this Python 3.12 environment, pyxrt does
+not expose the ELF loader used by those examples. The xclbin `aircc` path for
+the stitched module currently overflows AIE program memory for the full Q4_K
+embedding body, so the runnable path remains separate xclbins with a shared BO
+until the ELF binding or a smaller embedded body is available.
 
-## Compile And Run
+When two adjacent operators can be fused without changing the schedule shape,
+keep that as an explicit experiment. The current
+`embed_tokens_input_layernorm` spike proves L1 handoff for one Q4_K block. Full
+hidden RMSNorm should not replace the separate stages until it works for all
+four Q4_K blocks on real NPU hardware.
 
-The project should use MLIR-AIR tools directly:
+## Runtime Boundary
 
-```bash
-scripts/export-quantized-qwen3.sh
-scripts/compile-air.sh models/quantized_qwen3/generated/run_text_layer.manifest.json
-scripts/run-quantized-qwen3-air.sh
-```
+Do not recreate pyxrt concepts in torch2air.
 
-Expected toolchain pieces come from the future `mlir-air/` submodule and its
-dependencies:
+These already exist and should be used directly through MLIR-AIR or pyxrt:
 
-- `air-opt`
-- `air-translate`
-- `aircc.py`
-- XRT/AIR runtime pieces needed by the selected board
+- `pyxrt.device`
+- `pyxrt.xclbin`
+- `pyxrt.hw_context`
+- `pyxrt.kernel`
+- `pyxrt.bo`
+- `pyxrt.run`
+- `air.backend.xrt.XRTBackend`
+- `air.backend.xrt_runner.XRTRunner`
 
-IREE `vmfb`, IREE HAL dispatch formation, and IREE encoding dialect are not the
-core path for this project.
+Model code may call existing AIR/XRT helpers, but torch2air should not introduce
+new wrapper classes for device, kernel, buffer object, hardware context, or run
+state.
+
+## First Model
+
+The first target is `models.quantized_qwen3`.
+
+Initial useful milestone:
+
+- Use this repository's `.venv`; do not use `torch2vk/.venv`.
+- Load the Qwen3 PyTorch module on meta tensors.
+- Call local `export_one(...)` for one small boundary first.
+- Traverse the returned `ExportedProgram` directly.
+- Render one concrete file from the traversed nodes.
+- That file is a tiled `.mlir` file consumed by `air-opt`.
+- Keep Q4_K packed weight handling tied to real GGUF tensor metadata.
+
+Only broaden from there once the simple path produces a real artifact that the
+next compile/run step can consume.
 
 ## Non-Goals
 
-- Do not build a full PyTorch-to-AIR automatic optimizer.
-- Do not maintain a large hand-written model description language.
-- Do not require every op to pass through linalg first.
-- Do not dequantize GGUF weights on the host for NPU execution.
-- Do not make `iree-amd-aie` the project root.
+- No custom torch2air graph IR.
+- No default graph JSON dump.
+- No export manifest layer.
+- No AirRegistry/AirVariant abstraction.
+- No pyxrt runtime wrapper.
+- No host-side Q4_K dequantization in the NPU execution path.
+- No IREE `vmfb` path for this project.
 
-The practical model is: export PyTorch, match aten, emit AIR.
+The working rule is: direct `export_one(...)`, direct PyTorch graph traversal,
+simple templates, and existing AIR/XRT runtime APIs.

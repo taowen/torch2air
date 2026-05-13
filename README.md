@@ -36,6 +36,17 @@ or call the wrapper without sourcing:
 scripts/air-opt.sh --version
 ```
 
+## Python And Model Dependencies
+
+Install this repository's Python/model dependencies into `.venv`:
+
+```bash
+scripts/install-python-deps.sh
+```
+
+This installs PyTorch ROCm into the torch2air environment. It does not use the
+`torch2vk` virtual environment.
+
 ## Spike Verification
 
 Run all verified AIR/NPU spikes in order:
@@ -60,6 +71,56 @@ Generated IR is written under:
 
 ```text
 examples/amd_aie_experiments/generated/
+```
+
+## Quantized Qwen3 Scaffold
+
+Run the minimal export scaffold:
+
+```bash
+scripts/export-quantized-qwen3.sh --dry-run
+```
+
+The scaffold intentionally keeps the first pass simple. Real `torch.export`
+objects should be traversed directly in model export code and rendered through
+templates; torch2air does not wrap those objects in a separate graph IR.
+
+Run the first generated stage on the real NPU:
+
+```bash
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens
+```
+
+This exports `models.quantized_qwen3.embed_tokens` to tiled MLIR, lowers it with
+MLIR-AIR, compiles `xclbin`/`insts`, reads real GGUF Q4_K rows, and compares the
+NPU result with the reference dequantization.
+
+Run the next full-hidden step:
+
+```bash
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh input_layernorm
+```
+
+Run the first full-hidden pipeline:
+
+```bash
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh
+```
+
+This exports `embed_tokens` and `input_layernorm`, lowers both stages, generates
+a stitched AIR module for inspection, then runs the two stage xclbins with a
+shared `pyxrt.bo` hidden buffer. The intermediate hidden state stays on the NPU
+path between the two operators; it is copied back only after execution for
+verification.
+
+There is also a fused L1 handoff spike for the first Q4_K block:
+
+```bash
+AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
 ```
 
 ## NPU Smoke Test

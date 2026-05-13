@@ -4,11 +4,15 @@ This document tracks the experiments needed to validate the `torch2air`
 direction from [architecture.md](architecture.md):
 
 ```text
-PyTorch export -> aten registry -> AIR variant templates -> mlir-air tools
+PyTorch export -> direct graph walk -> Jinja tiled MLIR -> air-opt/aircc -> XRT
 ```
 
-The central hypothesis is that MLIR-AIR supports hand-written tiling strategy,
-but not as a separate tuning config file. The tile schedule is part of the IR:
+The central hypothesis is that the tiling strategy is hand-written by
+`torch2air` as pre-AIR MLIR, then lowered by MLIR-AIR. AIR is not expected to
+auto-discover the Qwen3 schedule from the PyTorch graph. `torch.export`
+provides operator and shape facts; the stage template emits MLIR that chooses
+tile sizes, memory spaces, copy order, and tile-local work explicitly. The tile
+schedule is part of the generated MLIR:
 
 - `scf.parallel` / `scf.for` express the tile loop nest.
 - `memref.subview` expresses a global tile slice.
@@ -20,6 +24,19 @@ but not as a separate tuning config file. The tile schedule is part of the IR:
 
 That is a good fit for Q4_K and FlashAttention-style kernels where tile size,
 memory space, DMA order, and double buffering are performance-critical.
+
+Avoid `.cc` kernels and direct Python AIR builders in the first implementation
+path. They hide or bypass the tiled MLIR artifact that we need to inspect and
+lower. If a native kernel is eventually needed, it is only the compute body
+inside a selected tile/herd, not the AIR tiling strategy.
+
+For operator-to-operator experiments, follow the upstream MLIR-AIR llama style:
+build each operator as an independent stage first, then stitch or sequence those
+stages through AIR/XRT. Full-hidden `embed_tokens -> input_layernorm` now
+generates a stitched two-launch AIR artifact, but the runnable Python 3.12 path
+uses two stage xclbins with a shared `pyxrt.bo` because the upstream ELF loader
+is not exposed by the current `pyxrt` binding and the xclbin multi-launch path
+overflows program memory for the current Q4_K embedding body.
 
 ## Baseline IR Shape
 
@@ -109,7 +126,7 @@ Success criteria:
 
 Decision after spike:
 
-- If this works, `AirVariant` templates can directly emit tiled AIR source.
+- If this works, model-stage templates can directly emit tiled MLIR source.
 - If this fails, inspect which exact op shape the AIR passes reject and narrow
   the template language to that accepted subset.
 
@@ -223,12 +240,13 @@ Success criteria:
 - The AIR template consumes packed bytes, not host-dequantized f16/f32 weights.
 - Tiling chooses output-column tiles explicitly.
 - The generated IR reaches `aie.device(npu4)`.
-- The host manifest records exact GGUF tensor names and packed formats.
+- The run log records exact GGUF tensor names and packed formats.
 
 Decision after spike:
 
-- If external core kernels are easiest, `AirVariant` should support a
-  `link_with` or external-kernel field.
+- If external core kernels are easiest, stage templates should emit the needed
+  the generated MLIR should make that boundary explicit, and the lowering path
+  must still start from a tiled `.mlir` artifact.
 - If `linalg.generic` is enough for a first implementation, keep the external
   path optional.
 
@@ -254,77 +272,106 @@ Success criteria:
 
 Decision after spike:
 
-- If the skeleton lowers cleanly, FlashAttention should be an `aten` fused
-  pattern mapped to a custom `AirVariant`.
+- If the skeleton lowers cleanly, FlashAttention should be a dedicated model
+  stage template, not a generic registry entry.
 - If it does not, keep FlashAttention outside the initial Qwen3 milestone.
 
-## Spike 7: Registry-Driven Template Rendering
+## Spike 7: Torch2VK-Style Direct Export
 
-Goal: connect the `torch2vk`-style export path to the hand-written AIR
-templates.
+Goal: connect the `torch2vk`-style export path to tiled MLIR templates.
 
 Input:
 
 - A small real `nn.Module` exported with `torch.export`.
-- A minimal `AirRegistry` with `aten.linear.default` and one elementwise op.
-- Template variables from node shape metadata and weight metadata.
+- A local `export_one(...)` function in the model package.
+- Direct iteration over `program.graph_module.graph.nodes`.
+- Template variables from node metadata and GGUF weight metadata.
 
 Success criteria:
 
-- Export writes a normalized `*.graph.json`.
-- Registry resolution writes one `*.tiled.mlir` or `*.air.mlir` per matched
-  variant.
-- The manifest records runtime entries, input/output buffers, and weight
-  bindings.
-- The generated AIR file is accepted by the Spike 1 pass pipeline.
+- Export writes only the stage artifact consumed by the next command.
+- No `graph.py`, normalized `graph.json`, registry, variant object, or export
+  manifest is introduced.
+- The generated tiled MLIR file is accepted by the Spike 1 pass pipeline.
+- The generated file contains explicit tile structure: `scf.parallel`,
+  `memref.subview`, L1 `memref.alloc`, and `memref.copy`.
 
 Decision after spike:
 
 - If this is straightforward, implement `models/quantized_qwen3/export.py`
-  using the same `export_one(..., export_registry=Q4_K_M_REGISTRY, ...)` style
-  as `torch2vk`.
+  using the same direct `export_one(...)` calling style as `torch2vk`.
 - If graph shapes are hard to recover from `torch.export`, add only the minimal
   shape annotation layer needed by template rendering.
 
 ## Spike 8: Runtime Boundary And Reference
 
-Goal: prove the generated AIR artifact can be loaded and compared at the module
+Goal: prove the generated tiled MLIR artifact can be loaded and compared at the module
 boundary.
 
 Input:
 
-- One generated AIR artifact from Spike 5.
+- One generated `models.quantized_qwen3` MLIR artifact from Spike 7.
 - Real packed GGUF weight buffer.
-- PyTorch ROCm reference for the same module boundary.
+- Reference output for the same module boundary.
 
 Rules:
 
 - `.npy` is only an optional file container for tool compatibility, not the
   deployment ABI.
-- Reference comparison should use PyTorch ROCm, not CPU NumPy arithmetic.
 - The AIR path must consume packed weights.
+- Prefer a PyTorch ROCm reference when the module boundary has a normal PyTorch
+  equivalent. For packed GGUF-only boundaries, a NumPy reference is acceptable
+  until the PyTorch quantized boundary exists.
 
 Success criteria:
 
 - A host program loads the AIR/XRT artifact and input/output buffers.
-- PyTorch ROCm produces the reference output.
+- The reference path produces expected output.
 - The comparison runs at the exported module boundary with documented tolerance.
+- The script runs on the real NPU, not only through `air-opt`.
 
 Decision after spike:
 
 - If Python AIR runtime bindings are unstable, use a small C++ host runner.
 - Keep `iree-run-module` and IREE `vmfb` out of the main path.
 
+Current `quantized_qwen3.embed_tokens` command:
+
+```bash
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 \
+  scripts/run-quantized-qwen3-npu.sh embed_tokens
+```
+
+This command exports from `torch.export`, lowers tiled pre-AIR MLIR through
+`air-opt`, compiles the runtime MLIR with `aiecc`, loads `xclbin`/`insts` with
+`air.backend.xrt.XRTBackend`, and compares the real NPU output with the GGUF
+Q4_K reference.
+
 ## Milestone Order
 
 1. Restore and commit the direct tiled matmul example.
 2. Freeze the memory-space and pass-pipeline contract.
-3. Add a minimal `AirRegistry` / `AirVariant` renderer.
-4. Generate one AIR file from one real exported PyTorch linear module.
-5. Replace the toy linear with packed Q4_K_M weight handling.
-6. Add runtime execution and PyTorch ROCm comparison.
-7. Only then attempt FlashAttention scheduling.
+3. Generate one stage artifact from one real exported PyTorch module.
+4. Replace the toy linear with packed Q4_K_M weight handling.
+5. Add runtime execution and reference comparison on real NPU.
+6. Only then attempt FlashAttention scheduling.
 
 The expected conclusion is not that MLIR-AIR auto-discovers the right schedule.
 The useful conclusion is that `torch2air` can write the schedule directly in IR
 and use MLIR-AIR to lower that schedule to herd, DMA, channel, and AIE forms.
+
+## Handoff Rule
+
+When adding the next Qwen3 step, first make the stage boundary direct: memref in,
+memref out, no graph JSON, manifest, `.npy`, or host repacking between
+operators. Then look for adjacent operators that can be fused so the
+intermediate stays in L1/L2.
+
+Current status:
+
+- Full `input_layernorm` has been migrated and runs on real NPU for hidden size
+  1024.
+- A fused `embed_tokens_input_layernorm` L1 handoff runs for one Q4_K block.
+- Full hidden fusion is a separate scheduling problem because RMSNorm needs a
+  reduction across all Q4_K blocks; the naive single-core full fusion is not yet
+  a valid replacement.

@@ -1,0 +1,59 @@
+[project]
+name = "torch2air"
+version = "0.1.0"
+description = "AIR backend experiments for PyTorch-exported models."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch==2.11.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "torchvision==0.26.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "torchaudio==2.11.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "triton-rocm==3.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "accelerate>=1.12,<2",
+  "huggingface-hub>=0.34,<2",
+  "jinja2>=3.1,<4",
+  "ml-dtypes>=0.5,<1",
+  "numpy>=2,<3",
+  "safetensors>=0.7,<1",
+  "transformers>=5.3,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.409,<1.2",
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<0.12",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download-r2.pytorch.org/whl/rocm7.2"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
+  { index = "pytorch-rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchaudio = [
+  { index = "pytorch-rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+"triton-rocm" = [
+  { index = "pytorch-rocm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
