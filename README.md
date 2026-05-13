@@ -24,14 +24,20 @@ uv pip install --pre torch-mlir \
 On the current `iree-amd-aie` checkout you can also reuse the existing
 `~/projects/torch2vk/.venv` for PyTorch and call the checked-in scripts directly.
 
+Useful environment helpers:
+
+```bash
+source scripts/env.sh
+scripts/bootstrap-python.sh
+scripts/doctor.sh
+```
+
 ## Export A Demo Model
 
 From the parent `iree-amd-aie` checkout:
 
 ```bash
-source iree-install-rocm/env.sh
-PYTHON=/var/home/taowen/projects/torch2vk/.venv/bin/python \
-  third_party/torch2air/scripts/export-matmul-air.sh
+third_party/torch2air/scripts/build-matmul-air.sh
 ```
 
 This produces:
@@ -41,27 +47,36 @@ This produces:
 - `examples/generated/matmul_i32_32.vmfb`
 
 Only the MLIR files are intended to be committed. VMFB files are build outputs.
+On Strix/NPU4, the AIR artifact is generated with the AIR path, while the
+runnable VMFB is built with `objectFifo` by default because the current
+AIR-to-AIE placement path fails for this small i32 demo.
 
 To execute the generated VMFB on `xrt-lite`:
 
 ```bash
-source iree-install-rocm/env.sh
-PYTHON=/var/home/taowen/projects/torch2vk/.venv/bin/python \
-  third_party/torch2air/scripts/run-matmul-air.sh
+third_party/torch2air/scripts/run-matmul-air.sh
 ```
 
-On the current `iree-amd-aie` checkout this reaches the NPU runtime, but the
-AIR/i32 path returns zeros. The script treats that as a verification failure
-instead of silently accepting it.
+The default target is Strix/Ryzen AI NPU4: `TORCH2AIR_TARGET_DEVICE=npu4` with
+`XRT_LITE_N_CORE_ROWS=4` and `XRT_LITE_N_CORE_COLS=8`. Override those variables
+for Phoenix/NPU1 devices.
+
+To compile and verify the same linalg MLIR through the ROCm backend:
+
+```bash
+third_party/torch2air/scripts/run-matmul-rocm.sh
+```
 
 ## CLI
 
 ```bash
-python -m torch2air export-demo --out-dir examples/generated
-python -m torch2air lower-air examples/generated/matmul_i32_32.linalg.mlir \
+$PYTHON -m torch2air export-demo --out-dir examples/generated
+$PYTHON -m torch2air lower-air examples/generated/matmul_i32_32.linalg.mlir \
   --air-mlir examples/generated/matmul_i32_32.air.mlir \
   --vmfb examples/generated/matmul_i32_32.vmfb
-python -m torch2air run-demo --out-dir examples/generated
+$PYTHON -m torch2air run-demo --out-dir examples/generated
+$PYTHON -m torch2air run-demo --out-dir examples/generated \
+  --vmfb examples/generated/matmul_i32_32.rocm.vmfb --device hip
 ```
 
 `--frontend=auto` tries `torch-mlir` first if it is installed. The fallback FX

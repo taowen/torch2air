@@ -21,14 +21,25 @@ def main(argv: list[str] | None = None) -> int:
     lower_parser.add_argument("--air-mlir", type=Path, required=True)
     lower_parser.add_argument("--vmfb", type=Path)
     lower_parser.add_argument("--iree-compile", default="iree-compile")
+    lower_parser.add_argument("--target-device")
+    lower_parser.add_argument("--tile-pipeline")
+    lower_parser.add_argument("--lower-to-aie-pipeline")
+    lower_parser.add_argument("--vmfb-tile-pipeline")
+    lower_parser.add_argument("--vmfb-lower-to-aie-pipeline")
 
     lower_demo_parser = subcommands.add_parser("lower-demo")
     lower_demo_parser.add_argument("--out-dir", type=Path, default=Path("examples/generated"))
     lower_demo_parser.add_argument("--iree-compile", default="iree-compile")
+    lower_demo_parser.add_argument("--target-device")
+    lower_demo_parser.add_argument("--tile-pipeline")
+    lower_demo_parser.add_argument("--lower-to-aie-pipeline")
+    lower_demo_parser.add_argument("--vmfb-tile-pipeline")
+    lower_demo_parser.add_argument("--vmfb-lower-to-aie-pipeline")
     lower_demo_parser.add_argument("--no-vmfb", action="store_true")
 
     run_parser = subcommands.add_parser("run-demo")
     run_parser.add_argument("--out-dir", type=Path, default=Path("examples/generated"))
+    run_parser.add_argument("--vmfb", type=Path)
     run_parser.add_argument("--iree-run-module", default="iree-run-module")
     run_parser.add_argument("--device", default="xrt-lite")
     run_parser.add_argument("--xrt-lite-n-core-rows", type=int, default=4)
@@ -49,7 +60,35 @@ def main(argv: list[str] | None = None) -> int:
             args.source_mlir,
             args.air_mlir,
             vmfb=args.vmfb,
-            config=IreeAirConfig(iree_compile=args.iree_compile),
+            config=IreeAirConfig(
+                iree_compile=args.iree_compile,
+                **{
+                    key: value
+                    for key, value in {
+                        "target_device": args.target_device,
+                        "tile_pipeline": args.tile_pipeline,
+                        "lower_to_aie_pipeline": args.lower_to_aie_pipeline,
+                    }.items()
+                    if value is not None
+                },
+            ),
+            vmfb_config=(
+                IreeAirConfig(
+                    iree_compile=args.iree_compile,
+                    **{
+                        key: value
+                        for key, value in {
+                            "target_device": args.target_device,
+                            "tile_pipeline": args.vmfb_tile_pipeline or args.tile_pipeline,
+                            "lower_to_aie_pipeline": args.vmfb_lower_to_aie_pipeline,
+                        }.items()
+                        if value is not None
+                    },
+                )
+                if args.vmfb_lower_to_aie_pipeline is not None
+                or args.vmfb_tile_pipeline is not None
+                else None
+            ),
         )
         print(f"wrote {args.air_mlir}")
         if args.vmfb is not None:
@@ -60,6 +99,11 @@ def main(argv: list[str] | None = None) -> int:
         air_mlir, vmfb = lower_demo(
             out_dir=args.out_dir,
             iree_compile=args.iree_compile,
+            target_device=args.target_device,
+            tile_pipeline=args.tile_pipeline,
+            lower_to_aie_pipeline=args.lower_to_aie_pipeline,
+            vmfb_tile_pipeline=args.vmfb_tile_pipeline,
+            vmfb_lower_to_aie_pipeline=args.vmfb_lower_to_aie_pipeline,
             build_vmfb=not args.no_vmfb,
         )
         print(f"wrote {air_mlir}")
@@ -70,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run-demo":
         max_abs_diff = run_demo(
             out_dir=args.out_dir,
+            vmfb=args.vmfb,
             iree_run_module=args.iree_run_module,
             device=args.device,
             xrt_lite_n_core_rows=args.xrt_lite_n_core_rows,

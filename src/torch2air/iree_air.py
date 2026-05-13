@@ -12,10 +12,18 @@ from pathlib import Path
 class IreeAirConfig:
     iree_compile: str = "iree-compile"
     target_backend: str = "amd-aie"
-    target_device: str = "npu1_4col"
-    device_hal: str = "xrt-lite"
-    tile_pipeline: str = "pack-peel"
-    lower_to_aie_pipeline: str = "air"
+    target_device: str = field(
+        default_factory=lambda: environ.get("TORCH2AIR_TARGET_DEVICE", "npu4")
+    )
+    device_hal: str = field(
+        default_factory=lambda: environ.get("TORCH2AIR_DEVICE_HAL", "xrt-lite")
+    )
+    tile_pipeline: str = field(
+        default_factory=lambda: environ.get("TORCH2AIR_TILE_PIPELINE", "pack-peel")
+    )
+    lower_to_aie_pipeline: str = field(
+        default_factory=lambda: environ.get("TORCH2AIR_LOWER_TO_AIE_PIPELINE", "air")
+    )
     air_dump_pass: str = "air-dma-to-channel"
     peano_install_dir: Path | None = None
     vitis_install_dir: Path | None = None
@@ -28,6 +36,7 @@ def lower_linalg_to_air(
     *,
     vmfb: Path | None = None,
     config: IreeAirConfig | None = None,
+    vmfb_config: IreeAirConfig | None = None,
 ) -> None:
     config = config or IreeAirConfig()
     source_mlir = source_mlir.resolve()
@@ -36,6 +45,7 @@ def lower_linalg_to_air(
     with tempfile.TemporaryDirectory(prefix="torch2air-dump-") as temp_dir:
         dump_dir = Path(temp_dir) / "air-dump"
         dump_dir.mkdir()
+        dump_error: RuntimeError | None = None
         compile_to_dump = _compile_command(
             source_mlir,
             output=None,
@@ -43,13 +53,23 @@ def lower_linalg_to_air(
             compile_to_executable_targets=True,
             dump_dir=dump_dir,
         )
-        _run(compile_to_dump)
-        dumped_air = _find_air_dump(dump_dir)
+        # The AIR dump is emitted before later AIR-to-AIE placement. On NPU4 that
+        # later placement may fail while the AIR artifact is still useful.
+        try:
+            _run(compile_to_dump)
+        except RuntimeError as exc:
+            dump_error = exc
+        try:
+            dumped_air = _find_air_dump(dump_dir)
+        except RuntimeError:
+            if dump_error is not None:
+                raise dump_error
+            raise
         shutil.copyfile(dumped_air, air_mlir)
 
     if vmfb is not None:
         vmfb.parent.mkdir(parents=True, exist_ok=True)
-        _run(_compile_command(source_mlir, output=vmfb, config=config))
+        _run(_compile_command(source_mlir, output=vmfb, config=vmfb_config or config))
 
 
 def _compile_command(

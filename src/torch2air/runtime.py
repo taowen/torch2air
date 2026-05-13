@@ -34,6 +34,11 @@ def lower_demo(
     *,
     out_dir: Path,
     iree_compile: str = "iree-compile",
+    target_device: str | None = None,
+    tile_pipeline: str | None = None,
+    lower_to_aie_pipeline: str | None = None,
+    vmfb_tile_pipeline: str | None = None,
+    vmfb_lower_to_aie_pipeline: str | None = None,
     build_vmfb: bool = True,
 ) -> tuple[Path, Path | None]:
     source_mlir = out_dir / "matmul_i32_32.linalg.mlir"
@@ -43,7 +48,34 @@ def lower_demo(
         source_mlir,
         air_mlir,
         vmfb=vmfb,
-        config=IreeAirConfig(iree_compile=iree_compile),
+        config=IreeAirConfig(
+            iree_compile=iree_compile,
+            **{
+                key: value
+                for key, value in {
+                    "target_device": target_device,
+                    "tile_pipeline": tile_pipeline,
+                    "lower_to_aie_pipeline": lower_to_aie_pipeline,
+                }.items()
+                if value is not None
+            },
+        ),
+        vmfb_config=(
+            IreeAirConfig(
+                iree_compile=iree_compile,
+                **{
+                    key: value
+                    for key, value in {
+                        "target_device": target_device,
+                        "tile_pipeline": vmfb_tile_pipeline or tile_pipeline,
+                        "lower_to_aie_pipeline": vmfb_lower_to_aie_pipeline,
+                    }.items()
+                    if value is not None
+                },
+            )
+            if vmfb_lower_to_aie_pipeline is not None or vmfb_tile_pipeline is not None
+            else None
+        ),
     )
     return air_mlir, vmfb
 
@@ -51,6 +83,7 @@ def lower_demo(
 def run_demo(
     *,
     out_dir: Path,
+    vmfb: Path | None = None,
     iree_run_module: str = "iree-run-module",
     device: str = "xrt-lite",
     function_name: str = "forward",
@@ -70,7 +103,7 @@ def run_demo(
     command = [
         iree_run_module,
         f"--device={device}",
-        f"--module={out_dir / 'matmul_i32_32.vmfb'}",
+        f"--module={vmfb or out_dir / 'matmul_i32_32.vmfb'}",
         f"--function={function_name}",
         f"--input=@{lhs_path}",
         f"--input=@{rhs_path}",
