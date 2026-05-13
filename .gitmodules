@@ -1,0 +1,3 @@
+[submodule "mlir-air"]
+	path = mlir-air
+	url = https://github.com/Xilinx/mlir-air.git

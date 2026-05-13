@@ -1,0 +1,7 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+
+# Generated AIR spike outputs.
+examples/amd_aie_experiments/generated/
