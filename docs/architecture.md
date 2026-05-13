@@ -1,265 +1,262 @@
 # torch2air Architecture
 
-`torch2air` is planned as a standalone project rooted at this repository. It
-uses PyTorch model structure and weight metadata as the frontend, and emits
-MLIR-AIR programs where the important tiling and data movement schedule is
-explicit in the IR.
+`torch2air` should be the AIR backend sibling of `torch2vk`.
 
-The project should not depend on the `iree-amd-aie` repository as its root. A
-future `mlir-air/` directory will be a git submodule, and the build/runtime
-scripts should use MLIR-AIR tools directly.
+The frontend shape is intentionally simple:
 
-## Goals
+```text
+PyTorch nn.Module
+  -> torch.export / FX graph
+  -> aten op or small-pattern lookup table
+  -> AIR variant templates
+  -> mlir-air tools
+```
 
-- Use real PyTorch `nn.Module` objects to discover model structure, names,
-  shapes, and call boundaries.
-- Use real on-disk quantized weights, especially GGUF Q4_K-style packed
-  weights, without host-side dequantization for NPU inputs.
-- Generate MLIR-AIR-oriented IR where tile loops, local buffers, and DMA copies
-  are written directly.
-- Keep kernel-specific performance decisions in `torch2air`, not hidden behind
-  a generic graph compiler.
-- Make the generated AIR artifacts inspectable and reproducible.
+The main difference from `torch2vk` is the backend artifact:
 
-## Non-Goals
+```text
+torch2vk:  aten node -> ShaderVariant -> GLSL / Vulkan dispatch
+torch2air: aten node -> AirVariant    -> tiled MLIR-AIR / AIR runtime dispatch
+```
 
-- `torch2air` is not an arbitrary PyTorch graph optimizer.
-- It should not rely on IREE `vmfb`, IREE HAL dispatch formation, or IREE
-  encoding dialect as the core execution path.
-- It should not assume PyTorch export can represent quantized packed-weight
-  kernels exactly. PyTorch export is used for model structure; backend kernels
-  can be custom generated.
+This project should not be a second generic graph compiler. It should export
+real PyTorch modules, inspect the exported aten graph, and replace each known op
+or fused pattern with an AIR implementation.
 
-## Repository Layout
+## Repository Shape
 
 Planned layout:
 
 ```text
 torch2air/
-  mlir-air/                         # git submodule: Xilinx/mlir-air
+  mlir-air/                         # future git submodule: Xilinx/mlir-air
   docs/
     architecture.md
   src/torch2air/
-    frontend/                       # PyTorch export, module traversal, shape capture
-    weights/                        # GGUF and other weight readers
-    ir/                             # MLIR text/builders for memref/AIR IR
-    kernels/                        # kernel templates and lowering rules
-    runtime/                        # XRT/AIR runtime wrappers
+    export/
+      __init__.py
+      graph.py                      # torch.export / FX graph normalization
+      registry.py                   # aten target -> AirVariant factory
+      air_codegen.py                # dispatch + AIR file emission
+      templates/                    # textual MLIR-AIR templates
+    weights/
+      gguf.py                       # exact packed weight metadata/readers
+    runtime/
+      xrt.py                        # host-side AIR/XRT loading
   models/
     quantized_qwen3/
       export.py
-      kernels/
       generated/
   scripts/
     build-air-tools.sh
     export-quantized-qwen3.sh
-    run-quantized-qwen3.sh
+    run-quantized-qwen3-air.sh
 ```
 
-Only the architecture document exists in the reset repository right now. The
-layout above is the intended direction.
+Only this architecture document exists after the repository reset. The layout
+above is the target shape for the next implementation pass.
 
-## Frontend Model Flow
+## Export API
 
-The PyTorch side should look similar to a normal model export flow:
+The model-level export should stay close to the existing `torch2vk` pattern:
 
-1. Load or construct a real `nn.Module`.
-2. Run `torch.export` or FX tracing with meta tensors for shapes.
-3. Preserve module path names, parameter names, and call boundaries.
-4. Match known subgraphs or modules to `torch2air` kernel rules.
-5. Attach disk weight references such as GGUF tensor names and quantization
-   types.
+```python
+export_one(
+    "run_text_layer",
+    text_model.layers[0],
+    args=(torch.zeros(1, prompt_len, hidden_size, device="meta"),),
+    kwargs={
+        "position_embeddings": (
+            torch.zeros(1, prompt_len, head_dim, device="meta"),
+            torch.zeros(1, prompt_len, head_dim, device="meta"),
+        ),
+        "past_key_values": None,
+        "attention_mask": None,
+    },
+    weight_prefix="model.layers.0.",
+    kv_inject=KVCacheInjectHint(phase="prefill", max_seq_len=max_seq),
+    reference_tensors="model_tensors().text_layers[layer_idx]",
+    reference_name="qwen3.prefill.layer.{layer_idx}",
+    export_registry=Q4_K_M_REGISTRY,
+    weight_quantization=quantized_weights,
+    shape_exprs=layer_shape_exprs,
+)
+```
 
-For quantized kernels, the PyTorch graph is not the exact arithmetic source. For
-example, a PyTorch `Linear` may conceptually be `x @ W`, but the actual AIR
-kernel can consume packed Q4_K bytes and decode on device. The frontend exports
-the structural intent; the kernel rule owns the NPU implementation.
+`torch.export` is used to discover the aten graph, shapes, names, and call
+boundaries. It is not expected to express packed GGUF math exactly. Packed
+weight handling belongs to the AIR variant selected from the registry.
 
-## IR Layers
+## Registry
 
-`torch2air` should use four IR layers.
+`torch2air.export.registry` should mirror `torch2vk.export.registry`.
 
-### 1. Model Description
+Conceptual API:
 
-This is a lightweight metadata layer derived from PyTorch:
+```python
+@dataclass(frozen=True, slots=True)
+class AirBinding:
+    target: str
+    factory: Callable[[torch.fx.Node, AirContext], AirVariant | None]
+
+
+class AirRegistry:
+    def resolve(self, node: torch.fx.Node, context: AirContext) -> AirVariant | None:
+        ...
+```
+
+Default registry:
+
+```python
+DEFAULT_REGISTRY = AirRegistry(
+    [
+        AirBinding("aten.linear.default", make_linear_variant),
+        AirBinding("aten.mul.Tensor", make_elementwise_variant),
+        AirBinding("aten.add.Tensor", make_elementwise_variant),
+        AirBinding("aten.mean.dim", make_reduce_variant),
+        AirBinding("aten.rsqrt.default", make_elementwise_variant),
+        AirBinding("aten.silu.default", make_elementwise_variant),
+        AirBinding("aten.scaled_dot_product_attention.default", make_sdpa_variant),
+        AirBinding("aten.embedding.default", make_embedding_variant),
+    ]
+)
+```
+
+Quantized registries override only the ops whose implementation changes:
+
+```python
+Q4_K_M_REGISTRY = AirRegistry(
+    [
+        AirBinding("aten.linear.default", make_q4_k_m_linear_variant),
+        AirBinding("aten.embedding.default", make_q4_k_m_embedding_variant),
+        # Remaining bindings can reuse DEFAULT_REGISTRY factories.
+    ]
+)
+```
+
+This is the important simplification: `torch2air` does not need a separate
+"model IR" and "logical linalg IR" layer before AIR. The exported aten graph is
+the control structure, and the registry maps nodes or small patterns to backend
+variants.
+
+## AirVariant
+
+`AirVariant` is the AIR equivalent of `ShaderVariant`.
+
+It should carry:
+
+- `name`: stable generated artifact name
+- `target`: matched aten target or fused pattern name
+- `inputs` and `outputs`: buffer contracts
+- `weight_bindings`: disk weight names and packed formats
+- `template`: textual MLIR-AIR template path or renderer
+- `tile_config`: tile sizes, herd shape, memory spaces, and buffering mode
+- `runtime_entry`: symbol name used by the host runner
+
+Example:
+
+```python
+AirVariant(
+    name="q4_k_m_linear_1x4096x4096_tile8",
+    target="aten.linear.default",
+    inputs=[AirBuffer("x", "1xSx4096xf16")],
+    outputs=[AirBuffer("y", "1xSx4096xf16")],
+    weight_bindings=[
+        PackedWeight("weight", "model.layers.0.self_attn.q_proj.weight", "Q4_K_M"),
+    ],
+    template="templates/q4_k_m_linear.air.mlir.j2",
+    tile_config=TileConfig(m_tile=1, n_tile=8, k_tile=1024, cols=8),
+    runtime_entry="q4_k_m_linear",
+)
+```
+
+The AIR template is allowed to contain explicit tiling, `air.herd`, local
+buffers, and DMA operations. That is equivalent to a `torch2vk` shader carrying
+its own workgroup layout and memory-access strategy.
+
+## Generated Files
+
+For one exported function, generate a small manifest and the AIR artifacts:
 
 ```text
-module path: model.layers.0.self_attn.q_proj
-logical op: q_proj
-activation shape: tensor<8x1024xf16>
-weight source: GGUF tensor model.layers.0.self_attn.q_proj.weight
-weight format: Q4_K
-output shape: tensor<8x2048xf16>
+models/quantized_qwen3/generated/
+  run_text_layer.graph.json
+  run_text_layer.manifest.json
+  run_text_layer_000_q4_k_m_linear.tiled.mlir
+  run_text_layer_000_q4_k_m_linear.air.mlir
+  run_text_layer_001_rmsnorm.tiled.mlir
+  run_text_layer_001_rmsnorm.air.mlir
 ```
 
-This layer is stable and easy to diff. It should be serializable as JSON or a
-small Python object graph.
+`.graph.json` records the normalized aten graph for debugging.
 
-### 2. Logical Linalg/Marker IR
+`.manifest.json` records inputs, outputs, weights, AIR files, and runtime entry
+symbols.
 
-This optional layer describes the mathematical contract:
+`.tiled.mlir` / `.air.mlir` are the backend artifacts. In simple cases the
+variant can emit `.air.mlir` directly. When a helper pass is useful, it can emit
+`.tiled.mlir` first and run `air-opt`.
 
-```mlir
-%out = linalg.generic
-    {torch2air.kernel = "q4k_f16_matmul"}
-    ins(%activation, %packed_weight : tensor<8x1024xf16>, tensor<2048x1024xi8>)
-    outs(%init : tensor<8x2048xf16>) {
-  ...
-} -> tensor<8x2048xf16>
-```
+## Tiling Policy
 
-This is useful for provenance, testing, and shape checking. It is not required
-to be executable by itself.
+Tiling should live in each AIR variant, not in a global optimizer.
 
-### 3. Tiled Memref IR
-
-This is the main source layer for MLIR-AIR. Tiling is explicit in the IR:
-
-```mlir
-scf.parallel (%oc) = (%c0) to (%c2048) step (%c8) {
-  %w_global = memref.subview %packed_weight[%oc, 0] [8, 1024] [1, 1]
-      : memref<2048x1024xi8> to memref<8x1024xi8, strided<[1024, 1], offset: ?>>
-  %o_global = memref.subview %output[0, %oc] [8, 8] [1, 1]
-      : memref<8x2048xf16> to memref<8x8xf16, strided<[2048, 1], offset: ?>>
-
-  %x_l1 = memref.alloc() : memref<8x1024xf16, 2 : i32>
-  %w_l1 = memref.alloc() : memref<8x1024xi8, 2 : i32>
-  %o_l1 = memref.alloc() : memref<8x8xf16, 2 : i32>
-
-  memref.copy %activation, %x_l1
-      : memref<8x1024xf16> to memref<8x1024xf16, 2 : i32>
-  memref.copy %w_global, %w_l1
-      : memref<8x1024xi8, strided<[1024, 1], offset: ?>>
-        to memref<8x1024xi8, 2 : i32>
-
-  call @q4k_f16_8x1024x8(%x_l1, %w_l1, %o_l1)
-      : (memref<8x1024xf16, 2 : i32>,
-         memref<8x1024xi8, 2 : i32>,
-         memref<8x8xf16, 2 : i32>) -> ()
-
-  memref.copy %o_l1, %o_global
-      : memref<8x8xf16, 2 : i32>
-        to memref<8x8xf16, strided<[2048, 1], offset: ?>>
-}
-```
-
-This layer is where `torch2air` directly controls:
-
-- output-column tile size
-- activation and weight tile shape
-- L1/L2/global memory placement
-- copy order
-- whether the compute body is a `linalg` op or an external AIE kernel call
-- future double buffering and DMA/compute overlap
-
-### 4. AIR/AIE IR
-
-MLIR-AIR tools lower the tiled memref IR:
+For example, Q4_K linear can use an AIR template that already knows:
 
 ```text
-air-par-to-herd
-air-copy-to-dma
-air-dependency
-air-dma-to-channel
-air-place-herds
-air-to-aie
-air-to-std
-airrt-to-npu
+activation tile: f16 [sequence_tile, k_tile]
+weight tile:     packed Q4_K_M bytes for [n_tile, k_tile]
+output tile:     f16 [sequence_tile, n_tile]
+herd shape:      columns/rows selected for the target NPU
+copy schedule:   global -> local, compute, local -> global
 ```
 
-Expected intermediate artifacts:
+This is still the same style as `torch2vk`: the backend implementation owns the
+low-level schedule. The registry only decides which implementation a node gets.
 
-- `.tiled.mlir`: hand-scheduled memref/scf IR
-- `.air.mlir`: AIR hierarchy and `air.dma_memcpy_nd`
-- `.aie.mlir`: `aie.device`, `aie.core`, locks, buffers, DMA BDs
-- runtime artifacts produced by `aircc.py`
+## Quantized Qwen3 First
 
-## Why Tiling Is Written Directly
+The first useful target should be `models/quantized_qwen3`.
 
-`air-par-to-herd` maps parallel loops to `air.herd`, but it does not invent an
-L1 tiling strategy by itself. To get DMA and local buffers, the input IR must
-already contain:
+Initial scope:
 
-- tile loops
-- `memref.subview`
-- `memref.alloc` in the desired memory space
-- `memref.copy`
+- Export one real `nn.Module` layer with `torch.export`.
+- Load real GGUF metadata and packed weight names.
+- Use `Q4_K_M_REGISTRY` for text layer linear/embedding ops.
+- Emit AIR variants that consume packed bytes on the NPU path.
+- Compare against PyTorch ROCm at the module boundary.
 
-Then `air-copy-to-dma` can turn the copies into `air.dma_memcpy_nd`.
+No host-side dequantization should be part of the AIR execution path. Host code
+may package buffers and run reference PyTorch ROCm, but the NPU kernel should see
+the same packed weight format that is on disk.
 
-MLIR-AIR also has `air-linalg-codegen`, which can generate this style of tiled
-IR for some Linalg programs. That pass should be treated as an optional helper,
-not as the core design. For Q4_K, FlashAttention, and other kernels where
-execution order is the performance contract, `torch2air` should generate the
-tiled memref IR explicitly.
+## Compile And Run
 
-## Quantized Qwen3 Direction
-
-The first model target should be one Qwen3 layer, starting with Q projection:
-
-```text
-activation:      memref<8x1024xf16>
-packed weight:   memref<2048x1024xi8>   # rows contain exact packed GGUF bytes
-output:          memref<8x2048xf16>
-hardware unit:   q4k_f16_8x1024x8
-```
-
-The generated program should tile output columns by 8:
-
-```text
-for oc in range(0, 2048, 8):
-  DMA activation tile to L1 or reuse resident activation tile
-  DMA packed_weight[oc:oc+8, :] to L1
-  run q4k_f16_8x1024x8 on AIE core
-  DMA output[:, oc:oc+8] back to global
-```
-
-The NPU input is packed bytes. The host may package buffers and compare results
-against PyTorch ROCm, but it must not dequantize weights for the NPU path.
-
-## Compute Kernel Choices
-
-The compute portion inside each tile can be represented in three ways:
-
-1. `linalg.matmul` or `linalg.generic` on L1 memrefs for simple integer/floating
-   kernels.
-2. `air-linalg-to-func{link-with=...}` for external AIE core kernels.
-3. Lower-level AIE/Peano code for kernels that need exact instruction-level
-   behavior.
-
-For Q4_K, the likely route is an external AIE core kernel because packed nibble
-decode, scale/min handling, and accumulation order matter.
-
-## Build Strategy
-
-Future bootstrap:
+The project should use MLIR-AIR tools directly:
 
 ```bash
-git submodule add https://github.com/Xilinx/mlir-air.git mlir-air
+scripts/export-quantized-qwen3.sh
+scripts/compile-air.sh models/quantized_qwen3/generated/run_text_layer.manifest.json
+scripts/run-quantized-qwen3-air.sh
 ```
 
-Build scripts should produce:
+Expected toolchain pieces come from the future `mlir-air/` submodule and its
+dependencies:
 
 - `air-opt`
 - `air-translate`
 - `aircc.py`
-- Python `air` package
-- required MLIR-AIE/llvm-aie/Peano pieces
+- XRT/AIR runtime pieces needed by the selected board
 
-The project should expose commands like:
+IREE `vmfb`, IREE HAL dispatch formation, and IREE encoding dialect are not the
+core path for this project.
 
-```bash
-scripts/export-quantized-qwen3.sh
-scripts/compile-air.sh models/quantized_qwen3/generated/q_proj.tiled.mlir
-scripts/run-quantized-qwen3.sh
-```
+## Non-Goals
 
-## Open Problems
+- Do not build a full PyTorch-to-AIR automatic optimizer.
+- Do not maintain a large hand-written model description language.
+- Do not require every op to pass through linalg first.
+- Do not dequantize GGUF weights on the host for NPU execution.
+- Do not make `iree-amd-aie` the project root.
 
-- Decide whether `air-linalg-codegen` is built and used as a helper for simple
-  kernels.
-- Fix or avoid AIRRt/NPU lowering issues from generated affine forms.
-- Define the exact AIR runtime ABI for model execution.
-- Decide how to package external AIE core kernels and link them through
-  `air-linalg-to-func` or `aircc.py`.
-- Add a minimal Q4_K end-to-end path with one tiled Q projection.
+The practical model is: export PyTorch, match aten, emit AIR.
