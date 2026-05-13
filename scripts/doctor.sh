@@ -49,10 +49,10 @@ else
   status=1
 fi
 
-if [[ -f "${IREE_AMD_AIE_ROOT}/iree-install-rocm/env.sh" ]]; then
-  printf 'ok   %-22s %s\n' iree-env "${IREE_AMD_AIE_ROOT}/iree-install-rocm/env.sh"
+if [[ -f "${IREE_AMD_AIE_ROOT}/iree-install/env.sh" ]]; then
+  printf 'ok   %-22s %s\n' iree-env "${IREE_AMD_AIE_ROOT}/iree-install/env.sh"
 else
-  printf 'miss %-22s %s\n' iree-env "${IREE_AMD_AIE_ROOT}/iree-install-rocm/env.sh"
+  printf 'miss %-22s %s\n' iree-env "${IREE_AMD_AIE_ROOT}/iree-install/env.sh"
   status=1
 fi
 

@@ -21,8 +21,8 @@ uv pip install --pre torch-mlir \
   -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
 ```
 
-On the current `iree-amd-aie` checkout you can also reuse the existing
-`~/projects/torch2vk/.venv` for PyTorch and call the checked-in scripts directly.
+On the current `iree-amd-aie` checkout, use the parent `.venv` as the shared
+Python environment for PyTorch, IREE Python bindings, and torch2air.
 
 Useful environment helpers:
 
@@ -66,6 +66,25 @@ To compile and verify the same linalg MLIR through the ROCm backend:
 ```bash
 third_party/torch2air/scripts/run-matmul-rocm.sh
 ```
+
+## Quantized Qwen3 Kernels
+
+The first model-specific scaffold mirrors `torch2vk`'s model layout under
+`src/models/quantized_qwen3`. It starts with one exported Qwen3-0.6B projection
+tile:
+
+```bash
+third_party/torch2air/scripts/build-quantized-qwen3-air.sh
+third_party/torch2air/scripts/run-quantized-qwen3-air.sh
+```
+
+The exporter and verifier use the same PyTorch module as the source of truth.
+`run-quantized-qwen3-air.sh` is a development smoke test: it uses
+`iree-run-module` and temporary `.npy` files only at the command-line tensor I/O
+boundary, then compares the IREE output against the PyTorch reference with torch
+operations. A deployment path should load the VMFB through the IREE runtime API
+and pass application-owned buffers directly, without `iree-run-module` or
+`.npy` files.
 
 ## CLI
 

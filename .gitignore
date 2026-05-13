@@ -3,7 +3,12 @@
 .ruff_cache/
 __pycache__/
 *.pyc
+*.egg-info/
 examples/generated/*.vmfb
 examples/generated/*.npy
 examples/generated/*.bin
 examples/generated/tmp*/
+src/models/*/generated/*.vmfb
+src/models/*/generated/*.npy
+src/models/*/generated/*.bin
+src/models/*/generated/tmp*/

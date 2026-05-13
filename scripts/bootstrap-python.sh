@@ -6,12 +6,16 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/env.sh"
 
 UV=${UV:-uv}
-VENV_DIR=${VENV_DIR:-"${TORCH2AIR_ROOT}/.venv"}
+VENV_DIR=${VENV_DIR:-"${IREE_AMD_AIE_ROOT}/.venv"}
 PYTHON_VERSION=${PYTHON_VERSION:-3.12}
 TORCH2AIR_EXTRAS=${TORCH2AIR_EXTRAS:-dev}
 INSTALL_TORCH_MLIR=${INSTALL_TORCH_MLIR:-0}
 
-"${UV}" venv --python "${PYTHON_VERSION}" "${VENV_DIR}"
+if [[ -x "${VENV_DIR}/bin/python" ]]; then
+  echo "Reusing virtual environment: ${VENV_DIR}"
+else
+  "${UV}" venv --python "${PYTHON_VERSION}" "${VENV_DIR}"
+fi
 if [[ -n "${TORCH2AIR_EXTRAS}" ]]; then
   "${UV}" pip install --python "${VENV_DIR}/bin/python" -e "${TORCH2AIR_ROOT}[${TORCH2AIR_EXTRAS}]"
 else

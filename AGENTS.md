@@ -12,9 +12,8 @@ source scripts/env.sh
 ```
 
 It discovers the parent `iree-amd-aie` checkout, sources
-`iree-install-rocm/env.sh` when available, picks `PYTHON`, and adds `src/` to
-`PYTHONPATH`. By default it reuses `~/projects/torch2vk/.venv/bin/python` when
-`torch2air/.venv` does not exist.
+`iree-install/env.sh` when available, picks the parent
+`iree-amd-aie/.venv/bin/python`, and adds `src/` to `PYTHONPATH`.
 
 For a local Python environment without RPM packages:
 
@@ -22,6 +21,9 @@ For a local Python environment without RPM packages:
 scripts/bootstrap-python.sh
 INSTALL_TORCH_MLIR=1 scripts/bootstrap-python.sh
 ```
+
+`scripts/bootstrap-python.sh` creates or refreshes the parent
+`iree-amd-aie/.venv`; do not create a separate `torch2air/.venv`.
 
 Run a quick environment check with:
 
@@ -67,6 +69,19 @@ Compile and run the same linalg MLIR through ROCm:
 scripts/run-matmul-rocm.sh
 ROCM_TARGET=gfx1150 scripts/run-matmul-rocm.sh
 ```
+
+Build and run the first quantized Qwen3 AIR kernel tile:
+
+```bash
+scripts/build-quantized-qwen3-air.sh
+scripts/run-quantized-qwen3-air.sh
+```
+
+The Qwen3 runner uses PyTorch as the reference implementation. It is a
+development smoke test: `.npy` files are only the tensor I/O format used by
+`iree-run-module`; after the device run, the output is converted back to a torch
+tensor and compared with the PyTorch reference. Deployment should call the VMFB
+through the IREE runtime API and pass application buffers directly.
 
 Useful direct CLI commands:
 

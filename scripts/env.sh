@@ -7,9 +7,9 @@ if [[ -z "${XDNA_DRIVER_ROOT:-}" && -d "${IREE_AMD_AIE_ROOT}/../xdna-driver" ]];
   export XDNA_DRIVER_ROOT=$(cd -- "${IREE_AMD_AIE_ROOT}/../xdna-driver" && pwd)
 fi
 
-if [[ -f "${IREE_AMD_AIE_ROOT}/iree-install-rocm/env.sh" ]]; then
+if [[ -f "${IREE_AMD_AIE_ROOT}/iree-install/env.sh" ]]; then
   # shellcheck disable=SC1091
-  source "${IREE_AMD_AIE_ROOT}/iree-install-rocm/env.sh"
+  source "${IREE_AMD_AIE_ROOT}/iree-install/env.sh"
 fi
 
 if [[ -n "${XDNA_DRIVER_ROOT:-}" && -f "${XDNA_DRIVER_ROOT}/build-bazzite/env-opt-xrt.sh" ]]; then
@@ -18,10 +18,8 @@ if [[ -n "${XDNA_DRIVER_ROOT:-}" && -f "${XDNA_DRIVER_ROOT}/build-bazzite/env-op
 fi
 
 if [[ -z "${PYTHON:-}" ]]; then
-  if [[ -x "${TORCH2AIR_ROOT}/.venv/bin/python" ]]; then
-    PYTHON="${TORCH2AIR_ROOT}/.venv/bin/python"
-  elif [[ -x "/var/home/taowen/projects/torch2vk/.venv/bin/python" ]]; then
-    PYTHON="/var/home/taowen/projects/torch2vk/.venv/bin/python"
+  if [[ -x "${IREE_AMD_AIE_ROOT}/.venv/bin/python" ]]; then
+    PYTHON="${IREE_AMD_AIE_ROOT}/.venv/bin/python"
   else
     PYTHON="python"
   fi
