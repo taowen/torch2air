@@ -52,15 +52,15 @@ class Qwen3Kernel:
 
 
 KERNELS: dict[str, Qwen3Kernel] = {
-    "prefill_q_proj_tile_i32": Qwen3Kernel(
-        name="prefill_q_proj_tile_i32",
+    "prefill_q_proj_tile_f32": Qwen3Kernel(
+        name="prefill_q_proj_tile_f32",
         function_name="qwen3_prefill_q_proj_tile",
         lhs_shape=(32, QWEN3_0_6B_SHAPES.hidden_size),
-        rhs_shape=(QWEN3_0_6B_SHAPES.hidden_size, QWEN3_0_6B_SHAPES.q_projection_size),
-        result_shape=(32, QWEN3_0_6B_SHAPES.q_projection_size),
-        dtype=torch.int32,
+        rhs_shape=(QWEN3_0_6B_SHAPES.hidden_size, QWEN3_0_6B_SHAPES.head_dim),
+        result_shape=(32, QWEN3_0_6B_SHAPES.head_dim),
+        dtype=torch.float32,
         description=(
-            "Tile of Qwen3 self_attn.q_proj using dequantized i32 weights; "
+            "Single-head tile of Qwen3 self_attn.q_proj using dequantized f32 weights; "
             "the quantized Q4_K weight loader is a later step."
         ),
     )

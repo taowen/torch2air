@@ -78,10 +78,9 @@ scripts/run-quantized-qwen3-air.sh
 ```
 
 The Qwen3 runner uses PyTorch as the reference implementation. It is a
-development smoke test: `.npy` files are only the tensor I/O format used by
-`iree-run-module`; after the device run, the output is converted back to a torch
-tensor and compared with the PyTorch reference. Deployment should call the VMFB
-through the IREE runtime API and pass application buffers directly.
+development smoke test: it loads the VMFB through the IREE Python runtime, runs
+it on `xrt-lite`, and compares the output against the PyTorch ROCm reference
+with torch operations.
 
 Useful direct CLI commands:
 

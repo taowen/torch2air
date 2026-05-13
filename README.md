@@ -79,12 +79,9 @@ third_party/torch2air/scripts/run-quantized-qwen3-air.sh
 ```
 
 The exporter and verifier use the same PyTorch module as the source of truth.
-`run-quantized-qwen3-air.sh` is a development smoke test: it uses
-`iree-run-module` and temporary `.npy` files only at the command-line tensor I/O
-boundary, then compares the IREE output against the PyTorch reference with torch
-operations. A deployment path should load the VMFB through the IREE runtime API
-and pass application-owned buffers directly, without `iree-run-module` or
-`.npy` files.
+`run-quantized-qwen3-air.sh` is a development smoke test: it loads the VMFB
+through the IREE Python runtime, runs it on `xrt-lite`, and compares the output
+against the PyTorch ROCm reference with torch operations.
 
 ## CLI
 

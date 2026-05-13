@@ -24,8 +24,13 @@ class Qwen3LinearTile(torch.nn.Module):
 def make_torch_inputs(kernel: Qwen3Kernel) -> tuple[torch.Tensor, torch.Tensor]:
     lhs_size = prod(kernel.lhs_shape)
     rhs_size = prod(kernel.rhs_shape)
-    lhs = (torch.arange(lhs_size, dtype=kernel.dtype).reshape(kernel.lhs_shape) % 17).contiguous()
-    rhs = (torch.arange(rhs_size, dtype=kernel.dtype).reshape(kernel.rhs_shape) % 13).contiguous()
+    lhs = torch.arange(lhs_size, dtype=kernel.dtype).reshape(kernel.lhs_shape).remainder(17)
+    rhs = torch.arange(rhs_size, dtype=kernel.dtype).reshape(kernel.rhs_shape).remainder(13)
+    if kernel.dtype.is_floating_point:
+        lhs = lhs / 17.0
+        rhs = rhs / 13.0
+    lhs = lhs.contiguous()
+    rhs = rhs.contiguous()
     return lhs, rhs
 
 
