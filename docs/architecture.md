@@ -207,6 +207,9 @@ q/k/v projections run sequentially from the same normalized-hidden BO and write
 separate output BOs. This is intentionally close to the torch2vk model: separate
 compiled programs can hand off through device buffers without inventing a
 torch2air runtime object.
+The current full-head q/k/v verification uses `OUTPUT_ROWS=128` and
+`OUTPUT_TILE_ROWS=32`; the earlier 64-row half-head shape remains available by
+overriding those environment variables.
 
 When two adjacent operators can be fused without changing the schedule shape,
 keep that as an explicit experiment. The current

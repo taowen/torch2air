@@ -121,26 +121,26 @@ shared `pyxrt.bo` hidden buffer. The intermediate hidden state stays on the NPU
 path between the two operators; it is copied back only after execution for
 verification.
 
-Run the first attention projections:
+Run the first full-head attention projections:
 
 ```bash
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh v_proj
 ```
 
 Run the current projection pipelines:
 
 ```bash
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 ```
 

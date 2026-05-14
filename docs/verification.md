@@ -198,28 +198,34 @@ AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
 AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh k_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh v_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh v_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
 
 AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 
 AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
@@ -358,6 +364,42 @@ v_proj external Q6_K kernel, 2 tokens, output_rows 64:
   allclose True rtol=0.05 atol=0.1
   mean_ms 11.287
 
+q_proj external Q4_K kernel, 1 token, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.058996558
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 27.872
+
+q_proj external Q4_K kernel, 2 tokens, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.058996558
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 28.014
+
+k_proj external Q4_K kernel, 1 token, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.03157258
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 27.663
+
+k_proj external Q4_K kernel, 2 tokens, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.046132445
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 28.110
+
+v_proj external Q6_K kernel, 1 token, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.00775823
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 20.167
+
+v_proj external Q6_K kernel, 2 tokens, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.0078741657
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 20.814
+
 pipeline_embed_norm_qproj shared BO handoff, 1 token, output_rows 64:
   reference safetensors_pytorch_rocm AMD Radeon 890M
   hidden_max_abs 0.0054986477
@@ -373,6 +415,14 @@ pipeline_embed_norm_qproj shared BO handoff, 2 tokens, output_rows 64:
   qproj_max_abs 0.081097126
   allclose True rtol=0.05 atol=0.2
   mean_ms 17.821
+
+pipeline_embed_norm_qproj shared BO handoff, 1 token, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  qproj_max_abs 0.081097126
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 29.340
 
 pipeline_embed_norm_qkv shared BO handoff, 1 token, output_rows 64:
   reference safetensors_pytorch_rocm AMD Radeon 890M
@@ -393,6 +443,26 @@ pipeline_embed_norm_qkv shared BO handoff, 2 tokens, output_rows 64:
   v_proj_max_abs 0.037101876
   allclose True rtol=0.05 atol=0.2
   mean_ms 43.504
+
+pipeline_embed_norm_qkv shared BO handoff, 1 token, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.031209335
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 77.533
+
+pipeline_embed_norm_qkv shared BO handoff, 2 tokens, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.037101876
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 78.332
 ```
 
 Notes:
@@ -401,6 +471,10 @@ Notes:
   the 1x4 and 2x4 variants, but still produces AIE IR, xclbin/insts, and a
   passing hardware result. Track this as a placement diagnostic issue, not as a
   runtime failure.
+- Full-head projection verification uses `OUTPUT_ROWS=128` with
+  `OUTPUT_TILE_ROWS=32`. The `128/16` shape creates eight projection tiles; on
+  `npu2` with the current row anchor, `air-to-aie` emits an out-of-range tile
+  row and does not reach hardware execution.
 - Q6_K projection variants currently print AIE bank allocation warnings because
   the spike widens Q6_K halfwords to i32 in L1. The generated xclbin still runs
   and matches the PyTorch ROCm reference. Compact i16 L1 DMA is the next

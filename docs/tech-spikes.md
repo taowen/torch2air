@@ -41,6 +41,9 @@ overflows program memory for the current Q4_K embedding body.
 The next verified steps, `embed_tokens -> input_layernorm -> q_proj` and
 `embed_tokens -> input_layernorm -> q/k/v`, keep the same shared-BO style and
 add official AIR external kernels for Q4_K and Q6_K linear tile bodies.
+The latest q/k/v verification covers one full Qwen3 attention head
+(`OUTPUT_ROWS=128`) on real NPU hardware using 32 output rows per external
+kernel tile.
 
 ## Baseline IR Shape
 

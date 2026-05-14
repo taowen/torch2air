@@ -199,7 +199,7 @@ def export_attention_proj(
     sequence_length: int,
     gguf_path: Path = DEFAULT_GGUF,
     output_rows_override: int | None = None,
-    output_tile_rows: int = 16,
+    output_tile_rows: int = 32,
 ) -> None:
     if proj_name not in ATTENTION_PROJ_NAMES:
         raise ValueError(f"proj_name must be one of {ATTENTION_PROJ_NAMES}, got {proj_name!r}")
@@ -212,7 +212,7 @@ def export_attention_proj(
         model = Qwen3ForCausalLM(config)
     module = getattr(model.model.layers[0].self_attn, proj_name)
     proj_output_size = int(module.out_features)
-    output_rows = output_rows_override or 64
+    output_rows = output_rows_override or 128
     if output_rows <= 0 or output_rows > proj_output_size:
         raise ValueError(f"output_rows must be in [1, {proj_output_size}], got {output_rows}")
     if output_tile_rows <= 0 or output_rows % output_tile_rows != 0:
@@ -262,7 +262,7 @@ def export_q_proj(
     sequence_length: int,
     gguf_path: Path = DEFAULT_GGUF,
     output_rows_override: int | None = None,
-    output_tile_rows: int = 16,
+    output_tile_rows: int = 32,
 ) -> None:
     export_attention_proj(
         proj_name="q_proj",
@@ -406,12 +406,12 @@ def main() -> int:
         "--output-rows",
         type=int,
         default=None,
-        help="Q4_K attention projection output rows to export; defaults to 64.",
+        help="attention projection output rows to export; defaults to 128.",
     )
     parser.add_argument(
         "--output-tile-rows",
         type=int,
-        default=16,
+        default=32,
         help="Q4_K linear output rows computed per AIE tile.",
     )
     parser.add_argument("--dry-run", action="store_true")
