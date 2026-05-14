@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from typing import cast
 import numpy as np
 from air.backend.xrt_runner import type_mapper
 from air.dialects import arith
@@ -9,34 +7,17 @@ from air.dialects.air import (
     MemorySpace,
     T,
     dma_memcpy_nd,
-    herd,
-    launch,
     module_builder,
-    segment,
 )
 from air.dialects.func import FuncOp
 from air.dialects.memref import AllocOp, DeallocOp, load, store
 from air.dialects.scf import for_, yield_
 from air._mlir_libs._mlir.ir import IntegerAttr, MemRefType, Module, Type, Value
 
+from torch2air.export.air_dsl import air_herd, air_launch, air_segment, idx
 from torch2air.export.builder import KernelAttr, TensorInfo
 
 range_ = for_
-
-type RegionBody = Callable[..., None]
-type RegionDecorator = Callable[[RegionBody], RegionBody]
-
-
-def air_launch(*, operands: Sequence[Value]) -> RegionDecorator:
-    return cast(RegionDecorator, launch(operands=operands))
-
-
-def air_segment(*, name: str, operands: Sequence[Value]) -> RegionDecorator:
-    return cast(RegionDecorator, segment(name=name, operands=operands))
-
-
-def air_herd(*, name: str, sizes: Sequence[int], operands: Sequence[Value]) -> RegionDecorator:
-    return cast(RegionDecorator, herd(name=name, sizes=sizes, operands=operands))
 
 
 class Q4KEmbeddingAirBuilder:
@@ -153,8 +134,8 @@ def build_q4k_embedding_air(
                         scale_l1 = AllocOp(scale_l1_type, [], [])
                         out_l1 = AllocOp(output_l1_type, [], [])
 
-                        packed_col = arith.muli(tile_j, _idx(36))
-                        out_col = arith.muli(tile_j, _idx(256))
+                        packed_col = arith.muli(tile_j, idx(36))
+                        out_col = arith.muli(tile_j, idx(256))
                         for token_i in range_(sequence_length):
                             dma_memcpy_nd(
                                 packed_l1,
@@ -166,7 +147,7 @@ def build_q4k_embedding_air(
                             dma_memcpy_nd(
                                 scale_l1,
                                 scales,
-                                src_offsets=[token_i, tile_j, _idx(0)],
+                                src_offsets=[token_i, tile_j, idx(0)],
                                 src_sizes=[1, 1, 2],
                                 src_strides=[blocks_per_row * 2, 2, 1],
                             )
@@ -194,8 +175,8 @@ def build_q4k_embedding_air(
 
 
 def _emit_q4k_dequant_tile(*, i32, f32, packed_l1, scale_l1, out_l1) -> None:
-    d = load(scale_l1, [_idx(0), _idx(0), _idx(0)])
-    dmin = load(scale_l1, [_idx(0), _idx(0), _idx(1)])
+    d = load(scale_l1, [idx(0), idx(0), idx(0)])
+    dmin = load(scale_l1, [idx(0), idx(0), idx(1)])
     scales: list[tuple[Value, Value]] = []
     for subblock in range(8):
         scale, minimum = _emit_scale_min(i32=i32, packed_l1=packed_l1, subblock=subblock)
@@ -205,9 +186,9 @@ def _emit_q4k_dequant_tile(*, i32, f32, packed_l1, scale_l1, out_l1) -> None:
 
     for pair in range(4):
         for q_word_i in range_(8):
-            word_index = arith.addi(q_word_i, _idx(4 + pair * 8))
-            q_word = load(packed_l1, [_idx(0), word_index])
-            word_base = arith.muli(q_word_i, _idx(4))
+            word_index = arith.addi(q_word_i, idx(4 + pair * 8))
+            q_word = load(packed_l1, [idx(0), word_index])
+            word_base = arith.muli(q_word_i, idx(4))
             for byte in range(4):
                 _emit_quant_byte(
                     i32=i32,
@@ -267,26 +248,22 @@ def _emit_quant_byte(
     even_value = arith.subf(arith.mulf(even_d, lo_f32), even_min)
     odd_value = arith.subf(arith.mulf(odd_d, hi_f32), odd_min)
 
-    out_word_byte = arith.addi(word_base, _idx(byte))
-    out_even = arith.addi(out_word_byte, _idx(pair * 64))
-    out_odd = arith.addi(out_word_byte, _idx(pair * 64 + 32))
-    store(even_value, out_l1, [_idx(0), out_even])
-    store(odd_value, out_l1, [_idx(0), out_odd])
+    out_word_byte = arith.addi(word_base, idx(byte))
+    out_even = arith.addi(out_word_byte, idx(pair * 64))
+    out_odd = arith.addi(out_word_byte, idx(pair * 64 + 32))
+    store(even_value, out_l1, [idx(0), out_even])
+    store(odd_value, out_l1, [idx(0), out_odd])
 
 
 def _emit_byte_at(*, i32, packed_l1, byte_offset: int):
     word_offset = byte_offset // 4
     bit_offset = (byte_offset % 4) * 8
-    word = load(packed_l1, [_idx(0), _idx(word_offset)])
+    word = load(packed_l1, [idx(0), idx(word_offset)])
     return _mask_i32(i32, arith.shrui(word, _i32(i32, bit_offset)), 255)
 
 
 def _mask_i32(i32, value, mask: int):
     return arith.andi(value, _i32(i32, mask))
-
-
-def _idx(value: int):
-    return arith.ConstantOp(T.index(), value)
 
 
 def _i32(i32, value: int):

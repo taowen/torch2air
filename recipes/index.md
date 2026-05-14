@@ -13,6 +13,7 @@
 | [attention-head-loop.md](attention-head-loop.md) | 多 head attention 怎么避免 tile 程序膨胀。 | host 常量 offset，tile 内运行时 head loop。 |
 | [attention-tile-limits.md](attention-tile-limits.md) | attention tile size 先选多大。 | `KEY_TILE_ROWS=8`，`QUERY_TILE_ROWS<=32`。 |
 | [python-air-dsl-kernel.md](python-air-dsl-kernel.md) | Python kernel 应该怎么写。 | 用 MLIR-AIR Python DSL，不要用 Python 拼 MLIR 字符串。 |
+| [herd-scalar-accumulator.md](herd-scalar-accumulator.md) | herd 内标量累加怎么写。 | 用 L1 scalar memref，不要依赖 `scf.for iter_args`。 |
 
 维护规则：
 

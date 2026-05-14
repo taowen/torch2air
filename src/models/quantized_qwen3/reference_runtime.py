@@ -115,5 +115,12 @@ def max_abs_rocm(actual: np.ndarray, expected: torch.Tensor) -> float:
     return float(torch.max(torch.abs(actual_t - expected.to(torch.float32))).item())
 
 
+def rmsnorm_rocm(hidden: torch.Tensor, weight: np.ndarray, eps: float) -> torch.Tensor:
+    hidden_t = hidden.to(device=rocm_device(), dtype=torch.float32)
+    weight_t = torch.as_tensor(np.ascontiguousarray(weight), device=hidden_t.device)
+    variance = torch.mean(hidden_t * hidden_t, dim=-1, keepdim=True)
+    return hidden_t * torch.rsqrt(variance + eps) * weight_t.reshape(1, -1)
+
+
 def first_values(tensor: torch.Tensor, count: int = 8) -> list[float]:
     return [float(value) for value in tensor.reshape(-1)[:count].detach().cpu().tolist()]

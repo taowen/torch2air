@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from torch2air.export.builder import AirBuilder
+from torch2air.export.input_layernorm import InputLayerNormAirBuilder
 from torch2air.export.q4k_embedding import Q4KEmbeddingAirBuilder
 
 
@@ -39,7 +40,40 @@ def compile_q4k_embedding_python_kernel(
         source_mlir=source_mlir,
         work_dir=work_dir,
         stem=instance_name,
+        herd_rows=1,
         herd_cols=_embedding_herd_cols(builder),
+    )
+    _, xclbin, insts = compile_runtime(
+        aie_mlir=aie_mlir,
+        work_dir=work_dir,
+        instance_name=instance_name,
+        peano_install_dir=str(peano),
+    )
+    return source_mlir, aie_mlir, xclbin, insts
+
+
+def compile_input_layernorm_python_kernel(
+    *,
+    kernel_py: Path,
+    function_name: str,
+    work_dir: Path,
+    instance_name: str,
+    eps: float,
+) -> tuple[Path, Path, Path, Path]:
+    _, _, peano = prepend_air_tool_paths()
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    builder = InputLayerNormAirBuilder(function_name=instance_name, eps=eps)
+    load_kernel_function(kernel_py, function_name)(builder)
+    source_mlir = work_dir / f"{instance_name}.air.mlir"
+    source_mlir.write_text(builder.render_air())
+    aie_mlir = lower_scf_air_to_aie(
+        source_mlir=source_mlir,
+        work_dir=work_dir,
+        stem=instance_name,
+        herd_rows=_input_layernorm_herd_rows(builder),
+        herd_cols=1,
     )
     _, xclbin, insts = compile_runtime(
         aie_mlir=aie_mlir,
@@ -69,6 +103,7 @@ def lower_scf_air_to_aie(
     source_mlir: Path,
     work_dir: Path,
     stem: str,
+    herd_rows: int,
     herd_cols: int,
 ) -> Path:
     air_opt = Path(os.environ["MLIR_AIR_INSTALL_DIR"]) / "bin" / "air-opt"
@@ -99,7 +134,8 @@ def lower_scf_air_to_aie(
             "--air-dma-to-channel",
             "--canonicalize",
             "--cse",
-            f"--air-place-herds=num-rows=1 num-cols={herd_cols} row-anchor=2 col-anchor=0",
+            f"--air-place-herds=num-rows={herd_rows} num-cols={herd_cols} "
+            "row-anchor=2 col-anchor=0",
             "-o",
             str(channel_mlir),
         ],
@@ -233,3 +269,12 @@ def _embedding_herd_cols(builder: Q4KEmbeddingAirBuilder) -> int:
     if hidden_size % 256 != 0:
         raise ValueError(f"Q4_K hidden size must be divisible by 256, got {hidden_size}")
     return hidden_size // 256
+
+
+def _input_layernorm_herd_rows(builder: InputLayerNormAirBuilder) -> int:
+    if not builder.outputs:
+        raise ValueError("kernel did not mark an output")
+    output = builder.tensors[builder.outputs[-1]]
+    if len(output.shape) != 3:
+        raise ValueError(f"expected rank-3 input_layernorm output, got {output.shape}")
+    return min(output.shape[1], 4)
