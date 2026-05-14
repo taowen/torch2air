@@ -2,6 +2,30 @@
 
 AIR backend experiments for PyTorch-exported models.
 
+## Current Layout
+
+The previous MLIR-template and C++ external-kernel implementation is preserved under:
+
+```text
+legacy/src/
+legacy/examples/
+```
+
+The active `src/` tree is being rebuilt around a simpler rule: traverse the
+`torch.export.ExportedProgram` directly, and map each aten op to one Python
+kernel in `torch2air.export.kernels`.
+
+Smoke-test the new exporter:
+
+```bash
+uv run --no-sync python -m models.quantized_qwen3.export --dry-run
+
+uv run --no-sync python -m models.quantized_qwen3.export \
+  --stage embed_tokens \
+  --sequence-length 2 \
+  --output-dir .cache/new-export-smoke
+```
+
 ## AIR Tool Environment
 
 Install the MLIR-AIR wheel toolchain with `uv` and Python 3.12:

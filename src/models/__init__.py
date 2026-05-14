@@ -1,1 +1,1 @@
-"""Model-level export entrypoints."""
+"""Model export entry points."""

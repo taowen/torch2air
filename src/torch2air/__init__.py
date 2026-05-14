@@ -1,2 +1,1 @@
-"""Minimal torch2air spike utilities."""
-
+"""AIR export experiments for PyTorch programs."""
