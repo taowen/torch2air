@@ -8,36 +8,6 @@ from torch.fx import Node
 from torch.fx.node import Argument
 
 
-KERNEL_FUNCTIONS: dict[str, str] = {
-    "aten.add.Tensor": "aten_add_tensor",
-    "aten.cat.default": "aten_cat_default",
-    "aten.cos.default": "aten_cos_default",
-    "aten.div.Tensor": "aten_div_tensor",
-    "aten.embedding.default": "aten_embedding_default",
-    "aten.gelu.default": "aten_gelu_default",
-    "aten.linear.default": "aten_linear_default",
-    "aten.matmul.default": "aten_matmul_default",
-    "aten.mean.dim": "aten_mean_dim",
-    "aten.mul.Tensor": "aten_mul_tensor",
-    "aten.neg.default": "aten_neg_default",
-    "aten.permute.default": "aten_permute_default",
-    "aten.pow.Tensor_Scalar": "aten_pow_tensor_scalar",
-    "aten.repeat_interleave.self_int": "aten_repeat_interleave_self_int",
-    "aten.reshape.default": "aten_reshape_default",
-    "aten.rsqrt.default": "aten_rsqrt_default",
-    "aten.scaled_dot_product_attention.default": "aten_scaled_dot_product_attention_default",
-    "aten.select.int": "aten_select_int",
-    "aten.silu.default": "aten_silu_default",
-    "aten.sin.default": "aten_sin_default",
-    "aten.slice.Tensor": "aten_slice_tensor",
-    "aten.sub.Tensor": "aten_sub_tensor",
-    "aten.sum.dim_IntList": "aten_sum_dim_int_list",
-    "aten.transpose.int": "aten_transpose_int",
-    "aten.unsqueeze.default": "aten_unsqueeze_default",
-    "aten.view.default": "aten_view_default",
-}
-
-
 ALIAS_TARGETS = frozenset(
     {
         "aten._assert_tensor_metadata.default",
@@ -46,6 +16,38 @@ ALIAS_TARGETS = frozenset(
         "aten.detach.default",
         "aten.to.dtype",
         "aten.to.dtype_layout",
+    }
+)
+
+
+KERNEL_TARGETS = frozenset(
+    {
+        "aten.add.Tensor",
+        "aten.cat.default",
+        "aten.cos.default",
+        "aten.div.Tensor",
+        "aten.embedding.default",
+        "aten.gelu.default",
+        "aten.linear.default",
+        "aten.matmul.default",
+        "aten.mean.dim",
+        "aten.mul.Tensor",
+        "aten.neg.default",
+        "aten.permute.default",
+        "aten.pow.Tensor_Scalar",
+        "aten.repeat_interleave.self_int",
+        "aten.reshape.default",
+        "aten.rsqrt.default",
+        "aten.scaled_dot_product_attention.default",
+        "aten.select.int",
+        "aten.silu.default",
+        "aten.sin.default",
+        "aten.slice.Tensor",
+        "aten.sub.Tensor",
+        "aten.sum.dim_IntList",
+        "aten.transpose.int",
+        "aten.unsqueeze.default",
+        "aten.view.default",
     }
 )
 
@@ -71,8 +73,7 @@ def render_exported_program(program: ExportedProgram, *, function_name: str) -> 
         "",
         "from __future__ import annotations",
         "",
-        "from torch2air.export import kernels",
-        "from torch2air.export.builder import AirBuilder",
+        "from torch2air.export.builder import AirBuilder, KernelAttr",
         "",
         "",
         f"def {function_name}(builder: AirBuilder) -> None:",
@@ -108,29 +109,25 @@ def _render_body(program: ExportedProgram) -> list[str]:
         if target in ALIAS_TARGETS:
             lines.append(_render_alias(node, target))
             continue
-        function_name = KERNEL_FUNCTIONS.get(target)
-        if function_name is None:
+        if target not in KERNEL_TARGETS:
             raise RuntimeError(f"unsupported aten op {target} on {node.name}")
-        lines.extend(_render_kernel_call(node, target, function_name))
+        lines.extend(_render_kernel_call(node, target))
     return lines
 
 
 def _render_alias(node: Node, target: str) -> str:
     source = _node_arg_name(node, 0)
-    return (
-        f"    kernels.alias(builder, source={source!r}, output={node.name!r}, "
-        f"target={target!r})"
+    return _render_emit_kernel(
+        target,
+        output=node.name,
+        inputs=(source,),
+        attrs=(("alias", "true"),),
     )
 
 
-def _render_kernel_call(node: Node, target: str, function_name: str) -> list[str]:
+def _render_kernel_call(node: Node, target: str) -> list[str]:
     if target in {"aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"}:
-        return [
-            (
-                f"    kernels.{function_name}(builder, lhs={_arg_name(node, 0)!r}, "
-                f"rhs={_arg_name(node, 1)!r}, output={node.name!r})"
-            )
-        ]
+        return [_render_emit_kernel(target, output=node.name, inputs=_arg_names(node, 0, 1))]
     if target in {
         "aten.cos.default",
         "aten.neg.default",
@@ -138,94 +135,173 @@ def _render_kernel_call(node: Node, target: str, function_name: str) -> list[str
         "aten.silu.default",
         "aten.sin.default",
     }:
-        return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r})"
-        ]
+        return [_render_emit_kernel(target, output=node.name, inputs=(_node_arg_name(node, 0),))]
     if target == "aten.pow.Tensor_Scalar":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, exponent={_literal_arg(node, 1)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("exponent", _literal_arg(node, 1)),),
+            )
         ]
     if target == "aten.gelu.default":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, approximate={_literal_arg(node, 1, default='none')!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("approximate", _literal_arg(node, 1, default="none")),),
+            )
         ]
     if target in {"aten.view.default", "aten.reshape.default"}:
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, shape={_literal_arg(node, 1)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("shape", _literal_arg(node, 1)),),
+            )
         ]
     if target == "aten.unsqueeze.default":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, dim={_literal_arg(node, 1)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("dim", _literal_arg(node, 1)),),
+            )
         ]
     if target == "aten.permute.default":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, dims={_literal_arg(node, 1)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("dims", _literal_arg(node, 1)),),
+            )
         ]
     if target == "aten.transpose.int":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, dim0={_literal_arg(node, 1)!r}, "
-            f"dim1={_literal_arg(node, 2)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("dim0", _literal_arg(node, 1)), ("dim1", _literal_arg(node, 2))),
+            )
         ]
     if target in {"aten.mean.dim", "aten.sum.dim_IntList"}:
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, dims={_literal_arg(node, 1)!r}, "
-            f"keepdim={_literal_arg(node, 2, default=False)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(
+                    ("dims", _literal_arg(node, 1)),
+                    ("keepdim", _literal_arg(node, 2, default=False)),
+                ),
+            )
         ]
     if target == "aten.embedding.default":
         return [
-            f"    kernels.{function_name}(builder, weight={_node_arg_name(node, 0)!r}, "
-            f"indices={_node_arg_name(node, 1)!r}, output={node.name!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0), _node_arg_name(node, 1)),
+            )
         ]
     if target == "aten.linear.default":
         bias = _optional_node_arg_name(node, 2)
-        return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"weight={_node_arg_name(node, 1)!r}, bias={bias!r}, output={node.name!r})"
-        ]
+        inputs = (_node_arg_name(node, 0), _node_arg_name(node, 1))
+        if bias is not None:
+            inputs = (*inputs, bias)
+        return [_render_emit_kernel(target, output=node.name, inputs=inputs)]
     if target == "aten.matmul.default":
         return [
-            f"    kernels.{function_name}(builder, lhs={_node_arg_name(node, 0)!r}, "
-            f"rhs={_node_arg_name(node, 1)!r}, output={node.name!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0), _node_arg_name(node, 1)),
+            )
         ]
     if target == "aten.cat.default":
         return [
-            f"    kernels.{function_name}(builder, tensors={_node_arg_names(node, 0)!r}, "
-            f"output={node.name!r}, dim={_literal_arg(node, 1, default=0)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=_node_arg_names(node, 0),
+                attrs=(("dim", _literal_arg(node, 1, default=0)),),
+            )
         ]
     if target == "aten.slice.Tensor":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, dim={_literal_arg(node, 1)!r}, "
-            f"start={_literal_arg(node, 2)!r}, end={_literal_arg(node, 3)!r}, "
-            f"step={_literal_arg(node, 4, default=1)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(
+                    ("dim", _literal_arg(node, 1)),
+                    ("start", _literal_arg(node, 2)),
+                    ("end", _literal_arg(node, 3)),
+                    ("step", _literal_arg(node, 4, default=1)),
+                ),
+            )
         ]
     if target == "aten.select.int":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, dim={_literal_arg(node, 1)!r}, "
-            f"index={_literal_arg(node, 2)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(("dim", _literal_arg(node, 1)), ("index", _literal_arg(node, 2))),
+            )
         ]
     if target == "aten.repeat_interleave.self_int":
         return [
-            f"    kernels.{function_name}(builder, source={_node_arg_name(node, 0)!r}, "
-            f"output={node.name!r}, repeats={_literal_arg(node, 1)!r}, "
-            f"dim={_literal_arg(node, 2, default=_kwarg_literal(node, 'dim', None))!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(_node_arg_name(node, 0),),
+                attrs=(
+                    ("repeats", _literal_arg(node, 1)),
+                    ("dim", _literal_arg(node, 2, default=_kwarg_literal(node, "dim", None))),
+                ),
+            )
         ]
     if target == "aten.scaled_dot_product_attention.default":
         return [
-            f"    kernels.{function_name}(builder, query={_node_arg_name(node, 0)!r}, "
-            f"key={_node_arg_name(node, 1)!r}, value={_node_arg_name(node, 2)!r}, "
-            f"output={node.name!r}, is_causal={_sdpa_is_causal(node)!r})"
+            _render_emit_kernel(
+                target,
+                output=node.name,
+                inputs=(
+                    _node_arg_name(node, 0),
+                    _node_arg_name(node, 1),
+                    _node_arg_name(node, 2),
+                ),
+                attrs=(("is_causal", _sdpa_is_causal(node)),),
+            )
         ]
     raise AssertionError(f"missing renderer for {target}")
+
+
+def _render_emit_kernel(
+    target: str,
+    *,
+    output: str,
+    inputs: tuple[str, ...],
+    attrs: tuple[tuple[str, str], ...] = (),
+) -> str:
+    attr_text = ""
+    if attrs:
+        attr_items = ", ".join(f"KernelAttr({name!r}, {value!r})" for name, value in attrs)
+        if len(attrs) == 1:
+            attr_items += ","
+        attr_text = f", attrs=({attr_items})"
+    return f"    builder.emit_kernel({target!r}, output={output!r}, inputs={inputs!r}{attr_text})"
+
+
+def _arg_names(node: Node, *indexes: int) -> tuple[str, ...]:
+    return tuple(_arg_name(node, index) for index in indexes)
 
 
 def _arg_name(node: Node, index: int) -> str:

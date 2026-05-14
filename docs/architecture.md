@@ -137,16 +137,16 @@ object owns only the tile-local compute body. `quantized_qwen3` attention
 projections follow that pattern with `q4k_linear_tile` and `q6k_linear_tile`:
 the templates emit direct AIR plus private `func.func` declarations carrying
 `link_with = "q4k_linear.o"` or `link_with = "q6k_linear.o"`, and the Peano
-objects live under `torch2air.export.kernels`.
+objects live under the concrete operator implementation that uses them.
 
-Reusable operator bodies belong under `torch2air.export.kernels`. The model
-package chooses a stage and passes concrete Qwen3 shapes, tensor names, and
-module metadata; it should not own a growing library of generic operator
-templates.
+Reusable operator bodies should be real Python AIR DSL kernels, not forwarding
+wrappers around `builder.emit_kernel`. The model package chooses a stage and
+passes concrete Qwen3 shapes, tensor names, and module metadata; it should not
+own a growing library of generic operator templates.
 
 Do not put model-stage tiling in ad hoc `.cc` files. Native code is acceptable
 only as a narrow external tile compute body, kept under
-`torch2air.export.kernels`, with the MLIR template still expressing the stage
+the operator implementation, with the Python AIR DSL still expressing the stage
 boundary, tile shape, memory spaces, and DMA.
 
 If a debug dump is useful while developing, make it opt-in and keep it out of

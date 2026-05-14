@@ -12,6 +12,7 @@
 | [debug-air-lowering.md](debug-air-lowering.md) | routing 失败或 NPU 数值错时怎么定位。 | 按 AIR graph、AIE lowering、runtime sequence、L1 地址分层看。 |
 | [attention-head-loop.md](attention-head-loop.md) | 多 head attention 怎么避免 tile 程序膨胀。 | host 常量 offset，tile 内运行时 head loop。 |
 | [attention-tile-limits.md](attention-tile-limits.md) | attention tile size 先选多大。 | `KEY_TILE_ROWS=8`，`QUERY_TILE_ROWS<=32`。 |
+| [python-air-dsl-kernel.md](python-air-dsl-kernel.md) | Python kernel 应该怎么写。 | 用 MLIR-AIR Python DSL，不要用 Python 拼 MLIR 字符串。 |
 
 维护规则：
 
