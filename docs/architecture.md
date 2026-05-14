@@ -74,7 +74,7 @@ def export_one(
     name: str,
     module: torch.nn.Module,
     args: tuple[torch.Tensor, ...],
-    kwargs: dict[str, object] | None = None,
+    kwargs: dict[str, torch.Tensor | tuple[torch.Tensor, ...] | None] | None = None,
     *,
     weight_prefix: str = "",
     shape_exprs: dict[int, str] | None = None,

@@ -3,18 +3,21 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import torch
 
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
-from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
+from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm, rmsnorm_rocm
 from .run_embed_tokens import (
     DEFAULT_GGUF,
+    EmbedInputInfo,
     compile_runtime,
     parse_token_ids,
     prepare_inputs,
@@ -25,6 +28,13 @@ from .run_embed_tokens import (
 DEFAULT_RMS_WEIGHT_TENSOR = "model.layers.0.input_layernorm.weight"
 
 
+@dataclass(frozen=True, slots=True)
+class FusedInputInfo:
+    source: EmbedInputInfo
+    rms_weight: GGUFTensorEntry
+    rms_norm_eps: float
+
+
 def prepare_fused_inputs(
     *,
     gguf_path: Path,
@@ -32,8 +42,8 @@ def prepare_fused_inputs(
     blocks_per_row: int,
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
-    packed_rows, block_f16_scales, embed_expected, info = prepare_inputs(
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, FusedInputInfo]:
+    packed_rows, block_f16_scales, embed_expected, embed_info = prepare_inputs(
         gguf_path=gguf_path,
         tensor_name="model.embed_tokens.weight",
         token_ids=token_ids,
@@ -50,21 +60,19 @@ def prepare_fused_inputs(
     payload = read_tensor_bytes(index.path, weight_entry, offset=0, size=hidden_size * 4)
     rms_weight = np.frombuffer(payload, dtype=np.float32).copy()
 
-    if blocks_per_row == int(info["model_blocks_per_row"]):
+    if blocks_per_row == embed_info.model_blocks_per_row:
         expected = reference.run_embed_tokens_input_layernorm(input_ids=token_ids_array(token_ids))["mul_1"]
         expected = expected.reshape(len(token_ids), hidden_size)
     else:
-        ref_weight = (
-            reference.get_model()
-            .model.layers[0]
-            .input_layernorm.weight.detach()
-            .to(dtype=torch.float32)
-            .cpu()
-            .numpy()[:hidden_size]
-        )
+        layernorm = reference._input_layernorm(reference.get_model())
+        ref_weight_tensor = cast(torch.Tensor, getattr(layernorm, "weight"))
+        ref_weight = ref_weight_tensor.detach().to(dtype=torch.float32).cpu().numpy()[:hidden_size]
         expected = rmsnorm_rocm(embed_expected, ref_weight, eps)
-    info["rms_weight"] = weight_entry.to_json()
-    info["rms_norm_eps"] = eps
+    info = FusedInputInfo(
+        source=embed_info,
+        rms_weight=weight_entry,
+        rms_norm_eps=eps,
+    )
     return (
         packed_rows,
         block_f16_scales,
@@ -151,10 +159,10 @@ def main() -> int:
         rms_weight_tensor=args.rms_weight_tensor,
         eps=args.rms_norm_eps,
     )
-    print(f"GGUF tensor {info['tensor']['name']} {info['tensor']['ggml_type']}")
-    print(f"RMS weight {info['rms_weight']['name']} {info['rms_weight']['ggml_type']}")
+    print(f"GGUF tensor {info.source.tensor.name} {info.source.tensor.ggml_type}")
+    print(f"RMS weight {info.rms_weight.name} {info.rms_weight.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
-    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
+    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info.source.hidden_size}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
     print("handoff embed_tokens->input_layernorm L1")
 

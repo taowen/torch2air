@@ -14,13 +14,13 @@ dependencies = [
   "jinja2>=3.1,<4",
   "ml-dtypes>=0.5,<1",
   "numpy>=2,<3",
+  "pyright>=1.1.409,<1.2",
   "safetensors>=0.7,<1",
   "transformers>=5.3,<6",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pyright>=1.1.409,<1.2",
   "pytest>=8.3,<9",
   "ruff>=0.11,<0.12",
 ]
@@ -57,3 +57,10 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.pyright]
+include = [
+  "src/models",
+  "src/torch2air",
+]
+reportPrivateImportUsage = false

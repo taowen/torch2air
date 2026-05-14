@@ -11,29 +11,35 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from typing import cast
 from transformers import AutoModelForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
 
 DEFAULT_MODEL_ID = {model_id!r}
 ReferenceInput = np.ndarray | torch.Tensor
 ReferenceOutput = dict[str, torch.Tensor]
 
-_MODEL: torch.nn.Module | None = None
+_MODEL: Qwen3ForCausalLM | None = None
 
 
-def load_model(model_id: str = DEFAULT_MODEL_ID) -> torch.nn.Module:
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        local_files_only=True,
-        dtype=torch.float32,
+def load_model(model_id: str = DEFAULT_MODEL_ID) -> Qwen3ForCausalLM:
+    model = cast(
+        Qwen3ForCausalLM,
+        AutoModelForCausalLM.from_pretrained(
+            model_id,
+            local_files_only=True,
+            dtype=torch.float32,
+        ),
     )
     set_model(model)
     return model
 
 
-def set_model(model: torch.nn.Module) -> None:
+def set_model(model: Qwen3ForCausalLM) -> None:
     global _MODEL
-    _MODEL = model.to(device="cuda", dtype=torch.float32).eval()
+    module = cast(torch.nn.Module, model)
+    _MODEL = cast(Qwen3ForCausalLM, module.to(device="cuda", dtype=torch.float32).eval())
 
 
 def clear_model() -> None:
@@ -41,20 +47,45 @@ def clear_model() -> None:
     _MODEL = None
 
 
-def get_model() -> torch.nn.Module:
+def get_model() -> Qwen3ForCausalLM:
     if _MODEL is None:
         return load_model()
     return _MODEL
 
 
 class _EmbedTokensInputLayerNorm(torch.nn.Module):
-    def __init__(self, root: torch.nn.Module) -> None:
+    def __init__(self, root: Qwen3ForCausalLM) -> None:
         super().__init__()
-        self.embed_tokens = root.model.embed_tokens
-        self.input_layernorm = root.model.layers[0].input_layernorm
+        self.embed_tokens = _embed_tokens(root)
+        self.input_layernorm = _input_layernorm(root)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.input_layernorm(self.embed_tokens(input_ids))
+
+
+def _inner_model(root: Qwen3ForCausalLM) -> torch.nn.Module:
+    return cast(torch.nn.Module, getattr(root, "model"))
+
+
+def _layer0(root: Qwen3ForCausalLM) -> torch.nn.Module:
+    layers = cast(torch.nn.ModuleList, getattr(_inner_model(root), "layers"))
+    return cast(torch.nn.Module, layers[0])
+
+
+def _embed_tokens(root: Qwen3ForCausalLM) -> torch.nn.Module:
+    return cast(torch.nn.Module, getattr(_inner_model(root), "embed_tokens"))
+
+
+def _input_layernorm(root: Qwen3ForCausalLM) -> torch.nn.Module:
+    return cast(torch.nn.Module, getattr(_layer0(root), "input_layernorm"))
+
+
+def _self_attn(root: Qwen3ForCausalLM) -> torch.nn.Module:
+    return cast(torch.nn.Module, getattr(_layer0(root), "self_attn"))
+
+
+def _attention_proj(root: Qwen3ForCausalLM, proj_name: str) -> torch.nn.Module:
+    return cast(torch.nn.Module, getattr(_self_attn(root), proj_name))
 
 
 def _arg(value: ReferenceInput) -> torch.Tensor:
@@ -113,7 +144,7 @@ def render_exported_reference_function(
     inputs_source = ", ".join(f"{key!r}: {value}" for key, value in input_bindings.items())
     return f'''def run_{name}(
     *,
-    {params}model: torch.nn.Module | None = None,
+    {params}model: Qwen3ForCausalLM | None = None,
 ) -> ReferenceOutput:
     root = get_model() if model is None else model
     return _execute_module(

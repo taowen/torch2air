@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import json
 import pprint
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+
+
+type TemplateValue = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | Sequence[TemplateValue]
+    | Mapping[str, TemplateValue]
+    | Mapping[int, TemplateValue]
+)
 
 
 def render_template(
     template_dir: str | Path | list[str | Path],
     template_name: str,
-    **context: Any,
+    **context: TemplateValue,
 ) -> str:
     from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -35,7 +47,7 @@ def render_to_file(
     template_dir: str | Path | list[str | Path],
     template_name: str,
     output_path: str | Path,
-    **context: Any,
+    **context: TemplateValue,
 ) -> None:
     resolved = Path(output_path)
     resolved.parent.mkdir(parents=True, exist_ok=True)

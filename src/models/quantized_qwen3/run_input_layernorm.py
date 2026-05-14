@@ -3,19 +3,27 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
-from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
+from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm
-from .run_embed_tokens import DEFAULT_GGUF, compile_runtime, parse_token_ids, prepare_inputs
+from .run_embed_tokens import DEFAULT_GGUF, EmbedInputInfo, compile_runtime, parse_token_ids, prepare_inputs
 from .run_embed_tokens_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR
 from .run_pipeline import compile_rms_norm_object
+
+
+@dataclass(frozen=True, slots=True)
+class LayerNormInputInfo:
+    source: EmbedInputInfo
+    rms_weight: GGUFTensorEntry
+    rms_norm_eps: float
 
 
 def prepare_layernorm_inputs(
@@ -25,8 +33,8 @@ def prepare_layernorm_inputs(
     blocks_per_row: int,
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
-    _, _, hidden_ref, info = prepare_inputs(
+) -> tuple[np.ndarray, np.ndarray, torch.Tensor, LayerNormInputInfo]:
+    _, _, hidden_ref, embed_info = prepare_inputs(
         gguf_path=gguf_path,
         tensor_name="model.embed_tokens.weight",
         token_ids=token_ids,
@@ -43,8 +51,11 @@ def prepare_layernorm_inputs(
     rms_weight = np.frombuffer(payload, dtype=np.float32).copy()
 
     expected = reference.run_input_layernorm(hidden_states=hidden_ref)["mul_1"]
-    info["rms_weight"] = weight_entry.to_json()
-    info["rms_norm_eps"] = eps
+    info = LayerNormInputInfo(
+        source=embed_info,
+        rms_weight=weight_entry,
+        rms_norm_eps=eps,
+    )
     return (
         np.ascontiguousarray(hidden_ref.detach().cpu().numpy().astype(np.float32, copy=False)),
         np.ascontiguousarray(rms_weight),
@@ -118,10 +129,10 @@ def main() -> int:
         rms_weight_tensor=args.rms_weight_tensor,
         eps=args.rms_norm_eps,
     )
-    print(f"input_source {info['tensor']['name']} safetensors reference buffer")
-    print(f"RMS weight {info['rms_weight']['name']} {info['rms_weight']['ggml_type']}")
+    print(f"input_source {info.source.tensor.name} safetensors reference buffer")
+    print(f"RMS weight {info.rms_weight.name} {info.rms_weight.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
-    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
+    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info.source.hidden_size}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
 
     rms_norm_object = compile_rms_norm_object(

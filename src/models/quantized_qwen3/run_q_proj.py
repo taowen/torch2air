@@ -4,13 +4,14 @@ import argparse
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
-from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
+from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
 from .reference_runtime import (
@@ -20,7 +21,14 @@ from .reference_runtime import (
     q4k_block_f16_scales_rocm,
     q6k_block_f16_scales_rocm,
 )
-from .run_embed_tokens import DEFAULT_GGUF, compile_runtime, installed_tool, parse_token_ids, prepare_inputs
+from .run_embed_tokens import (
+    DEFAULT_GGUF,
+    EmbedInputInfo,
+    compile_runtime,
+    installed_tool,
+    parse_token_ids,
+    prepare_inputs,
+)
 from .run_embed_tokens_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR
 
 
@@ -30,6 +38,29 @@ DEFAULT_Q_PROJ_WEIGHT_TENSOR = "model.layers.0.self_attn.q_proj.weight"
 KERNEL_DIR = Path(__file__).resolve().parents[2] / "torch2air" / "export" / "kernels"
 Q4K_KERNEL_SOURCE = KERNEL_DIR / "q4k_linear.cc"
 Q6K_KERNEL_SOURCE = KERNEL_DIR / "q6k_linear.cc"
+
+
+@dataclass(frozen=True, slots=True)
+class NormHiddenInfo:
+    source: EmbedInputInfo
+    rms_weight: GGUFTensorEntry
+    rms_norm_eps: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionWeightInfo:
+    tensor: GGUFTensorEntry
+    output_rows: int
+    blocks_per_row: int
+    hidden_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionInputInfo:
+    norm: NormHiddenInfo
+    projection: str
+    projection_weight: GGUFTensorEntry
+    projection_output_rows: int
 
 
 def projection_weight_tensor(proj_name: str) -> str:
@@ -54,8 +85,8 @@ def prepare_norm_hidden(
     token_ids: list[int],
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[np.ndarray, torch.Tensor, dict[str, object]]:
-    _, _, embed_expected, info = prepare_inputs(
+) -> tuple[np.ndarray, torch.Tensor, NormHiddenInfo]:
+    _, _, embed_expected, embed_info = prepare_inputs(
         gguf_path=gguf_path,
         tensor_name="model.embed_tokens.weight",
         token_ids=token_ids,
@@ -70,8 +101,11 @@ def prepare_norm_hidden(
         raise ValueError(f"{rms_weight_tensor} shape must match hidden_size={hidden_size}")
 
     norm_hidden = reference.run_input_layernorm(hidden_states=embed_expected)["mul_1"]
-    info["rms_weight"] = weight_entry.to_json()
-    info["rms_norm_eps"] = eps
+    info = NormHiddenInfo(
+        source=embed_info,
+        rms_weight=weight_entry,
+        rms_norm_eps=eps,
+    )
     return np.ascontiguousarray(norm_hidden.detach().cpu().numpy()), norm_hidden, info
 
 
@@ -81,7 +115,7 @@ def prepare_projection_weights(
     tensor_name: str,
     output_rows: int,
     hidden_size: int,
-) -> tuple[np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, ProjectionWeightInfo]:
     index = load_gguf_index(gguf_path)
     selected = index.tensors[tensor_name]
     if selected.ggml_type == "Q4_K":
@@ -100,12 +134,12 @@ def prepare_projection_weights(
         )
     else:
         raise ValueError(f"{tensor_name} is {selected.ggml_type}, not Q4_K or Q6_K")
-    info = {
-        "tensor": selected.to_json(),
-        "output_rows": output_rows,
-        "blocks_per_row": blocks_per_row,
-        "hidden_size": hidden_size,
-    }
+    info = ProjectionWeightInfo(
+        tensor=selected,
+        output_rows=output_rows,
+        blocks_per_row=blocks_per_row,
+        hidden_size=hidden_size,
+    )
     return (
         np.ascontiguousarray(packed_with_scales),
         info,
@@ -115,7 +149,7 @@ def prepare_projection_weights(
 def _prepare_q4_k_projection_weights(
     *,
     index_path: Path,
-    selected,
+    selected: GGUFTensorEntry,
     output_rows: int,
     hidden_size: int,
 ) -> tuple[np.ndarray, int]:
@@ -156,7 +190,7 @@ def _prepare_q4_k_projection_weights(
 def _prepare_q6_k_projection_weights(
     *,
     index_path: Path,
-    selected,
+    selected: GGUFTensorEntry,
     output_rows: int,
     hidden_size: int,
 ) -> tuple[np.ndarray, int]:
@@ -194,7 +228,7 @@ def prepare_q_proj_weights(
     tensor_name: str,
     output_rows: int,
     hidden_size: int,
-) -> tuple[np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, ProjectionWeightInfo]:
     return prepare_projection_weights(
         gguf_path=gguf_path,
         tensor_name=tensor_name,
@@ -212,9 +246,9 @@ def prepare_projection_inputs(
     output_rows: int,
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, ProjectionInputInfo]:
     validate_projection_name(proj_name)
-    norm_hidden, norm_hidden_ref, info = prepare_norm_hidden(
+    norm_hidden, norm_hidden_ref, norm_info = prepare_norm_hidden(
         gguf_path=gguf_path,
         token_ids=token_ids,
         rms_weight_tensor=rms_weight_tensor,
@@ -232,9 +266,12 @@ def prepare_projection_inputs(
             -1,
         )[:, :output_rows]
     output = np.zeros(tuple(expected.shape), dtype=np.float32)
-    info["projection"] = proj_name
-    info["projection_weight"] = weight_info["tensor"]
-    info["projection_output_rows"] = output_rows
+    info = ProjectionInputInfo(
+        norm=norm_info,
+        projection=proj_name,
+        projection_weight=weight_info.tensor,
+        projection_output_rows=output_rows,
+    )
     return (
         norm_hidden,
         packed_weights,
@@ -252,7 +289,7 @@ def prepare_q_proj_inputs(
     output_rows: int,
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, ProjectionInputInfo]:
     return prepare_projection_inputs(
         proj_name="q_proj",
         gguf_path=gguf_path,
@@ -403,15 +440,15 @@ def main() -> int:
         rms_weight_tensor=args.rms_weight_tensor,
         eps=args.rms_norm_eps,
     )
-    print(f"input_source {info['tensor']['name']} -> {info['rms_weight']['name']}")
-    print(f"projection {info['projection']}")
-    print(f"quantized weight {info['projection_weight']['name']} {info['projection_weight']['ggml_type']}")
+    print(f"input_source {info.norm.source.tensor.name} -> {info.norm.rms_weight.name}")
+    print(f"projection {info.projection}")
+    print(f"quantized weight {info.projection_weight.name} {info.projection_weight.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
     print(f"output_rows {args.output_rows} hidden_size {hidden.shape[1]}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
 
     projection_object = compile_projection_object(
-        ggml_type=info["projection_weight"]["ggml_type"],
+        ggml_type=info.projection_weight.ggml_type,
         work_dir=args.work_dir,
         peano_install_dir=peano_install_dir,
         output_tile_rows=args.output_tile_rows,

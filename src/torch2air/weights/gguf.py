@@ -3,7 +3,7 @@ from __future__ import annotations
 import mmap
 import numpy as np
 import struct
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import BinaryIO
@@ -11,6 +11,9 @@ from typing import BinaryIO
 
 GGUF_MAGIC = 0x46554747
 GGUF_DEFAULT_ALIGNMENT = 32
+
+type GGUFMetadataValue = str | int | float | bool | list[GGUFMetadataValue]
+type GGUFTensorJsonValue = str | int | tuple[int, ...]
 
 
 class GGUFTensorType(IntEnum):
@@ -88,8 +91,17 @@ class GGUFTensorEntry:
     data_offset: int
     nbytes: int
 
-    def to_json(self) -> dict[str, object]:
-        return asdict(self)
+    def to_json(self) -> dict[str, GGUFTensorJsonValue]:
+        return {
+            "name": self.name,
+            "ggml_type": self.ggml_type,
+            "ggml_shape": self.ggml_shape,
+            "logical_shape": self.logical_shape,
+            "physical_dtype": self.physical_dtype,
+            "physical_shape": self.physical_shape,
+            "data_offset": self.data_offset,
+            "nbytes": self.nbytes,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +109,7 @@ class GGUFIndex:
     path: Path
     version: int
     alignment: int
-    metadata: dict[str, object]
+    metadata: dict[str, GGUFMetadataValue]
     tensors: dict[str, GGUFTensorEntry]
 
 
@@ -113,7 +125,7 @@ def load_gguf_index(path: str | Path) -> GGUFIndex:
         tensor_count = _read_u64(handle)
         kv_count = _read_u64(handle)
 
-        metadata: dict[str, object] = {"GGUF.version": version}
+        metadata: dict[str, GGUFMetadataValue] = {"GGUF.version": version}
         for _ in range(kv_count):
             key = _read_string(handle)
             value_type = GGUFValueType(_read_u32(handle))
@@ -236,14 +248,14 @@ def _build_tensor_entry(
     )
 
 
-def _extract_alignment(metadata: dict[str, object]) -> int:
+def _extract_alignment(metadata: dict[str, GGUFMetadataValue]) -> int:
     value = metadata.get("general.alignment", GGUF_DEFAULT_ALIGNMENT)
     if not isinstance(value, int):
         raise ValueError(f"Invalid GGUF alignment {value!r}")
     return value
 
 
-def _read_metadata_value(handle: BinaryIO, value_type: GGUFValueType) -> object:
+def _read_metadata_value(handle: BinaryIO, value_type: GGUFValueType) -> GGUFMetadataValue:
     if value_type is GGUFValueType.UINT8:
         return _read_u8(handle)
     if value_type is GGUFValueType.INT8:

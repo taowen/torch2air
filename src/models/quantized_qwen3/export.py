@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import cast
 
 import torch
+from torch.fx import Node
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
@@ -23,11 +25,14 @@ NORM_ROPE_NAMES = ("q_norm_rope", "k_norm_rope")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 
 
+type ExportKwarg = torch.Tensor | tuple[torch.Tensor, ...] | None
+
+
 class EmbedTokensInputLayerNorm(torch.nn.Module):
     def __init__(self, model: Qwen3ForCausalLM) -> None:
         super().__init__()
-        self.embed_tokens = model.model.embed_tokens
-        self.input_layernorm = model.model.layers[0].input_layernorm
+        self.embed_tokens = cast(torch.nn.Module, model.model.embed_tokens)
+        self.input_layernorm = cast(torch.nn.Module, model.model.layers[0].input_layernorm)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.input_layernorm(self.embed_tokens(input_ids))
@@ -49,14 +54,14 @@ def export_one(
     name: str,
     module: torch.nn.Module,
     args: tuple[torch.Tensor, ...],
-    kwargs: dict[str, object] | None = None,
+    kwargs: dict[str, ExportKwarg] | None = None,
     *,
     output_dir: Path,
-    template_dir: Path | list[Path] = TEMPLATE_DIR,
+    template_dir: str | Path | list[str | Path] = TEMPLATE_DIR,
     weight_prefix: str = "",
     shape_exprs: dict[int, str] | None = None,
     template_name: str,
-    context: dict[str, object],
+    context: dict[str, int | float | str],
 ) -> None:
     program = torch.export.export(module, args, kwargs=kwargs, strict=False)
     nodes = [
@@ -187,7 +192,7 @@ def export_input_layernorm(
         model = Qwen3ForCausalLM(config)
     export_one(
         "run_input_layernorm",
-        model.model.layers[0].input_layernorm,
+        cast(torch.nn.Module, model.model.layers[0].input_layernorm),
         args=(torch.zeros((1, sequence_length, model_hidden_size), dtype=torch.float32, device="meta"),),
         output_dir=output_dir,
         template_dir=KERNEL_TEMPLATE_DIR,
@@ -325,7 +330,7 @@ def export_norm_rope(
     with torch.device("meta"):
         model = Qwen3ForCausalLM(config)
         attn = model.model.layers[0].self_attn
-        norm = attn.q_norm if norm_name == "q_norm_rope" else attn.k_norm
+        norm = cast(torch.nn.Module, getattr(attn, "q_norm" if norm_name == "q_norm_rope" else "k_norm"))
         module = RMSNormRope(norm)
     export_one(
         f"run_{norm_name}",
@@ -387,14 +392,14 @@ def export_reference_module(
             model.model.embed_tokens,
             (torch.zeros((1, sequence_length), dtype=torch.long, device="meta"),),
             None,
-            "root.model.embed_tokens",
+            "_embed_tokens(root)",
         ),
         (
             "input_layernorm",
             model.model.layers[0].input_layernorm,
             (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
             None,
-            "root.model.layers[0].input_layernorm",
+            "_input_layernorm(root)",
         ),
         (
             "embed_tokens_input_layernorm",
@@ -411,7 +416,7 @@ def export_reference_module(
                 getattr(model.model.layers[0].self_attn, proj_name),
                 (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
                 None,
-                f"root.model.layers[0].self_attn.{proj_name}",
+                f"_attention_proj(root, {proj_name!r})",
             )
         )
     reference_functions: list[str] = []
@@ -432,14 +437,14 @@ def export_reference_module(
     )
 
 
-def _shape_of(node: object) -> tuple[int | str, ...] | None:
+def _shape_of(node: Node) -> tuple[int | str, ...] | None:
     tensor_meta = getattr(node, "meta", {}).get("tensor_meta")
     if tensor_meta is None:
         return None
     return tuple(dim if isinstance(dim, int) else str(dim) for dim in tensor_meta.shape)
 
 
-def _dtype_of(node: object) -> str | None:
+def _dtype_of(node: Node) -> str | None:
     tensor_meta = getattr(node, "meta", {}).get("tensor_meta")
     if tensor_meta is None:
         return None

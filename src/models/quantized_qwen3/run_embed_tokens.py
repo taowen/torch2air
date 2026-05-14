@@ -5,13 +5,14 @@ import os
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
-from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
+from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
 from .reference_runtime import (
@@ -26,13 +27,22 @@ DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/mod
 DEFAULT_TENSOR = "model.embed_tokens.weight"
 
 
+@dataclass(frozen=True, slots=True)
+class EmbedInputInfo:
+    tensor: GGUFTensorEntry
+    token_ids: list[int]
+    blocks_per_row: int
+    model_blocks_per_row: int
+    hidden_size: int
+
+
 def prepare_inputs(
     *,
     gguf_path: Path,
     tensor_name: str,
     token_ids: list[int],
     blocks_per_row: int,
-) -> tuple[np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, torch.Tensor, EmbedInputInfo]:
     index = load_gguf_index(gguf_path)
     selected = index.tensors[tensor_name]
     if selected.ggml_type != "Q4_K":
@@ -79,13 +89,13 @@ def prepare_inputs(
     )
     reference_output = reference.run_embed_tokens(input=token_ids_array(token_ids))["embedding"]
     expected = reference_output.reshape(len(token_ids), model_blocks_per_row * 256)[:, : blocks_per_row * 256]
-    info = {
-        "tensor": selected.to_json(),
-        "token_ids": token_ids,
-        "blocks_per_row": blocks_per_row,
-        "model_blocks_per_row": model_blocks_per_row,
-        "hidden_size": blocks_per_row * 256,
-    }
+    info = EmbedInputInfo(
+        tensor=selected,
+        token_ids=token_ids,
+        blocks_per_row=blocks_per_row,
+        model_blocks_per_row=model_blocks_per_row,
+        hidden_size=blocks_per_row * 256,
+    )
     return (
         np.ascontiguousarray(packed_rows),
         np.ascontiguousarray(block_f16_scales),
@@ -265,9 +275,9 @@ def main() -> int:
         token_ids=args.token_ids,
         blocks_per_row=args.blocks_per_row,
     )
-    print(f"GGUF tensor {info['tensor']['name']} {info['tensor']['ggml_type']}")
+    print(f"GGUF tensor {info.tensor.name} {info.tensor.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
-    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
+    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info.hidden_size}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
 
     npu_mlir, xclbin, insts = compile_runtime(

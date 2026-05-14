@@ -5,11 +5,14 @@ import math
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pyxrt as xrt
 import torch
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
@@ -46,28 +49,70 @@ ROPE_TABLE_KERNEL_SOURCE = KERNEL_DIR / "rope_table.cc"
 RMS_NORM_ROPE_KERNEL_SOURCE = KERNEL_DIR / "rms_norm_rope.cc"
 RMS_NORM_KERNEL_SOURCE = KERNEL_DIR / "rms_norm.cc"
 
-type TensorInfo = dict[str, str | int | tuple[int, ...]]
-type PipelineInfo = dict[str, int | float | list[int] | TensorInfo | dict[str, TensorInfo]]
+
+@dataclass(frozen=True, slots=True)
+class EmbedNormPrepared:
+    packed_rows: np.ndarray
+    block_f16_scales: np.ndarray
+    rms_weight: np.ndarray
+    hidden: np.ndarray
+    norm_output: np.ndarray
+    embed_expected: torch.Tensor
+    norm_expected: torch.Tensor
+    embed_tensor: GGUFTensorEntry
+    rms_weight_tensor: GGUFTensorEntry
+    token_ids: list[int]
+    blocks_per_row: int
+    model_blocks_per_row: int
+    hidden_size: int
+    rms_norm_eps: float
 
 
-def prepare_pipeline_inputs(
+@dataclass(frozen=True, slots=True)
+class QProjPrepared:
+    base: EmbedNormPrepared
+    qproj_weights: np.ndarray
+    qproj_output: np.ndarray
+    qproj_expected: torch.Tensor
+    qproj_weight_tensor: GGUFTensorEntry
+    qproj_output_rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class QKVPrepared:
+    base: EmbedNormPrepared
+    projection_weights: dict[str, np.ndarray]
+    projection_outputs: dict[str, np.ndarray]
+    projection_expected: dict[str, torch.Tensor]
+    projection_weight_tensors: dict[str, GGUFTensorEntry]
+    projection_output_rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class QKVRopePrepared:
+    projection: QKVPrepared
+    q_norm_weight: np.ndarray
+    k_norm_weight: np.ndarray
+    start_position: np.ndarray
+    norm_rope_outputs: dict[str, np.ndarray]
+    cos_expected: torch.Tensor
+    sin_expected: torch.Tensor
+    norm_rope_expected: dict[str, torch.Tensor]
+    q_norm_weight_tensor: GGUFTensorEntry
+    k_norm_weight_tensor: GGUFTensorEntry
+    rope_theta: float
+    rope_start_position: int
+
+
+def prepare_embed_norm(
     *,
     gguf_path: Path,
     token_ids: list[int],
     blocks_per_row: int,
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    torch.Tensor,
-    torch.Tensor,
-    PipelineInfo,
-]:
-    packed_rows, block_f16_scales, embed_expected, info = prepare_inputs(
+) -> EmbedNormPrepared:
+    packed_rows, block_f16_scales, embed_expected, _ = prepare_inputs(
         gguf_path=gguf_path,
         tensor_name="model.embed_tokens.weight",
         token_ids=token_ids,
@@ -75,6 +120,7 @@ def prepare_pipeline_inputs(
     )
     hidden_size = blocks_per_row * 256
     index = load_gguf_index(gguf_path)
+    embed_entry = index.tensors["model.embed_tokens.weight"]
     weight_entry = index.tensors[rms_weight_tensor]
     if weight_entry.ggml_type != "F32" or weight_entry.physical_dtype != "float32":
         raise ValueError(f"{rms_weight_tensor} must be F32, got {weight_entry}")
@@ -91,21 +137,25 @@ def prepare_pipeline_inputs(
     hidden = np.zeros(tuple(embed_expected.shape), dtype=np.float32)
     output = np.zeros(tuple(expected.shape), dtype=np.float32)
 
-    info["rms_weight"] = weight_entry.to_json()
-    info["rms_norm_eps"] = eps
-    return (
-        packed_rows,
-        block_f16_scales,
-        np.ascontiguousarray(rms_weight),
-        np.ascontiguousarray(hidden),
-        np.ascontiguousarray(output),
-        embed_expected,
-        expected,
-        info,
+    return EmbedNormPrepared(
+        packed_rows=packed_rows,
+        block_f16_scales=block_f16_scales,
+        rms_weight=np.ascontiguousarray(rms_weight),
+        hidden=np.ascontiguousarray(hidden),
+        norm_output=np.ascontiguousarray(output),
+        embed_expected=embed_expected,
+        norm_expected=expected,
+        embed_tensor=embed_entry,
+        rms_weight_tensor=weight_entry,
+        token_ids=token_ids,
+        blocks_per_row=blocks_per_row,
+        model_blocks_per_row=int(embed_entry.physical_shape[1]) // 36,
+        hidden_size=hidden_size,
+        rms_norm_eps=eps,
     )
 
 
-def prepare_pipeline_qproj_inputs(
+def prepare_qproj(
     *,
     gguf_path: Path,
     token_ids: list[int],
@@ -114,65 +164,38 @@ def prepare_pipeline_qproj_inputs(
     eps: float,
     qproj_tensor: str,
     output_rows: int,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    dict[str, object],
-]:
-    (
-        packed_rows,
-        block_f16_scales,
-        rms_weight,
-        hidden,
-        norm_output,
-        embed_expected,
-        norm_expected,
-        info,
-    ) = prepare_pipeline_inputs(
+) -> QProjPrepared:
+    base = prepare_embed_norm(
         gguf_path=gguf_path,
         token_ids=token_ids,
         blocks_per_row=blocks_per_row,
         rms_weight_tensor=rms_weight_tensor,
         eps=eps,
     )
-    packed_qproj, qproj_info = prepare_q_proj_weights(
+    packed_qproj, _ = prepare_q_proj_weights(
         gguf_path=gguf_path,
         tensor_name=qproj_tensor,
         output_rows=output_rows,
-        hidden_size=norm_expected.shape[1],
+        hidden_size=base.norm_expected.shape[1],
     )
     with torch.no_grad():
-        qproj_expected = reference.run_q_proj(input=norm_expected)["linear"].reshape(
+        qproj_expected = reference.run_q_proj(input=base.norm_expected)["linear"].reshape(
             len(token_ids),
             -1,
         )[:, :output_rows]
     qproj_output = np.zeros(tuple(qproj_expected.shape), dtype=np.float32)
-    info["q_proj_weight"] = qproj_info["tensor"]
-    info["q_proj_output_rows"] = output_rows
-    return (
-        packed_rows,
-        block_f16_scales,
-        rms_weight,
-        hidden,
-        norm_output,
-        packed_qproj,
-        qproj_output,
-        embed_expected,
-        norm_expected,
-        qproj_expected,
-        info,
+    qproj_entry = load_gguf_index(gguf_path).tensors[qproj_tensor]
+    return QProjPrepared(
+        base=base,
+        qproj_weights=packed_qproj,
+        qproj_output=qproj_output,
+        qproj_expected=qproj_expected,
+        qproj_weight_tensor=qproj_entry,
+        qproj_output_rows=output_rows,
     )
 
 
-def prepare_pipeline_projection_inputs(
+def prepare_qkv(
     *,
     gguf_path: Path,
     token_ids: list[int],
@@ -181,29 +204,8 @@ def prepare_pipeline_projection_inputs(
     eps: float,
     projection_tensors: dict[str, str],
     output_rows: int,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict[str, np.ndarray],
-    dict[str, np.ndarray],
-    torch.Tensor,
-    torch.Tensor,
-    dict[str, torch.Tensor],
-    PipelineInfo,
-]:
-    (
-        packed_rows,
-        block_f16_scales,
-        rms_weight,
-        hidden,
-        norm_output,
-        embed_expected,
-        norm_expected,
-        info,
-    ) = prepare_pipeline_inputs(
+) -> QKVPrepared:
+    base = prepare_embed_norm(
         gguf_path=gguf_path,
         token_ids=token_ids,
         blocks_per_row=blocks_per_row,
@@ -213,44 +215,38 @@ def prepare_pipeline_projection_inputs(
     projection_weights: dict[str, np.ndarray] = {}
     projection_outputs: dict[str, np.ndarray] = {}
     projection_expected: dict[str, torch.Tensor] = {}
-    projection_weight_info: dict[str, object] = {}
+    index = load_gguf_index(gguf_path)
+    projection_weight_tensors: dict[str, GGUFTensorEntry] = {}
     for proj_name, tensor_name in projection_tensors.items():
         if proj_name not in ATTENTION_PROJ_NAMES:
             raise ValueError(f"Unsupported projection {proj_name!r}")
-        packed_projection, projection_info = prepare_projection_weights(
+        packed_projection, _ = prepare_projection_weights(
             gguf_path=gguf_path,
             tensor_name=tensor_name,
             output_rows=output_rows,
-            hidden_size=norm_expected.shape[1],
+            hidden_size=base.norm_expected.shape[1],
         )
         with torch.no_grad():
-            expected = reference_projection(proj_name, norm_expected).reshape(
+            expected = reference_projection(proj_name, base.norm_expected).reshape(
                 len(token_ids),
                 -1,
             )[:, :output_rows]
         projection_weights[proj_name] = packed_projection
         projection_outputs[proj_name] = np.zeros(tuple(expected.shape), dtype=np.float32)
         projection_expected[proj_name] = expected
-        projection_weight_info[proj_name] = projection_info["tensor"]
+        projection_weight_tensors[proj_name] = index.tensors[tensor_name]
 
-    info["projection_weights"] = projection_weight_info
-    info["projection_output_rows"] = output_rows
-    return (
-        packed_rows,
-        block_f16_scales,
-        rms_weight,
-        hidden,
-        norm_output,
-        projection_weights,
-        projection_outputs,
-        embed_expected,
-        norm_expected,
-        projection_expected,
-        info,
+    return QKVPrepared(
+        base=base,
+        projection_weights=projection_weights,
+        projection_outputs=projection_outputs,
+        projection_expected=projection_expected,
+        projection_weight_tensors=projection_weight_tensors,
+        projection_output_rows=output_rows,
     )
 
 
-def prepare_pipeline_projection_rope_inputs(
+def prepare_qkv_rope(
     *,
     gguf_path: Path,
     token_ids: list[int],
@@ -262,41 +258,10 @@ def prepare_pipeline_projection_rope_inputs(
     q_norm_weight_tensor: str,
     k_norm_weight_tensor: str,
     start_position: int,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict[str, np.ndarray],
-    dict[str, np.ndarray],
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict[str, np.ndarray],
-    torch.Tensor,
-    torch.Tensor,
-    dict[str, torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-    dict[str, torch.Tensor],
-    PipelineInfo,
-]:
+) -> QKVRopePrepared:
     if output_rows != HEAD_DIM:
         raise ValueError(f"q/k norm+RoPE currently expects one {HEAD_DIM}-wide head, got output_rows={output_rows}")
-    (
-        packed_rows,
-        block_f16_scales,
-        rms_weight,
-        hidden,
-        norm_output,
-        projection_weights,
-        projection_outputs,
-        embed_expected,
-        norm_expected,
-        projection_expected,
-        info,
-    ) = prepare_pipeline_projection_inputs(
+    base = prepare_qkv(
         gguf_path=gguf_path,
         token_ids=token_ids,
         blocks_per_row=blocks_per_row,
@@ -305,16 +270,16 @@ def prepare_pipeline_projection_rope_inputs(
         projection_tensors=projection_tensors,
         output_rows=output_rows,
     )
-    missing = [name for name in ("q_proj", "k_proj") if name not in projection_expected]
+    missing = [name for name in ("q_proj", "k_proj") if name not in base.projection_expected]
     if missing:
         raise ValueError(f"q/k norm+RoPE requires q_proj and k_proj outputs; missing {missing}")
 
-    q_norm_weight, q_norm_info = read_f32_vector(
+    q_norm_weight, q_norm_entry = read_f32_vector(
         gguf_path=gguf_path,
         tensor_name=q_norm_weight_tensor,
         length=HEAD_DIM,
     )
-    k_norm_weight, k_norm_info = read_f32_vector(
+    k_norm_weight, k_norm_entry = read_f32_vector(
         gguf_path=gguf_path,
         tensor_name=k_norm_weight_tensor,
         length=HEAD_DIM,
@@ -327,18 +292,16 @@ def prepare_pipeline_projection_rope_inputs(
         start_position=start_position,
         head_dim=HEAD_DIM,
     )
-    cos_output = np.zeros(tuple(cos_expected.shape), dtype=np.float32)
-    sin_output = np.zeros(tuple(sin_expected.shape), dtype=np.float32)
     norm_rope_expected = {
         "q_norm_rope": reference_norm_rope(
             norm_name="q_norm_rope",
-            projection=projection_expected["q_proj"],
+            projection=base.projection_expected["q_proj"],
             cos=cos_expected,
             sin=sin_expected,
         ),
         "k_norm_rope": reference_norm_rope(
             norm_name="k_norm_rope",
-            projection=projection_expected["k_proj"],
+            projection=base.projection_expected["k_proj"],
             cos=cos_expected,
             sin=sin_expected,
         ),
@@ -348,46 +311,23 @@ def prepare_pipeline_projection_rope_inputs(
         for name, expected in norm_rope_expected.items()
     }
 
-    info["q_norm_weight"] = q_norm_info
-    info["k_norm_weight"] = k_norm_info
-    info["rope_theta"] = theta
-    info["rope_start_position"] = start_position
-    return (
-        packed_rows,
-        block_f16_scales,
-        rms_weight,
-        hidden,
-        norm_output,
-        projection_weights,
-        projection_outputs,
-        q_norm_weight,
-        k_norm_weight,
-        start_position_array,
-        norm_rope_outputs,
-        embed_expected,
-        norm_expected,
-        projection_expected,
-        cos_expected,
-        sin_expected,
-        norm_rope_expected,
-        info,
+    return QKVRopePrepared(
+        projection=base,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        start_position=start_position_array,
+        norm_rope_outputs=norm_rope_outputs,
+        cos_expected=cos_expected,
+        sin_expected=sin_expected,
+        norm_rope_expected=norm_rope_expected,
+        q_norm_weight_tensor=q_norm_entry,
+        k_norm_weight_tensor=k_norm_entry,
+        rope_theta=theta,
+        rope_start_position=start_position,
     )
 
 
-def tensor_info(entry: GGUFTensorEntry) -> TensorInfo:
-    return {
-        "name": entry.name,
-        "ggml_type": entry.ggml_type,
-        "ggml_shape": entry.ggml_shape,
-        "logical_shape": entry.logical_shape,
-        "physical_dtype": entry.physical_dtype,
-        "physical_shape": entry.physical_shape,
-        "data_offset": entry.data_offset,
-        "nbytes": entry.nbytes,
-    }
-
-
-def read_f32_vector(*, gguf_path: Path, tensor_name: str, length: int) -> tuple[np.ndarray, TensorInfo]:
+def read_f32_vector(*, gguf_path: Path, tensor_name: str, length: int) -> tuple[np.ndarray, GGUFTensorEntry]:
     index = load_gguf_index(gguf_path)
     selected = index.tensors[tensor_name]
     if selected.ggml_type != "F32" or selected.physical_dtype != "float32":
@@ -395,11 +335,11 @@ def read_f32_vector(*, gguf_path: Path, tensor_name: str, length: int) -> tuple[
     if int(selected.physical_shape[0]) < length:
         raise ValueError(f"{tensor_name} is too small for length={length}")
     payload = read_tensor_bytes(index.path, selected, offset=0, size=length * 4)
-    return np.ascontiguousarray(np.frombuffer(payload, dtype=np.float32).copy()), tensor_info(selected)
+    return np.ascontiguousarray(np.frombuffer(payload, dtype=np.float32).copy()), selected
 
 
 def reference_rope_theta() -> float:
-    config = reference.get_model().config
+    config = cast(Qwen3ForCausalLM, reference.get_model()).config
     rope_scaling = getattr(config, "rope_scaling", None)
     if isinstance(rope_scaling, dict) and "rope_theta" in rope_scaling:
         return float(rope_scaling["rope_theta"])
@@ -415,7 +355,7 @@ def reference_rope_table(
     start_position: int,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    root = reference.get_model()
+    root = cast(Qwen3ForCausalLM, reference.get_model())
     device = next(root.parameters()).device
     position_ids = torch.arange(
         start_position,
@@ -439,12 +379,12 @@ def reference_norm_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    root = reference.get_model()
+    root = cast(Qwen3ForCausalLM, reference.get_model())
     attn = root.model.layers[0].self_attn
     if norm_name == "q_norm_rope":
-        norm = attn.q_norm
+        norm = cast(torch.nn.Module, getattr(attn, "q_norm"))
     elif norm_name == "k_norm_rope":
-        norm = attn.k_norm
+        norm = cast(torch.nn.Module, getattr(attn, "k_norm"))
     else:
         raise ValueError(f"Unsupported norm+RoPE stage {norm_name!r}")
 
@@ -1506,65 +1446,63 @@ def main() -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
+    qproj_aie_mlir: Path | None = args.qproj_aie_mlir
+    kproj_aie_mlir: Path | None = args.kproj_aie_mlir
+    vproj_aie_mlir: Path | None = args.vproj_aie_mlir
+    rope_table_aie_mlir: Path | None = args.rope_table_aie_mlir
+    q_norm_rope_aie_mlir: Path | None = args.q_norm_rope_aie_mlir
+    k_norm_rope_aie_mlir: Path | None = args.k_norm_rope_aie_mlir
+
     peano_install_dir = os.environ.get("PEANO_INSTALL_DIR")
     if not peano_install_dir:
         raise SystemExit("PEANO_INSTALL_DIR is not set; source scripts/npu-common.sh first")
     os.environ.setdefault("XRT_HACK_UNSECURE_LOADING_XCLBIN", "1")
 
-    run_qkv = args.kproj_aie_mlir is not None or args.vproj_aie_mlir is not None
-    if run_qkv and (args.qproj_aie_mlir is None or args.kproj_aie_mlir is None or args.vproj_aie_mlir is None):
+    run_qkv = kproj_aie_mlir is not None or vproj_aie_mlir is not None
+    if run_qkv and (qproj_aie_mlir is None or kproj_aie_mlir is None or vproj_aie_mlir is None):
         raise SystemExit("q/k/v pipeline requires --qproj-aie-mlir, --kproj-aie-mlir, and --vproj-aie-mlir")
     run_rope = (
-        args.rope_table_aie_mlir is not None
-        or args.q_norm_rope_aie_mlir is not None
-        or args.k_norm_rope_aie_mlir is not None
+        rope_table_aie_mlir is not None
+        or q_norm_rope_aie_mlir is not None
+        or k_norm_rope_aie_mlir is not None
     )
     if run_rope and (
         not run_qkv
-        or args.rope_table_aie_mlir is None
-        or args.q_norm_rope_aie_mlir is None
-        or args.k_norm_rope_aie_mlir is None
+        or rope_table_aie_mlir is None
+        or q_norm_rope_aie_mlir is None
+        or k_norm_rope_aie_mlir is None
     ):
         raise SystemExit(
             "q/k norm+RoPE pipeline requires q/k/v projections plus "
             "--rope-table-aie-mlir, --q-norm-rope-aie-mlir, and --k-norm-rope-aie-mlir"
         )
 
-    if args.qproj_aie_mlir is None:
-        packed_rows, block_f16_scales, rms_weight, hidden, output, embed_expected, expected, info = (
-            prepare_pipeline_inputs(
-                gguf_path=args.gguf,
-                token_ids=args.token_ids,
-                blocks_per_row=args.blocks_per_row,
-                rms_weight_tensor=args.rms_weight_tensor,
-                eps=args.rms_norm_eps,
-            )
+    qproj_prepared: QProjPrepared | None = None
+    projection_prepared: QKVPrepared | None = None
+    rope_prepared: QKVRopePrepared | None = None
+    projection_weights: dict[str, np.ndarray]
+    projection_outputs: dict[str, np.ndarray]
+    projection_expected: dict[str, torch.Tensor]
+    qproj_expected: torch.Tensor | None
+
+    if qproj_aie_mlir is None:
+        prepared_base = prepare_embed_norm(
+            gguf_path=args.gguf,
+            token_ids=args.token_ids,
+            blocks_per_row=args.blocks_per_row,
+            rms_weight_tensor=args.rms_weight_tensor,
+            eps=args.rms_norm_eps,
         )
         projection_weights = {}
         projection_outputs = {}
         projection_expected = {}
+        qproj_expected = None
     elif run_qkv:
+        assert qproj_aie_mlir is not None
+        assert kproj_aie_mlir is not None
+        assert vproj_aie_mlir is not None
         if run_rope:
-            (
-                packed_rows,
-                block_f16_scales,
-                rms_weight,
-                hidden,
-                output,
-                projection_weights,
-                projection_outputs,
-                q_norm_weight,
-                k_norm_weight,
-                rope_start_position,
-                norm_rope_outputs,
-                embed_expected,
-                expected,
-                projection_expected,
-                cos_expected,
-                sin_expected,
-                norm_rope_expected,
-                info,
-            ) = prepare_pipeline_projection_rope_inputs(
+            rope_prepared = prepare_qkv_rope(
                 gguf_path=args.gguf,
                 token_ids=args.token_ids,
                 blocks_per_row=args.blocks_per_row,
@@ -1580,20 +1518,9 @@ def main() -> int:
                 k_norm_weight_tensor=args.k_norm_weight_tensor,
                 start_position=args.start_position,
             )
+            projection_prepared = rope_prepared.projection
         else:
-            (
-                packed_rows,
-                block_f16_scales,
-                rms_weight,
-                hidden,
-                output,
-                projection_weights,
-                projection_outputs,
-                embed_expected,
-                expected,
-                projection_expected,
-                info,
-            ) = prepare_pipeline_projection_inputs(
+            projection_prepared = prepare_qkv(
                 gguf_path=args.gguf,
                 token_ids=args.token_ids,
                 blocks_per_row=args.blocks_per_row,
@@ -1606,21 +1533,13 @@ def main() -> int:
                 },
                 output_rows=args.output_rows,
             )
+        prepared_base = projection_prepared.base
+        projection_weights = projection_prepared.projection_weights
+        projection_outputs = projection_prepared.projection_outputs
+        projection_expected = projection_prepared.projection_expected
         qproj_expected = projection_expected["q_proj"]
     else:
-        (
-            packed_rows,
-            block_f16_scales,
-            rms_weight,
-            hidden,
-            output,
-            qproj_weights,
-            qproj_output,
-            embed_expected,
-            expected,
-            qproj_expected,
-            info,
-        ) = prepare_pipeline_qproj_inputs(
+        qproj_prepared = prepare_qproj(
             gguf_path=args.gguf,
             token_ids=args.token_ids,
             blocks_per_row=args.blocks_per_row,
@@ -1629,30 +1548,43 @@ def main() -> int:
             qproj_tensor=args.qproj_tensor,
             output_rows=args.output_rows,
         )
+        prepared_base = qproj_prepared.base
+        qproj_expected = qproj_prepared.qproj_expected
         projection_weights = {}
         projection_outputs = {}
         projection_expected = {}
 
-    print(f"GGUF tensor {info['tensor']['name']} {info['tensor']['ggml_type']}")
-    print(f"RMS weight {info['rms_weight']['name']} {info['rms_weight']['ggml_type']}")
+    packed_rows = prepared_base.packed_rows
+    block_f16_scales = prepared_base.block_f16_scales
+    rms_weight = prepared_base.rms_weight
+    hidden = prepared_base.hidden
+    output = prepared_base.norm_output
+    embed_expected = prepared_base.embed_expected
+    expected = prepared_base.norm_expected
+
+    print(f"GGUF tensor {prepared_base.embed_tensor.name} {prepared_base.embed_tensor.ggml_type}")
+    print(f"RMS weight {prepared_base.rms_weight_tensor.name} {prepared_base.rms_weight_tensor.ggml_type}")
     print(f"token_ids {','.join(str(value) for value in args.token_ids)}")
-    print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
+    print(f"blocks_per_row {args.blocks_per_row} hidden_size {prepared_base.hidden_size}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
-    if args.qproj_aie_mlir is None:
+    if qproj_aie_mlir is None:
         print("handoff embed_tokens->input_layernorm shared pyxrt BO")
     elif run_qkv:
-        for proj_name, weight_info in info["projection_weights"].items():
-            print(f"quantized weight {proj_name} {weight_info['name']} {weight_info['ggml_type']}")
+        assert projection_prepared is not None
+        for proj_name, weight_entry in projection_prepared.projection_weight_tensors.items():
+            print(f"quantized weight {proj_name} {weight_entry.name} {weight_entry.ggml_type}")
         print(f"output_rows {args.output_rows}")
         if run_rope:
-            print(f"q_norm weight {info['q_norm_weight']['name']} {info['q_norm_weight']['ggml_type']}")
-            print(f"k_norm weight {info['k_norm_weight']['name']} {info['k_norm_weight']['ggml_type']}")
-            print(f"rope_start_position {info['rope_start_position']} rope_theta {info['rope_theta']:g}")
+            assert rope_prepared is not None
+            print(f"q_norm weight {rope_prepared.q_norm_weight_tensor.name} {rope_prepared.q_norm_weight_tensor.ggml_type}")
+            print(f"k_norm weight {rope_prepared.k_norm_weight_tensor.name} {rope_prepared.k_norm_weight_tensor.ggml_type}")
+            print(f"rope_start_position {rope_prepared.rope_start_position} rope_theta {rope_prepared.rope_theta:g}")
             print("handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope shared pyxrt BO")
         else:
             print("handoff embed_tokens->input_layernorm->q/k/v shared pyxrt BO")
     else:
-        print(f"Q4_K weight {info['q_proj_weight']['name']} {info['q_proj_weight']['ggml_type']}")
+        assert qproj_prepared is not None
+        print(f"Q4_K weight {qproj_prepared.qproj_weight_tensor.name} {qproj_prepared.qproj_weight_tensor.ggml_type}")
         print(f"output_rows {args.output_rows}")
         print("handoff embed_tokens->input_layernorm->q_proj shared pyxrt BO")
 
@@ -1675,7 +1607,7 @@ def main() -> int:
         peano_install_dir=peano_install_dir,
         link_objects=(rms_norm_object,),
     )
-    if args.qproj_aie_mlir is None:
+    if qproj_aie_mlir is None:
         actual_hidden, actual_output, latencies_ms = run_on_npu(
             embed_xclbin=embed_xclbin,
             embed_insts=embed_insts,
@@ -1708,16 +1640,20 @@ def main() -> int:
         actual_sin = None
         actual_norm_rope = {}
     elif run_qkv:
+        assert qproj_aie_mlir is not None
+        assert kproj_aie_mlir is not None
+        assert vproj_aie_mlir is not None
+        assert projection_prepared is not None
         projection_aie_mlirs = {
-            "q_proj": args.qproj_aie_mlir,
-            "k_proj": args.kproj_aie_mlir,
-            "v_proj": args.vproj_aie_mlir,
+            "q_proj": qproj_aie_mlir,
+            "k_proj": kproj_aie_mlir,
+            "v_proj": vproj_aie_mlir,
         }
         projection_xclbins = {}
         projection_insts = {}
         for proj_name, aie_mlir in projection_aie_mlirs.items():
             projection_object = compile_projection_object(
-                ggml_type=info["projection_weights"][proj_name]["ggml_type"],
+                ggml_type=projection_prepared.projection_weight_tensors[proj_name].ggml_type,
                 work_dir=args.work_dir / proj_name,
                 peano_install_dir=peano_install_dir,
                 output_tile_rows=args.output_tile_rows,
@@ -1732,14 +1668,18 @@ def main() -> int:
                 link_objects=(projection_object,),
             )
         if run_rope:
+            assert rope_table_aie_mlir is not None
+            assert q_norm_rope_aie_mlir is not None
+            assert k_norm_rope_aie_mlir is not None
+            assert rope_prepared is not None
             rope_table_object = compile_rope_table_object(
                 work_dir=args.work_dir / "rope_table",
                 peano_install_dir=peano_install_dir,
                 head_dim=args.output_rows,
-                rope_theta=float(info["rope_theta"]),
+                rope_theta=rope_prepared.rope_theta,
             )
             _, rope_table_xclbin, rope_table_insts = compile_runtime(
-                aie_mlir=args.rope_table_aie_mlir,
+                aie_mlir=rope_table_aie_mlir,
                 work_dir=args.work_dir / "rope_table",
                 instance_name="run_rope_table",
                 peano_install_dir=peano_install_dir,
@@ -1752,8 +1692,8 @@ def main() -> int:
                 eps=args.rms_norm_eps,
             )
             norm_rope_aie_mlirs = {
-                "q_norm_rope": args.q_norm_rope_aie_mlir,
-                "k_norm_rope": args.k_norm_rope_aie_mlir,
+                "q_norm_rope": q_norm_rope_aie_mlir,
+                "k_norm_rope": k_norm_rope_aie_mlir,
             }
             norm_rope_xclbins = {}
             norm_rope_insts = {}
@@ -1791,18 +1731,18 @@ def main() -> int:
                 norm_output=output,
                 projection_weights=projection_weights,
                 projection_outputs=projection_outputs,
-                q_norm_weight=q_norm_weight,
-                k_norm_weight=k_norm_weight,
-                start_position=rope_start_position,
-                cos_output=np.zeros(tuple(cos_expected.shape), dtype=np.float32),
-                sin_output=np.zeros(tuple(sin_expected.shape), dtype=np.float32),
-                norm_rope_outputs=norm_rope_outputs,
+                q_norm_weight=rope_prepared.q_norm_weight,
+                k_norm_weight=rope_prepared.k_norm_weight,
+                start_position=rope_prepared.start_position,
+                cos_output=np.zeros(tuple(rope_prepared.cos_expected.shape), dtype=np.float32),
+                sin_output=np.zeros(tuple(rope_prepared.sin_expected.shape), dtype=np.float32),
+                norm_rope_outputs=rope_prepared.norm_rope_outputs,
                 embed_expected=embed_expected,
                 norm_expected=expected,
                 projection_expected=projection_expected,
-                cos_expected=cos_expected,
-                sin_expected=sin_expected,
-                norm_rope_expected=norm_rope_expected,
+                cos_expected=rope_prepared.cos_expected,
+                sin_expected=rope_prepared.sin_expected,
+                norm_rope_expected=rope_prepared.norm_rope_expected,
                 warmup=args.warmup,
                 iterations=args.iterations,
                 rtol=args.rtol,
@@ -1844,6 +1784,8 @@ def main() -> int:
         qproj_xclbin = projection_xclbins["q_proj"]
         qproj_insts = projection_insts["q_proj"]
     else:
+        assert qproj_aie_mlir is not None
+        assert qproj_prepared is not None
         q4k_object = compile_q4k_linear_object(
             work_dir=args.work_dir / "q_proj",
             peano_install_dir=peano_install_dir,
@@ -1852,12 +1794,13 @@ def main() -> int:
             hidden_size=hidden.shape[1],
         )
         _, qproj_xclbin, qproj_insts = compile_runtime(
-            aie_mlir=args.qproj_aie_mlir,
+            aie_mlir=qproj_aie_mlir,
             work_dir=args.work_dir / "q_proj",
             instance_name="run_q_proj",
             peano_install_dir=peano_install_dir,
             link_objects=(q4k_object,),
         )
+        assert qproj_expected is not None
         actual_hidden, actual_output, actual_qproj, latencies_ms = run_on_npu_qproj(
             embed_xclbin=embed_xclbin,
             embed_insts=embed_insts,
@@ -1870,8 +1813,8 @@ def main() -> int:
             rms_weight=rms_weight,
             hidden=hidden,
             norm_output=output,
-            qproj_weights=qproj_weights,
-            qproj_output=qproj_output,
+            qproj_weights=qproj_prepared.qproj_weights,
+            qproj_output=qproj_prepared.qproj_output,
             embed_expected=embed_expected,
             norm_expected=expected,
             qproj_expected=qproj_expected,
@@ -1918,16 +1861,18 @@ def main() -> int:
             print(f"{proj_name}_first8 {actual.reshape(-1)[:8].tolist()}")
             print(f"{proj_name}_expected_first8 {first_values(projection_expected[proj_name])}")
     elif actual_qproj is not None:
+        assert qproj_expected is not None
         print(f"qproj_first8 {actual_qproj.reshape(-1)[:8].tolist()}")
         print(f"qproj_expected_first8 {first_values(qproj_expected)}")
     if actual_cos is not None and actual_sin is not None:
+        assert rope_prepared is not None
         print(f"rope_cos_first8 {actual_cos.reshape(-1)[:8].tolist()}")
-        print(f"rope_cos_expected_first8 {first_values(cos_expected)}")
+        print(f"rope_cos_expected_first8 {first_values(rope_prepared.cos_expected)}")
         print(f"rope_sin_first8 {actual_sin.reshape(-1)[:8].tolist()}")
-        print(f"rope_sin_expected_first8 {first_values(sin_expected)}")
+        print(f"rope_sin_expected_first8 {first_values(rope_prepared.sin_expected)}")
         for stage_name, actual in actual_norm_rope.items():
             print(f"{stage_name}_first8 {actual.reshape(-1)[:8].tolist()}")
-            print(f"{stage_name}_expected_first8 {first_values(norm_rope_expected[stage_name])}")
+            print(f"{stage_name}_expected_first8 {first_values(rope_prepared.norm_rope_expected[stage_name])}")
     print(f"expected_first8 {first_values(expected)}")
     print(f"hidden_max_abs {hidden_max_abs:.8g}")
     print(f"max_abs {output_max_abs:.8g}")
@@ -1936,13 +1881,15 @@ def main() -> int:
             projection_max_abs = max_abs_rocm(actual, projection_expected[proj_name])
             print(f"{proj_name}_max_abs {projection_max_abs:.8g}")
     elif actual_qproj is not None:
+        assert qproj_expected is not None
         qproj_max_abs = max_abs_rocm(actual_qproj, qproj_expected)
         print(f"qproj_max_abs {qproj_max_abs:.8g}")
     if actual_cos is not None and actual_sin is not None:
-        print(f"rope_cos_max_abs {max_abs_rocm(actual_cos, cos_expected):.8g}")
-        print(f"rope_sin_max_abs {max_abs_rocm(actual_sin, sin_expected):.8g}")
+        assert rope_prepared is not None
+        print(f"rope_cos_max_abs {max_abs_rocm(actual_cos, rope_prepared.cos_expected):.8g}")
+        print(f"rope_sin_max_abs {max_abs_rocm(actual_sin, rope_prepared.sin_expected):.8g}")
         for stage_name, actual in actual_norm_rope.items():
-            norm_rope_max_abs = max_abs_rocm(actual, norm_rope_expected[stage_name])
+            norm_rope_max_abs = max_abs_rocm(actual, rope_prepared.norm_rope_expected[stage_name])
             print(f"{stage_name}_max_abs {norm_rope_max_abs:.8g}")
     print(f"allclose True rtol={args.rtol:g} atol={args.atol:g}")
     if latencies_ms:
