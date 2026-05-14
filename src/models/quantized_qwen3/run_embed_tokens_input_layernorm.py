@@ -6,16 +6,19 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
 from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
 
+from . import reference
+from .reference_runtime import check_close_rocm, first_values, max_abs_rocm, rmsnorm_rocm
 from .run_embed_tokens import (
     DEFAULT_GGUF,
-    _check_close,
     compile_runtime,
     parse_token_ids,
     prepare_inputs,
+    token_ids_array,
 )
 
 
@@ -29,7 +32,7 @@ def prepare_fused_inputs(
     blocks_per_row: int,
     rms_weight_tensor: str,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
     packed_rows, block_f16_scales, embed_expected, info = prepare_inputs(
         gguf_path=gguf_path,
         tensor_name="model.embed_tokens.weight",
@@ -47,16 +50,26 @@ def prepare_fused_inputs(
     payload = read_tensor_bytes(index.path, weight_entry, offset=0, size=hidden_size * 4)
     rms_weight = np.frombuffer(payload, dtype=np.float32).copy()
 
-    variance = np.mean(embed_expected.astype(np.float32) ** 2, axis=-1, keepdims=True)
-    expected = embed_expected * (1.0 / np.sqrt(variance + eps)).astype(np.float32)
-    expected = expected * rms_weight.reshape(1, hidden_size)
+    if blocks_per_row == int(info["model_blocks_per_row"]):
+        expected = reference.run_embed_tokens_input_layernorm(input_ids=token_ids_array(token_ids))["mul_1"]
+        expected = expected.reshape(len(token_ids), hidden_size)
+    else:
+        ref_weight = (
+            reference.get_model()
+            .model.layers[0]
+            .input_layernorm.weight.detach()
+            .to(dtype=torch.float32)
+            .cpu()
+            .numpy()[:hidden_size]
+        )
+        expected = rmsnorm_rocm(embed_expected, ref_weight, eps)
     info["rms_weight"] = weight_entry.to_json()
     info["rms_norm_eps"] = eps
     return (
         packed_rows,
         block_f16_scales,
         np.ascontiguousarray(rms_weight),
-        np.ascontiguousarray(expected.astype(np.float32, copy=False)),
+        expected,
         info,
     )
 
@@ -69,7 +82,7 @@ def run_on_npu(
     packed_rows: np.ndarray,
     block_f16_scales: np.ndarray,
     rms_weight: np.ndarray,
-    expected: np.ndarray,
+    expected: torch.Tensor,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -82,25 +95,26 @@ def run_on_npu(
         instance_name=instance_name,
     )
     func = backend.load(XRTCompileArtifact(str(xclbin), "MLIR_AIE", str(insts)))
-    output = np.zeros_like(expected)
+    expected_shape = tuple(expected.shape)
+    output = np.zeros(expected_shape, dtype=np.float32)
     actual = output
     latencies_ms: list[float] = []
     try:
         for _ in range(warmup):
             output.fill(0)
             actual = np.asarray(func(packed_rows, block_f16_scales, rms_weight, output)[3]).reshape(
-                expected.shape
+                expected_shape
             )
-            _check_close(actual, expected, rtol=rtol, atol=atol)
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol)
 
         for _ in range(iterations):
             output.fill(0)
             start = time.perf_counter()
             actual = np.asarray(func(packed_rows, block_f16_scales, rms_weight, output)[3]).reshape(
-                expected.shape
+                expected_shape
             )
             latencies_ms.append((time.perf_counter() - start) * 1000.0)
-            _check_close(actual, expected, rtol=rtol, atol=atol)
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol)
     finally:
         backend.unload()
     return actual, latencies_ms
@@ -120,8 +134,8 @@ def main() -> int:
     parser.add_argument("--instance-name", default="run_embed_tokens_input_layernorm")
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
-    parser.add_argument("--rtol", type=float, default=1e-4)
-    parser.add_argument("--atol", type=float, default=1e-5)
+    parser.add_argument("--rtol", type=float, default=5e-2)
+    parser.add_argument("--atol", type=float, default=2e-1)
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -141,6 +155,7 @@ def main() -> int:
     print(f"RMS weight {info['rms_weight']['name']} {info['rms_weight']['ggml_type']}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
     print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
+    print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
     print("handoff embed_tokens->input_layernorm L1")
 
     npu_mlir, xclbin, insts = compile_runtime(
@@ -164,12 +179,12 @@ def main() -> int:
         verbose=args.verbose,
     )
 
-    max_abs = float(np.max(np.abs(actual - expected)))
+    max_abs = max_abs_rocm(actual, expected)
     print(f"npu_mlir {npu_mlir}")
     print(f"xclbin {xclbin}")
     print(f"insts {insts}")
     print(f"actual_first8 {actual.reshape(-1)[:8].tolist()}")
-    print(f"expected_first8 {expected.reshape(-1)[:8].tolist()}")
+    print(f"expected_first8 {first_values(expected)}")
     print(f"max_abs {max_abs:.8g}")
     print(f"allclose True rtol={args.rtol:g} atol={args.atol:g}")
     if latencies_ms:

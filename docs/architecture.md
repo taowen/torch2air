@@ -48,9 +48,11 @@ src/
     quantized_qwen3/
       export.py             # model-specific export_one(...) calls
       quantization.py       # model-specific quantized tensor naming
-      reference.py          # PyTorch ROCm reference, when implemented
+      reference.py          # generated PyTorch ROCm reference wrappers
+      reference_runtime.py  # small ROCm check/debug helpers
       run.py                # thin CLI dispatch for model runners
       run_embed_tokens.py   # embed_tokens XRT execution and reference check
+      run_q_proj.py         # q_proj external-kernel XRT execution
       generated/            # ignored generated files
 scripts/
   install-air-tools.sh
@@ -128,13 +130,23 @@ not a Python AIR builder. It should look like the spike fixtures:
 tile-local `linalg`/`arith`/`scf` work. `air-opt` is responsible for lowering
 that into `air.launch`, `air.herd`, `air.dma_memcpy_nd`, channels, and AIE IR.
 
+Some kernels need the official AIR external-kernel style earlier than the
+pure-MLIR body is practical. In that case the exported artifact is still MLIR
+that owns the AIR launch/segment/herd shape and L3<->L1 DMA, while the native
+object owns only the tile-local compute body. `quantized_qwen3.q_proj` follows
+that pattern with `q4k_linear_tile`: the template emits direct AIR plus a
+private `func.func` carrying `link_with = "q4k_linear.o"`, and the Peano object
+lives under `torch2air.export.kernels`.
+
 Reusable operator bodies belong under `torch2air.export.kernels`. The model
 package chooses a stage and passes concrete Qwen3 shapes, tensor names, and
 module metadata; it should not own a growing library of generic operator
 templates.
 
-Do not put model-stage compute in ad hoc `.cc` files. A separate native kernel
-should only appear after a measured reason makes that boundary necessary.
+Do not put model-stage tiling in ad hoc `.cc` files. Native code is acceptable
+only as a narrow external tile compute body, kept under
+`torch2air.export.kernels`, with the MLIR template still expressing the stage
+boundary, tile shape, memory spaces, and DMA.
 
 If a debug dump is useful while developing, make it opt-in and keep it out of
 the default export path.
@@ -149,14 +161,22 @@ Do not host-dequantize Q4_K weight values for NPU execution. The NPU path should
 consume the packed blocks and decode the quantized values inside the generated
 tile body.
 
-The current `quantized_qwen3.embed_tokens` runner has one temporary exception:
-the GGUF Q4_K block-level f16 values `d` and `dmin` are decoded on the host into
-a small `block_f16_scales` f32 input. The NPU still reads real packed Q4_K
-blocks and decodes the per-subblock scale/min bytes and q4 nibbles. This keeps
-the first tiled MLIR stage runnable while the AIE f16 scalar conversion issue is
-isolated. Remove this exception once f16-to-f32 lowering is validated.
+The current Q4_K runners have one temporary exception: the GGUF Q4_K block-level
+f16 values `d` and `dmin` are decoded on the host into small f32 side inputs
+(`block_f16_scales` for `embed_tokens`, appended sidecar words for `q_proj`).
+The NPU still reads real packed Q4_K blocks and decodes the per-subblock
+scale/min bytes and q4 nibbles. This keeps the tiled stages runnable while the
+AIE f16 scalar conversion issue is isolated. Remove this exception once
+f16-to-f32 lowering is validated.
 
-Host-side full dequantization is allowed only for reference checks or tests.
+Host-side full dequantization is allowed only for debug checks or focused tests.
+For `quantized_qwen3` runners, the default reference path is generated from the
+same `torch.export` boundaries used by the stage exporter. `reference.py` loads
+the local `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
+`run_embed_tokens`, `run_input_layernorm`, `run_embed_tokens_input_layernorm`,
+and `run_q_proj`. Expected tensors, `allclose`, and max-abs reporting are
+computed with torch tensors on the ROCm device. NumPy is only used to slice GGUF
+bytes and pass host buffers to XRT.
 
 ## Operator Handoff
 
@@ -178,6 +198,12 @@ not expose the ELF loader used by those examples. The xclbin `aircc` path for
 the stitched module currently overflows AIE program memory for the full Q4_K
 embedding body, so the runnable path remains separate xclbins with a shared BO
 until the ELF binding or a smaller embedded body is available.
+
+`embed_tokens -> input_layernorm -> q_proj` extends the same runnable boundary:
+three stage xclbins share pyxrt BOs for the hidden and normalized-hidden
+memrefs. This is intentionally close to the torch2vk model: separate compiled
+programs can hand off through device buffers without inventing a torch2air
+runtime object.
 
 When two adjacent operators can be fused without changing the schedule shape,
 keep that as an explicit experiment. The current

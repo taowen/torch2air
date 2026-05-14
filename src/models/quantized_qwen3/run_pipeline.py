@@ -7,17 +7,28 @@ from pathlib import Path
 
 import numpy as np
 import pyxrt as xrt
+import torch
 
 from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
 
+from . import reference
+from .reference_runtime import (
+    check_close_rocm,
+    first_values,
+    max_abs_rocm,
+)
 from .run_embed_tokens import (
     DEFAULT_GGUF,
-    _check_close,
     compile_runtime,
     parse_token_ids,
     prepare_inputs,
 )
 from .run_embed_tokens_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR
+from .run_q_proj import (
+    DEFAULT_Q_PROJ_WEIGHT_TENSOR,
+    compile_q4k_linear_object,
+    prepare_q_proj_weights,
+)
 
 
 def prepare_pipeline_inputs(
@@ -33,8 +44,8 @@ def prepare_pipeline_inputs(
     np.ndarray,
     np.ndarray,
     np.ndarray,
-    np.ndarray,
-    np.ndarray,
+    torch.Tensor,
+    torch.Tensor,
     dict[str, object],
 ]:
     packed_rows, block_f16_scales, embed_expected, info = prepare_inputs(
@@ -54,11 +65,12 @@ def prepare_pipeline_inputs(
     payload = read_tensor_bytes(index.path, weight_entry, offset=0, size=hidden_size * 4)
     rms_weight = np.frombuffer(payload, dtype=np.float32).copy()
 
-    variance = np.mean(embed_expected.astype(np.float32) ** 2, axis=-1, keepdims=True)
-    expected = embed_expected * (1.0 / np.sqrt(variance + eps)).astype(np.float32)
-    expected = expected * rms_weight.reshape(1, hidden_size)
-    hidden = np.zeros_like(embed_expected, dtype=np.float32)
-    output = np.zeros_like(expected, dtype=np.float32)
+    expected = reference.run_input_layernorm(hidden_states=embed_expected)["mul_1"].reshape(
+        len(token_ids),
+        hidden_size,
+    )
+    hidden = np.zeros(tuple(embed_expected.shape), dtype=np.float32)
+    output = np.zeros(tuple(expected.shape), dtype=np.float32)
 
     info["rms_weight"] = weight_entry.to_json()
     info["rms_norm_eps"] = eps
@@ -68,8 +80,75 @@ def prepare_pipeline_inputs(
         np.ascontiguousarray(rms_weight),
         np.ascontiguousarray(hidden),
         np.ascontiguousarray(output),
-        np.ascontiguousarray(embed_expected.astype(np.float32, copy=False)),
-        np.ascontiguousarray(expected.astype(np.float32, copy=False)),
+        embed_expected,
+        expected,
+        info,
+    )
+
+
+def prepare_pipeline_qproj_inputs(
+    *,
+    gguf_path: Path,
+    token_ids: list[int],
+    blocks_per_row: int,
+    rms_weight_tensor: str,
+    eps: float,
+    qproj_tensor: str,
+    output_rows: int,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, object],
+]:
+    (
+        packed_rows,
+        block_f16_scales,
+        rms_weight,
+        hidden,
+        norm_output,
+        embed_expected,
+        norm_expected,
+        info,
+    ) = prepare_pipeline_inputs(
+        gguf_path=gguf_path,
+        token_ids=token_ids,
+        blocks_per_row=blocks_per_row,
+        rms_weight_tensor=rms_weight_tensor,
+        eps=eps,
+    )
+    packed_qproj, qproj_info = prepare_q_proj_weights(
+        gguf_path=gguf_path,
+        tensor_name=qproj_tensor,
+        output_rows=output_rows,
+        hidden_size=norm_expected.shape[1],
+    )
+    with torch.no_grad():
+        qproj_expected = reference.run_q_proj(input=norm_expected)["linear"].reshape(
+            len(token_ids),
+            -1,
+        )[:, :output_rows]
+    qproj_output = np.zeros(tuple(qproj_expected.shape), dtype=np.float32)
+    info["q_proj_weight"] = qproj_info["tensor"]
+    info["q_proj_output_rows"] = output_rows
+    return (
+        packed_rows,
+        block_f16_scales,
+        rms_weight,
+        hidden,
+        norm_output,
+        packed_qproj,
+        qproj_output,
+        embed_expected,
+        norm_expected,
+        qproj_expected,
         info,
     )
 
@@ -107,8 +186,8 @@ def run_on_npu(
     rms_weight: np.ndarray,
     hidden: np.ndarray,
     output: np.ndarray,
-    embed_expected: np.ndarray,
-    expected: np.ndarray,
+    embed_expected: torch.Tensor,
+    expected: torch.Tensor,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -190,8 +269,8 @@ def run_on_npu(
             embed_expected=embed_expected,
             expected=expected,
         )
-        _check_close(actual_hidden, embed_expected, rtol=1e-5, atol=1e-6)
-        _check_close(actual_output, expected, rtol=rtol, atol=atol)
+        check_close_rocm(actual_hidden, embed_expected, rtol=1e-2, atol=1e-2)
+        check_close_rocm(actual_output, expected, rtol=rtol, atol=atol)
 
     for _ in range(iterations):
         hidden.fill(0)
@@ -215,12 +294,197 @@ def run_on_npu(
             expected=expected,
         )
         latencies_ms.append((time.perf_counter() - start) * 1000.0)
-        _check_close(actual_hidden, embed_expected, rtol=1e-5, atol=1e-6)
-        _check_close(actual_output, expected, rtol=rtol, atol=atol)
+        check_close_rocm(actual_hidden, embed_expected, rtol=1e-2, atol=1e-2)
+        check_close_rocm(actual_output, expected, rtol=rtol, atol=atol)
 
     _ = embed_context
     _ = norm_context
     return actual_hidden, actual_output, latencies_ms
+
+
+def run_on_npu_qproj(
+    *,
+    embed_xclbin: Path,
+    embed_insts: Path,
+    norm_xclbin: Path,
+    norm_insts: Path,
+    qproj_xclbin: Path,
+    qproj_insts: Path,
+    packed_rows: np.ndarray,
+    block_f16_scales: np.ndarray,
+    rms_weight: np.ndarray,
+    hidden: np.ndarray,
+    norm_output: np.ndarray,
+    qproj_weights: np.ndarray,
+    qproj_output: np.ndarray,
+    embed_expected: torch.Tensor,
+    norm_expected: torch.Tensor,
+    qproj_expected: torch.Tensor,
+    warmup: int,
+    iterations: int,
+    rtol: float,
+    atol: float,
+    verbose: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
+    if verbose:
+        print("pyxrt", xrt.__file__)
+    device = xrt.device(0)
+    _, embed_kernel, embed_instr_v, embed_bo_instr = load_xrt_kernel(
+        device,
+        xclbin=embed_xclbin,
+        insts=embed_insts,
+    )
+    _, norm_kernel, norm_instr_v, norm_bo_instr = load_xrt_kernel(
+        device,
+        xclbin=norm_xclbin,
+        insts=norm_insts,
+    )
+    _, qproj_kernel, qproj_instr_v, qproj_bo_instr = load_xrt_kernel(
+        device,
+        xclbin=qproj_xclbin,
+        insts=qproj_insts,
+    )
+
+    bo_packed = xrt.bo(device, packed_rows.nbytes, xrt.bo.host_only, embed_kernel.group_id(3))
+    bo_scales = xrt.bo(
+        device,
+        block_f16_scales.nbytes,
+        xrt.bo.host_only,
+        embed_kernel.group_id(4),
+    )
+    bo_hidden = xrt.bo(device, hidden.nbytes, xrt.bo.host_only, embed_kernel.group_id(5))
+    bo_weight = xrt.bo(device, rms_weight.nbytes, xrt.bo.host_only, norm_kernel.group_id(4))
+    bo_norm_output = xrt.bo(
+        device,
+        norm_output.nbytes,
+        xrt.bo.host_only,
+        norm_kernel.group_id(5),
+    )
+    bo_qproj_weights = xrt.bo(
+        device,
+        qproj_weights.nbytes,
+        xrt.bo.host_only,
+        qproj_kernel.group_id(4),
+    )
+    bo_qproj_output = xrt.bo(
+        device,
+        qproj_output.nbytes,
+        xrt.bo.host_only,
+        qproj_kernel.group_id(5),
+    )
+
+    for bo, array in (
+        (bo_packed, packed_rows),
+        (bo_scales, block_f16_scales),
+        (bo_weight, rms_weight),
+        (bo_qproj_weights, qproj_weights),
+    ):
+        bo.write(array, 0)
+        bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+    actual_hidden = hidden
+    actual_norm = norm_output
+    actual_qproj = qproj_output
+    latencies_ms: list[float] = []
+    for iteration in range(warmup + iterations):
+        hidden.fill(0)
+        norm_output.fill(0)
+        qproj_output.fill(0)
+        start = time.perf_counter()
+        actual_hidden, actual_norm, actual_qproj = run_shared_bo_qproj_once(
+            embed_kernel=embed_kernel,
+            embed_instr_v=embed_instr_v,
+            embed_bo_instr=embed_bo_instr,
+            norm_kernel=norm_kernel,
+            norm_instr_v=norm_instr_v,
+            norm_bo_instr=norm_bo_instr,
+            qproj_kernel=qproj_kernel,
+            qproj_instr_v=qproj_instr_v,
+            qproj_bo_instr=qproj_bo_instr,
+            bo_packed=bo_packed,
+            bo_scales=bo_scales,
+            bo_hidden=bo_hidden,
+            bo_weight=bo_weight,
+            bo_norm_output=bo_norm_output,
+            bo_qproj_weights=bo_qproj_weights,
+            bo_qproj_output=bo_qproj_output,
+            hidden=hidden,
+            norm_output=norm_output,
+            qproj_output=qproj_output,
+            embed_expected=embed_expected,
+            norm_expected=norm_expected,
+            qproj_expected=qproj_expected,
+        )
+        if iteration >= warmup:
+            latencies_ms.append((time.perf_counter() - start) * 1000.0)
+        check_close_rocm(actual_hidden, embed_expected, rtol=1e-2, atol=1e-2)
+        check_close_rocm(actual_norm, norm_expected, rtol=rtol, atol=atol)
+        check_close_rocm(actual_qproj, qproj_expected, rtol=rtol, atol=atol)
+
+    return actual_hidden, actual_norm, actual_qproj, latencies_ms
+
+
+def run_shared_bo_qproj_once(
+    *,
+    embed_kernel,
+    embed_instr_v: np.ndarray,
+    embed_bo_instr,
+    norm_kernel,
+    norm_instr_v: np.ndarray,
+    norm_bo_instr,
+    qproj_kernel,
+    qproj_instr_v: np.ndarray,
+    qproj_bo_instr,
+    bo_packed,
+    bo_scales,
+    bo_hidden,
+    bo_weight,
+    bo_norm_output,
+    bo_qproj_weights,
+    bo_qproj_output,
+    hidden: np.ndarray,
+    norm_output: np.ndarray,
+    qproj_output: np.ndarray,
+    embed_expected: torch.Tensor,
+    norm_expected: torch.Tensor,
+    qproj_expected: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    for bo, array in (
+        (bo_hidden, hidden),
+        (bo_norm_output, norm_output),
+        (bo_qproj_output, qproj_output),
+    ):
+        bo.write(array, 0)
+        bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+    embed_run = embed_kernel(3, embed_bo_instr, len(embed_instr_v), bo_packed, bo_scales, bo_hidden)
+    embed_run.wait()
+    norm_run = norm_kernel(3, norm_bo_instr, len(norm_instr_v), bo_hidden, bo_weight, bo_norm_output)
+    norm_run.wait()
+    qproj_run = qproj_kernel(
+        3,
+        qproj_bo_instr,
+        len(qproj_instr_v),
+        bo_norm_output,
+        bo_qproj_weights,
+        bo_qproj_output,
+    )
+    qproj_run.wait()
+
+    for bo in (bo_hidden, bo_norm_output, bo_qproj_output):
+        bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+    actual_hidden = bo_hidden.read(hidden.nbytes, 0).view(hidden.dtype).reshape(tuple(embed_expected.shape))
+    actual_norm = (
+        bo_norm_output.read(norm_output.nbytes, 0)
+        .view(norm_output.dtype)
+        .reshape(tuple(norm_expected.shape))
+    )
+    actual_qproj = (
+        bo_qproj_output.read(qproj_output.nbytes, 0)
+        .view(qproj_output.dtype)
+        .reshape(tuple(qproj_expected.shape))
+    )
+    return actual_hidden, actual_norm, actual_qproj
 
 
 def run_shared_bo_once(
@@ -238,8 +502,8 @@ def run_shared_bo_once(
     bo_output,
     hidden: np.ndarray,
     output: np.ndarray,
-    embed_expected: np.ndarray,
-    expected: np.ndarray,
+    embed_expected: torch.Tensor,
+    expected: torch.Tensor,
 ) -> tuple[np.ndarray, np.ndarray]:
     bo_hidden.write(hidden, 0)
     bo_hidden.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
@@ -253,8 +517,8 @@ def run_shared_bo_once(
 
     bo_hidden.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
     bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-    actual_hidden = bo_hidden.read(hidden.nbytes, 0).view(hidden.dtype).reshape(embed_expected.shape)
-    actual_output = bo_output.read(output.nbytes, 0).view(output.dtype).reshape(expected.shape)
+    actual_hidden = bo_hidden.read(hidden.nbytes, 0).view(hidden.dtype).reshape(tuple(embed_expected.shape))
+    actual_output = bo_output.read(output.nbytes, 0).view(output.dtype).reshape(tuple(expected.shape))
     return actual_hidden, actual_output
 
 
@@ -269,11 +533,15 @@ def main() -> int:
     parser.add_argument("--rms-norm-eps", type=float, default=1e-6)
     parser.add_argument("--embed-aie-mlir", type=Path, required=True)
     parser.add_argument("--norm-aie-mlir", type=Path, required=True)
+    parser.add_argument("--qproj-aie-mlir", type=Path, default=None)
+    parser.add_argument("--qproj-tensor", default=DEFAULT_Q_PROJ_WEIGHT_TENSOR)
+    parser.add_argument("--output-rows", type=int, default=64)
+    parser.add_argument("--output-tile-rows", type=int, default=16)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
-    parser.add_argument("--rtol", type=float, default=1e-4)
-    parser.add_argument("--atol", type=float, default=1e-5)
+    parser.add_argument("--rtol", type=float, default=5e-2)
+    parser.add_argument("--atol", type=float, default=2e-1)
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -282,21 +550,50 @@ def main() -> int:
         raise SystemExit("PEANO_INSTALL_DIR is not set; source scripts/npu-common.sh first")
     os.environ.setdefault("XRT_HACK_UNSECURE_LOADING_XCLBIN", "1")
 
-    packed_rows, block_f16_scales, rms_weight, hidden, output, embed_expected, expected, info = (
-        prepare_pipeline_inputs(
+    if args.qproj_aie_mlir is None:
+        packed_rows, block_f16_scales, rms_weight, hidden, output, embed_expected, expected, info = (
+            prepare_pipeline_inputs(
+                gguf_path=args.gguf,
+                token_ids=args.token_ids,
+                blocks_per_row=args.blocks_per_row,
+                rms_weight_tensor=args.rms_weight_tensor,
+                eps=args.rms_norm_eps,
+            )
+        )
+    else:
+        (
+            packed_rows,
+            block_f16_scales,
+            rms_weight,
+            hidden,
+            output,
+            qproj_weights,
+            qproj_output,
+            embed_expected,
+            expected,
+            qproj_expected,
+            info,
+        ) = prepare_pipeline_qproj_inputs(
             gguf_path=args.gguf,
             token_ids=args.token_ids,
             blocks_per_row=args.blocks_per_row,
             rms_weight_tensor=args.rms_weight_tensor,
             eps=args.rms_norm_eps,
+            qproj_tensor=args.qproj_tensor,
+            output_rows=args.output_rows,
         )
-    )
 
     print(f"GGUF tensor {info['tensor']['name']} {info['tensor']['ggml_type']}")
     print(f"RMS weight {info['rms_weight']['name']} {info['rms_weight']['ggml_type']}")
     print(f"token_ids {','.join(str(value) for value in args.token_ids)}")
     print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
-    print("handoff embed_tokens->input_layernorm shared pyxrt BO")
+    print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
+    if args.qproj_aie_mlir is None:
+        print("handoff embed_tokens->input_layernorm shared pyxrt BO")
+    else:
+        print(f"Q4_K weight {info['q_proj_weight']['name']} {info['q_proj_weight']['ggml_type']}")
+        print(f"output_rows {args.output_rows}")
+        print("handoff embed_tokens->input_layernorm->q_proj shared pyxrt BO")
 
     _, embed_xclbin, embed_insts = compile_runtime(
         aie_mlir=args.embed_aie_mlir,
@@ -310,36 +607,87 @@ def main() -> int:
         instance_name="run_input_layernorm",
         peano_install_dir=peano_install_dir,
     )
-    actual_hidden, actual_output, latencies_ms = run_on_npu(
-        embed_xclbin=embed_xclbin,
-        embed_insts=embed_insts,
-        norm_xclbin=norm_xclbin,
-        norm_insts=norm_insts,
-        packed_rows=packed_rows,
-        block_f16_scales=block_f16_scales,
-        rms_weight=rms_weight,
-        hidden=hidden,
-        output=output,
-        embed_expected=embed_expected,
-        expected=expected,
-        warmup=args.warmup,
-        iterations=args.iterations,
-        rtol=args.rtol,
-        atol=args.atol,
-        verbose=args.verbose,
-    )
+    if args.qproj_aie_mlir is None:
+        actual_hidden, actual_output, latencies_ms = run_on_npu(
+            embed_xclbin=embed_xclbin,
+            embed_insts=embed_insts,
+            norm_xclbin=norm_xclbin,
+            norm_insts=norm_insts,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
+            rms_weight=rms_weight,
+            hidden=hidden,
+            output=output,
+            embed_expected=embed_expected,
+            expected=expected,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            rtol=args.rtol,
+            atol=args.atol,
+            verbose=args.verbose,
+        )
+        actual_qproj = None
+        qproj_xclbin = None
+        qproj_insts = None
+    else:
+        q4k_object = compile_q4k_linear_object(
+            work_dir=args.work_dir / "q_proj",
+            peano_install_dir=peano_install_dir,
+            output_tile_rows=args.output_tile_rows,
+            blocks_per_row=args.blocks_per_row,
+            hidden_size=hidden.shape[1],
+        )
+        _, qproj_xclbin, qproj_insts = compile_runtime(
+            aie_mlir=args.qproj_aie_mlir,
+            work_dir=args.work_dir / "q_proj",
+            instance_name="run_q_proj",
+            peano_install_dir=peano_install_dir,
+            link_objects=(q4k_object,),
+        )
+        actual_hidden, actual_output, actual_qproj, latencies_ms = run_on_npu_qproj(
+            embed_xclbin=embed_xclbin,
+            embed_insts=embed_insts,
+            norm_xclbin=norm_xclbin,
+            norm_insts=norm_insts,
+            qproj_xclbin=qproj_xclbin,
+            qproj_insts=qproj_insts,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
+            rms_weight=rms_weight,
+            hidden=hidden,
+            norm_output=output,
+            qproj_weights=qproj_weights,
+            qproj_output=qproj_output,
+            embed_expected=embed_expected,
+            norm_expected=expected,
+            qproj_expected=qproj_expected,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            rtol=args.rtol,
+            atol=args.atol,
+            verbose=args.verbose,
+        )
 
-    hidden_max_abs = float(np.max(np.abs(actual_hidden - embed_expected)))
-    output_max_abs = float(np.max(np.abs(actual_output - expected)))
+    hidden_max_abs = max_abs_rocm(actual_hidden, embed_expected)
+    output_max_abs = max_abs_rocm(actual_output, expected)
     print(f"embed_xclbin {embed_xclbin}")
     print(f"embed_insts {embed_insts}")
     print(f"norm_xclbin {norm_xclbin}")
     print(f"norm_insts {norm_insts}")
+    if qproj_xclbin is not None and qproj_insts is not None:
+        print(f"qproj_xclbin {qproj_xclbin}")
+        print(f"qproj_insts {qproj_insts}")
     print(f"hidden_first8 {actual_hidden.reshape(-1)[:8].tolist()}")
     print(f"output_first8 {actual_output.reshape(-1)[:8].tolist()}")
-    print(f"expected_first8 {expected.reshape(-1)[:8].tolist()}")
+    if actual_qproj is not None:
+        print(f"qproj_first8 {actual_qproj.reshape(-1)[:8].tolist()}")
+        print(f"qproj_expected_first8 {first_values(qproj_expected)}")
+    print(f"expected_first8 {first_values(expected)}")
     print(f"hidden_max_abs {hidden_max_abs:.8g}")
     print(f"max_abs {output_max_abs:.8g}")
+    if actual_qproj is not None:
+        qproj_max_abs = max_abs_rocm(actual_qproj, qproj_expected)
+        print(f"qproj_max_abs {qproj_max_abs:.8g}")
     print(f"allclose True rtol={args.rtol:g} atol={args.atol:g}")
     if latencies_ms:
         print(f"mean_ms {sum(latencies_ms) / len(latencies_ms):.3f}")

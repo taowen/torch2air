@@ -7,11 +7,15 @@ import torch
 from transformers import AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from torch2air.export import render_to_file
+from torch2air.export import (
+    render_exported_reference_function,
+    render_reference_module,
+    render_to_file,
+)
 from torch2air.export.kernels import TEMPLATE_DIR as KERNEL_TEMPLATE_DIR
 
 
-DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/llama_cpp_qwen3/qwen3-0.6b-q4_k_m.gguf")
+DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf")
 DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 
@@ -185,6 +189,53 @@ def export_input_layernorm(
     )
 
 
+def export_q_proj(
+    *,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+    output_rows_override: int | None = None,
+    output_tile_rows: int = 16,
+) -> None:
+    config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+    model_hidden_size = int(config.hidden_size)
+    if model_hidden_size % 256 != 0:
+        raise ValueError(f"Q4_K hidden_size must be divisible by 256, got {model_hidden_size}")
+    blocks_per_row = model_hidden_size // 256
+    q_proj_output_size = int(config.num_attention_heads) * int(config.head_dim)
+    output_rows = output_rows_override or 64
+    if output_rows <= 0 or output_rows > q_proj_output_size:
+        raise ValueError(f"output_rows must be in [1, {q_proj_output_size}], got {output_rows}")
+    if output_tile_rows <= 0 or output_rows % output_tile_rows != 0:
+        raise ValueError(
+            f"output_tile_rows must be positive and divide output_rows={output_rows}, got {output_tile_rows}"
+        )
+    with torch.device("meta"):
+        model = Qwen3ForCausalLM(config)
+    export_one(
+        "run_q_proj",
+        model.model.layers[0].self_attn.q_proj,
+        args=(torch.zeros((1, sequence_length, model_hidden_size), dtype=torch.float32, device="meta"),),
+        output_dir=output_dir,
+        template_dir=KERNEL_TEMPLATE_DIR,
+        weight_prefix="model.layers.0.self_attn.q_proj.",
+        shape_exprs={sequence_length: "sequence_length"},
+        template_name="q4k_linear.mlir.j2",
+        context={
+            "blocks_per_row": blocks_per_row,
+            "hidden_size": model_hidden_size,
+            "model_hidden_size": model_hidden_size,
+            "output_rows": output_rows,
+            "output_tile_rows": output_tile_rows,
+            "output_tiles": output_rows // output_tile_rows,
+            "q_proj_output_size": q_proj_output_size,
+            "row_words": blocks_per_row * 36,
+            "weight_words": blocks_per_row * 38,
+            "sequence_length": sequence_length,
+        },
+    )
+
+
 def export_pipeline_embed_norm(
     *,
     model_id: str,
@@ -203,6 +254,66 @@ def export_pipeline_embed_norm(
         output_dir=output_dir,
         sequence_length=sequence_length,
         blocks_per_row_override=blocks_per_row_override,
+    )
+
+
+def export_reference_module(
+    *,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+) -> None:
+    config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+    hidden_size = int(config.hidden_size)
+    with torch.device("meta"):
+        model = Qwen3ForCausalLM(config)
+        fused = EmbedTokensInputLayerNorm(model)
+
+    exports = [
+        (
+            "embed_tokens",
+            model.model.embed_tokens,
+            (torch.zeros((1, sequence_length), dtype=torch.long, device="meta"),),
+            None,
+            "root.model.embed_tokens",
+        ),
+        (
+            "input_layernorm",
+            model.model.layers[0].input_layernorm,
+            (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
+            None,
+            "root.model.layers[0].input_layernorm",
+        ),
+        (
+            "embed_tokens_input_layernorm",
+            fused,
+            (torch.zeros((1, sequence_length), dtype=torch.long, device="meta"),),
+            None,
+            "_EmbedTokensInputLayerNorm(root)",
+        ),
+        (
+            "q_proj",
+            model.model.layers[0].self_attn.q_proj,
+            (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
+            None,
+            "root.model.layers[0].self_attn.q_proj",
+        ),
+    ]
+    reference_functions: list[str] = []
+    for name, module, args, kwargs, module_expr in exports:
+        program = torch.export.export(module, args, kwargs=kwargs, strict=False)
+        reference_functions.append(
+            render_exported_reference_function(
+                program,
+                name=name,
+                module_expr=module_expr,
+            )
+        )
+    (output_dir / "reference.py").write_text(
+        render_reference_module(
+            model_id=model_id,
+            reference_functions=reference_functions,
+        )
     )
 
 
@@ -229,6 +340,7 @@ def main() -> int:
             "input_layernorm",
             "embed_tokens_input_layernorm",
             "pipeline_embed_norm",
+            "q_proj",
         ],
         default="embed_tokens",
     )
@@ -246,6 +358,18 @@ def main() -> int:
         default=None,
         help="Q4_K blocks per token row to export; default exports the model hidden size.",
     )
+    parser.add_argument(
+        "--output-rows",
+        type=int,
+        default=None,
+        help="Q4_K linear output rows to export; q_proj defaults to 64.",
+    )
+    parser.add_argument(
+        "--output-tile-rows",
+        type=int,
+        default=16,
+        help="Q4_K linear output rows computed per AIE tile.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -254,6 +378,8 @@ def main() -> int:
     print(f"gguf: {args.gguf}")
     print(f"output_dir: {args.output_dir}")
     print(f"sequence_length: {args.sequence_length}")
+    if args.output_rows is not None:
+        print(f"output_rows: {args.output_rows}")
     if args.dry_run:
         print("mode: dry-run")
         return 0
@@ -287,6 +413,19 @@ def main() -> int:
             sequence_length=args.sequence_length,
             blocks_per_row_override=args.blocks_per_row,
         )
+    elif args.stage == "q_proj":
+        export_q_proj(
+            model_id=args.model_id,
+            output_dir=args.output_dir,
+            sequence_length=args.sequence_length,
+            output_rows_override=args.output_rows,
+            output_tile_rows=args.output_tile_rows,
+        )
+    export_reference_module(
+        model_id=args.model_id,
+        output_dir=Path(__file__).parent,
+        sequence_length=args.sequence_length,
+    )
     return 0
 
 

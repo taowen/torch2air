@@ -25,10 +25,11 @@ schedule is part of the generated MLIR:
 That is a good fit for Q4_K and FlashAttention-style kernels where tile size,
 memory space, DMA order, and double buffering are performance-critical.
 
-Avoid `.cc` kernels and direct Python AIR builders in the first implementation
-path. They hide or bypass the tiled MLIR artifact that we need to inspect and
-lower. If a native kernel is eventually needed, it is only the compute body
-inside a selected tile/herd, not the AIR tiling strategy.
+Avoid using `.cc` kernels or direct Python AIR builders to express the tiling
+strategy. They hide or bypass the MLIR artifact that we need to inspect and
+lower. A native kernel is acceptable only as the compute body inside a selected
+tile/herd, with the generated MLIR still owning launch/segment/herd placement,
+DMA, memory spaces, and operator boundaries.
 
 For operator-to-operator experiments, follow the upstream MLIR-AIR llama style:
 build each operator as an independent stage first, then stitch or sequence those
@@ -37,6 +38,9 @@ generates a stitched two-launch AIR artifact, but the runnable Python 3.12 path
 uses two stage xclbins with a shared `pyxrt.bo` because the upstream ELF loader
 is not exposed by the current `pyxrt` binding and the xclbin multi-launch path
 overflows program memory for the current Q4_K embedding body.
+The next verified step, `embed_tokens -> input_layernorm -> q_proj`, keeps the
+same shared-BO style and adds an official AIR external kernel for the Q4_K
+linear tile body.
 
 ## Baseline IR Shape
 
@@ -319,9 +323,10 @@ Rules:
 - `.npy` is only an optional file container for tool compatibility, not the
   deployment ABI.
 - The AIR path must consume packed weights.
-- Prefer a PyTorch ROCm reference when the module boundary has a normal PyTorch
-  equivalent. For packed GGUF-only boundaries, a NumPy reference is acceptable
-  until the PyTorch quantized boundary exists.
+- Prefer the generated PyTorch ROCm reference when the module boundary has a
+  normal PyTorch equivalent. For `quantized_qwen3`, `export.py` regenerates
+  `reference.py` from those exported boundaries and loads the local safetensors
+  model. NumPy is not a default model-reference path.
 
 Success criteria:
 
@@ -344,8 +349,8 @@ AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 \
 
 This command exports from `torch.export`, lowers tiled pre-AIR MLIR through
 `air-opt`, compiles the runtime MLIR with `aiecc`, loads `xclbin`/`insts` with
-`air.backend.xrt.XRTBackend`, and compares the real NPU output with the GGUF
-Q4_K reference.
+`air.backend.xrt.XRTBackend`, and compares the real NPU output with the
+generated safetensors PyTorch ROCm reference.
 
 ## Milestone Order
 

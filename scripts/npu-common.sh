@@ -10,6 +10,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${XRT_DIR:=/opt/xilinx/xrt}"
 : "${AIE_TARGET:=aie2p}"
 : "${NPU_WORK_ROOT:=$ROOT_DIR/.cache/npu-spikes}"
+: "${UV:=uv}"
 
 source "$XRT_DIR/setup.sh" >/tmp/torch2air-xrt-setup.log
 source "$ROOT_DIR/scripts/air-env.sh"
@@ -19,7 +20,7 @@ export XRT_HACK_UNSECURE_LOADING_XCLBIN="${XRT_HACK_UNSECURE_LOADING_XCLBIN:-1}"
 setup_npu_python_shim() {
   local shim_dir="$NPU_WORK_ROOT/bin"
   mkdir -p "$shim_dir"
-  printf '#!/usr/bin/env bash\nexec "%s/.venv/bin/python" "$@"\n' "$ROOT_DIR" > "$shim_dir/python3"
+  printf '#!/usr/bin/env bash\ncd "%s"\nexec "%s" run --no-sync python "$@"\n' "$ROOT_DIR" "$UV" > "$shim_dir/python3"
   chmod +x "$shim_dir/python3"
   if [[ ":$PATH:" != *":$shim_dir:"* ]]; then
     export PATH="$shim_dir:$PATH"
@@ -27,7 +28,9 @@ setup_npu_python_shim() {
 }
 
 check_npu_device() {
-  "$ROOT_DIR/.venv/bin/python" - <<'PY'
+  (
+    cd "$ROOT_DIR"
+    "$UV" run --no-sync python - <<'PY'
 import pyxrt
 
 devices = pyxrt.enumerate_devices()
@@ -38,6 +41,7 @@ if devices < 1:
 device = pyxrt.device(0)
 print("device", device.get_info(pyxrt.xrt_info_device.name))
 PY
+  )
 }
 
 run_npu_make() {

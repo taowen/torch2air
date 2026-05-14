@@ -198,6 +198,18 @@ AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
 AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh
 
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh q_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh q_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
+
 AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
 ```
@@ -249,55 +261,80 @@ Verified checks:
 - `embed_tokens_input_layernorm` is a fused L1 handoff spike. It keeps the
   dequantized embedding values in L1 and feeds RMSNorm without writing an
   intermediate global hidden buffer.
+- `q_proj` uses official-style AIR external kernel lowering: generated MLIR owns
+  `air.launch`, `air.segment`, `air.herd`, and `air.dma_memcpy_nd`, while
+  `q4k_linear.o` owns the tile-local Q4_K dot-product body.
+- Like `embed_tokens`, `q_proj` still uses the temporary Q4_K `d`/`dmin`
+  sidecar workaround for AIE scalar f16 conversion: the NPU receives real packed
+  Q4_K words plus f32 sidecar words for block-level scales.
+- `embed_tokens -> input_layernorm -> q_proj` runs three stage xclbins with
+  shared `pyxrt.bo` handoff buffers. It does not copy intermediate hidden states
+  through NumPy arrays between operators.
+- The `quantized_qwen3` reference path is generated from the same exported
+  module boundaries. `src/models/quantized_qwen3/reference.py` loads the local
+  `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
+  `run_embed_tokens`, `run_input_layernorm`,
+  `run_embed_tokens_input_layernorm`, and `run_q_proj`. Expected tensors,
+  `allclose`, and max-abs metrics are computed on the ROCm device. NumPy is
+  used only for GGUF byte slicing and XRT host buffers.
 
 Latest real NPU results:
 
 ```text
-2026-05-13:
+2026-05-14 safetensors PyTorch ROCm reference:
 
-1 token, 1 Q4_K block, hidden_size 256:
-  max_abs 0
-  allclose True rtol=1e-05 atol=1e-06
-  mean_ms 1.067
-
-1 token, 4 Q4_K blocks, hidden_size 1024:
-  max_abs 0
-  allclose True rtol=1e-05 atol=1e-06
-  mean_ms 1.415
-
-2 tokens, 4 Q4_K blocks each, hidden_size 1024:
-  max_abs 0
-  allclose True rtol=1e-05 atol=1e-06
-  mean_ms 2.025
+embed_tokens, 1 token, 4 Q4_K blocks, hidden_size 1024:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.0054986477
+  allclose True rtol=0.01 atol=0.01
+  mean_ms 1.435
 
 input_layernorm, 1 token, hidden_size 1024:
-  max_abs 1.6689301e-06
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 1.9073486e-06
   allclose True rtol=0.0001 atol=1e-05
-  mean_ms 1.588
-
-input_layernorm, 2 tokens, hidden_size 1024:
-  max_abs 1.6689301e-06
-  allclose True rtol=0.0001 atol=1e-05
-  mean_ms 1.779
+  mean_ms 1.497
 
 embed_tokens_input_layernorm fused L1 handoff, 1 token, 1 Q4_K block:
-  max_abs 2.3841858e-07
-  allclose True rtol=0.0001 atol=1e-05
-  mean_ms 1.199
-
-2026-05-14:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.18145949
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 1.135
 
 pipeline_embed_norm shared BO handoff, 1 token, hidden_size 1024:
-  hidden_max_abs 0
-  max_abs 1.6689301e-06
-  allclose True rtol=0.0001 atol=1e-05
-  mean_ms 2.285
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 2.304
 
-pipeline_embed_norm shared BO handoff, 2 tokens, hidden_size 1024:
-  hidden_max_abs 0
-  max_abs 1.6689301e-06
-  allclose True rtol=0.0001 atol=1e-05
-  mean_ms 3.007
+q_proj external Q4_K kernel, 1 token, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.058996558
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 14.788
+
+q_proj external Q4_K kernel, 2 tokens, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.058996558
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 15.114
+
+pipeline_embed_norm_qproj shared BO handoff, 1 token, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  qproj_max_abs 0.081097126
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 16.258
+
+pipeline_embed_norm_qproj shared BO handoff, 2 tokens, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  qproj_max_abs 0.081097126
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 17.821
 ```
 
 Notes:

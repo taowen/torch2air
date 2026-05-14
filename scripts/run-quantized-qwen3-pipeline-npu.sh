@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 UV="${UV:-uv}"
+PIPELINE_STAGE="${1:-embed_norm}"
 GGUF_PATH="${GGUF_PATH:-/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf}"
 TOKEN_IDS="${TOKEN_IDS:-0}"
 BLOCKS_PER_ROW="${BLOCKS_PER_ROW:-4}"
@@ -12,13 +13,34 @@ OUT_DIR="${OUT_DIR:-$ROOT_DIR/src/models/quantized_qwen3/generated/lowered}"
 NPU_WARMUP="${NPU_WARMUP:-0}"
 NPU_ITERATIONS="${NPU_ITERATIONS:-1}"
 RMS_NORM_EPS="${RMS_NORM_EPS:-0.000001}"
-STEM="quantized_qwen3_pipeline_embed_norm"
-FUNC="run_pipeline_embed_norm"
+OUTPUT_ROWS="${OUTPUT_ROWS:-64}"
+OUTPUT_TILE_ROWS="${OUTPUT_TILE_ROWS:-16}"
+
+case "$PIPELINE_STAGE" in
+  embed_norm|pipeline_embed_norm)
+    INCLUDE_QPROJ=0
+    STEM="quantized_qwen3_pipeline_embed_norm"
+    FUNC="run_pipeline_embed_norm"
+    ;;
+  embed_norm_qproj|pipeline_embed_norm_qproj)
+    INCLUDE_QPROJ=1
+    STEM="quantized_qwen3_pipeline_embed_norm_qproj"
+    FUNC="run_pipeline_embed_norm_qproj"
+    ;;
+  *)
+    echo "Unknown quantized_qwen3 pipeline stage: $PIPELINE_STAGE" >&2
+    exit 2
+    ;;
+esac
 
 IFS=',' read -r -a _token_parts <<< "$TOKEN_IDS"
 TOKEN_COUNT="${TOKEN_COUNT:-${#_token_parts[@]}}"
 if [[ "$BLOCKS_PER_ROW" != "4" ]]; then
   echo "pipeline_embed_norm currently targets full hidden_size=1024, so BLOCKS_PER_ROW must be 4." >&2
+  exit 2
+fi
+if (( INCLUDE_QPROJ && (OUTPUT_TILE_ROWS <= 0 || OUTPUT_ROWS % OUTPUT_TILE_ROWS != 0) )); then
+  echo "OUTPUT_TILE_ROWS must be positive and divide OUTPUT_ROWS." >&2
   exit 2
 fi
 
@@ -31,14 +53,23 @@ source "$ROOT_DIR/scripts/verify-air-common.sh"
 
 EMBED_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_embed_tokens.mlir"
 NORM_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_input_layernorm.mlir"
+QPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_proj.mlir"
 PIPELINE_DMA="$OUT_DIR/$STEM.dma.mlir"
-WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-pipeline_embed_norm-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
+WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
 
 "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
   --stage pipeline_embed_norm \
   --gguf "$GGUF_PATH" \
   --sequence-length "$TOKEN_COUNT" \
   --blocks-per-row "$BLOCKS_PER_ROW"
+if (( INCLUDE_QPROJ )); then
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage q_proj \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT" \
+    --output-rows "$OUTPUT_ROWS" \
+    --output-tile-rows "$OUTPUT_TILE_ROWS"
+fi
 
 check_contains "$EMBED_MLIR" 'scf\.parallel' 'embed_tokens explicit tile loop'
 check_contains "$EMBED_MLIR" 'memref\.subview' 'embed_tokens tile subview'
@@ -54,6 +85,19 @@ compile_air_dma_fixture "$EMBED_DMA" "${STEM}_embed_tokens"
 EMBED_AIE="$AIE_IR"
 compile_air_dma_fixture "$NORM_DMA" "${STEM}_input_layernorm"
 NORM_AIE="$AIE_IR"
+if (( INCLUDE_QPROJ )); then
+  QPROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
+  check_contains "$QPROJ_MLIR" 'air\.launch' 'q_proj official AIR launch'
+  check_contains "$QPROJ_MLIR" 'air\.herd' 'q_proj official AIR herd'
+  check_contains "$QPROJ_MLIR" 'air\.dma_memcpy_nd' 'q_proj explicit AIR DMA'
+  check_contains "$QPROJ_MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${QPROJ_WEIGHT_WORDS}xi32, 2" 'q_proj packed Q4_K weight L1 tile'
+  check_contains "$QPROJ_MLIR" 'func\.call @q4k_linear_tile' 'q_proj external Q4_K tile kernel call'
+  check_contains "$QPROJ_MLIR" 'link_with = "q4k_linear\.o"' 'q_proj external Q4_K link object'
+  HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
+  compile_air_dma_fixture "$QPROJ_MLIR" "${STEM}_q_proj"
+  QPROJ_AIE="$AIE_IR"
+  HERD_COLS="$BLOCKS_PER_ROW"
+fi
 
 "$UV" run --no-sync python -m models.quantized_qwen3.stitch_pipeline \
   --embed-dma-mlir "$EMBED_DMA" \
@@ -72,13 +116,24 @@ if [[ "${PIPELINE_DEBUG_AIE:-0}" == "1" ]]; then
   compile_air_dma_fixture "$PIPELINE_DMA" "$STEM"
 fi
 
-"$ROOT_DIR/.venv/bin/python" -m models.quantized_qwen3.run_pipeline \
-  --gguf "$GGUF_PATH" \
-  --token-ids "$TOKEN_IDS" \
-  --blocks-per-row "$BLOCKS_PER_ROW" \
-  --rms-norm-eps "$RMS_NORM_EPS" \
-  --embed-aie-mlir "$EMBED_AIE" \
-  --norm-aie-mlir "$NORM_AIE" \
-  --work-dir "$WORK_DIR" \
-  --warmup "$NPU_WARMUP" \
+RUNNER_ARGS=(
+  -m models.quantized_qwen3.run_pipeline
+  --gguf "$GGUF_PATH"
+  --token-ids "$TOKEN_IDS"
+  --blocks-per-row "$BLOCKS_PER_ROW"
+  --rms-norm-eps "$RMS_NORM_EPS"
+  --embed-aie-mlir "$EMBED_AIE"
+  --norm-aie-mlir "$NORM_AIE"
+  --work-dir "$WORK_DIR"
+  --warmup "$NPU_WARMUP"
   --iterations "$NPU_ITERATIONS"
+)
+if (( INCLUDE_QPROJ )); then
+  RUNNER_ARGS+=(
+    --qproj-aie-mlir "$QPROJ_AIE"
+    --output-rows "$OUTPUT_ROWS"
+    --output-tile-rows "$OUTPUT_TILE_ROWS"
+  )
+fi
+
+"$UV" run --no-sync python "${RUNNER_ARGS[@]}"

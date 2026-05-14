@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+UV="${UV:-uv}"
 source "$ROOT_DIR/scripts/verify-air-common.sh"
 source "$ROOT_DIR/scripts/npu-common.sh"
 
@@ -11,7 +13,7 @@ MANIFEST="${MANIFEST:-$OUT_DIR/q4k_gguf_manifest.json}"
 NPU_MANIFEST="${NPU_MANIFEST:-$OUT_DIR/q4k_matvec_npu_manifest.json}"
 
 PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
-  "$ROOT_DIR/.venv/bin/python" -m torch2air.tools.inspect_gguf \
+  "$UV" run --no-sync python -m torch2air.tools.inspect_gguf \
   --gguf "$GGUF_PATH" \
   --format Q4_K \
   --manifest "$MANIFEST"
@@ -50,7 +52,7 @@ WARNING_FLAGS=(
 
 (
   cd "$SPIKE5_NPU_DIR"
-  "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/examples/amd_aie_experiments/npu_q4k_matvec.py" \
+  "$UV" run --no-sync python "$ROOT_DIR/examples/amd_aie_experiments/npu_q4k_matvec.py" \
     --gguf "$GGUF_PATH" \
     --tensor "${Q4K_TENSOR:-token_embd.weight}" \
     --rows "${Q4K_ROWS:-64}" \

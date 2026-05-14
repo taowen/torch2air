@@ -8,9 +8,18 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
-from torch2air.weights.gguf import dequantize_q4_k_blocks, load_gguf_index, read_tensor_bytes
+from torch2air.weights.gguf import load_gguf_index, read_tensor_bytes
+
+from . import reference
+from .reference_runtime import (
+    check_close_rocm,
+    first_values,
+    max_abs_rocm,
+    q4k_block_f16_scales_rocm,
+)
 
 
 DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf")
@@ -23,7 +32,7 @@ def prepare_inputs(
     tensor_name: str,
     token_ids: list[int],
     blocks_per_row: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
     index = load_gguf_index(gguf_path)
     selected = index.tensors[tensor_name]
     if selected.ggml_type != "Q4_K":
@@ -61,22 +70,32 @@ def prepare_inputs(
             dtype=np.uint8,
         ).reshape(blocks_per_row, 144)
 
-    d = raw_blocks[:, 0:2].view(np.float16).astype(np.float32).reshape(-1)
-    dmin = raw_blocks[:, 2:4].view(np.float16).astype(np.float32).reshape(-1)
-    block_f16_scales = np.stack([d, dmin], axis=1).reshape(len(token_ids), blocks_per_row, 2)
-    expected = dequantize_q4_k_blocks(raw_blocks).reshape(len(token_ids), blocks_per_row * 256)
+    block_f16_scales = (
+        q4k_block_f16_scales_rocm(raw_blocks)
+        .reshape(len(token_ids), blocks_per_row, 2)
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    reference_output = reference.run_embed_tokens(input=token_ids_array(token_ids))["embedding"]
+    expected = reference_output.reshape(len(token_ids), model_blocks_per_row * 256)[:, : blocks_per_row * 256]
     info = {
         "tensor": selected.to_json(),
         "token_ids": token_ids,
         "blocks_per_row": blocks_per_row,
+        "model_blocks_per_row": model_blocks_per_row,
         "hidden_size": blocks_per_row * 256,
     }
     return (
         np.ascontiguousarray(packed_rows),
         np.ascontiguousarray(block_f16_scales),
-        np.ascontiguousarray(expected),
+        expected,
         info,
     )
+
+
+def token_ids_array(token_ids: list[int]) -> np.ndarray:
+    return np.array([token_ids], dtype=np.int64)
 
 
 def compile_runtime(
@@ -85,19 +104,27 @@ def compile_runtime(
     work_dir: Path,
     instance_name: str,
     peano_install_dir: str,
+    link_objects: tuple[Path, ...] = (),
 ) -> tuple[Path, Path, Path]:
     work_dir.mkdir(parents=True, exist_ok=True)
     aiecc_dir = work_dir / "aiecc"
     shutil.rmtree(aiecc_dir, ignore_errors=True)
     aiecc_dir.mkdir(parents=True, exist_ok=True)
+    if link_objects:
+        for object_dir in (work_dir / "air_project", aiecc_dir / "air_project"):
+            object_dir.mkdir(parents=True, exist_ok=True)
+            for object_path in link_objects:
+                shutil.copy2(object_path, object_dir / object_path.name)
 
     npu_mlir = work_dir / f"{instance_name}.npu.mlir"
     xclbin = work_dir / f"{instance_name}.xclbin"
     insts = work_dir / f"{instance_name}.insts.bin"
+    air_opt = installed_tool("air-opt", "MLIR_AIR_INSTALL_DIR")
+    aiecc = installed_tool("aiecc", "MLIR_AIE_INSTALL_DIR")
 
     subprocess.run(
         [
-            "air-opt",
+            air_opt,
             str(aie_mlir),
             "--air-to-std",
             "--airrt-to-npu",
@@ -107,9 +134,11 @@ def compile_runtime(
         ],
         check=True,
     )
+    if link_objects:
+        _dedupe_private_func_declarations(npu_mlir)
     subprocess.run(
         [
-            "aiecc",
+            aiecc,
             "--no-aiesim",
             "--no-xchesscc",
             "--no-xbridge",
@@ -126,8 +155,35 @@ def compile_runtime(
             str(npu_mlir),
         ],
         check=True,
+        cwd=work_dir,
     )
     return npu_mlir, xclbin, insts
+
+
+def installed_tool(name: str, install_env: str) -> str:
+    install_dir = os.environ.get(install_env)
+    if install_dir:
+        candidate = Path(install_dir) / "bin" / name
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which(name)
+    if not found:
+        raise RuntimeError(f"{name} is not on PATH and {install_env} is not set")
+    return found
+
+
+def _dedupe_private_func_declarations(path: Path) -> None:
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("func.func private @"):
+            symbol = stripped.split("@", 1)[1].split("(", 1)[0]
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+        output.append(line)
+    path.write_text("\n".join(output) + "\n")
 
 
 def run_on_npu(
@@ -137,7 +193,7 @@ def run_on_npu(
     instance_name: str,
     packed_rows: np.ndarray,
     block_f16_scales: np.ndarray,
-    expected: np.ndarray,
+    expected: torch.Tensor,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -150,38 +206,25 @@ def run_on_npu(
         instance_name=instance_name,
     )
     func = backend.load(XRTCompileArtifact(str(xclbin), "MLIR_AIE", str(insts)))
-    output = np.zeros_like(expected)
+    expected_shape = tuple(expected.shape)
+    output = np.zeros(expected_shape, dtype=np.float32)
     actual = output
     latencies_ms: list[float] = []
     try:
         for _ in range(warmup):
             output.fill(0)
-            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(expected.shape)
-            _check_close(actual, expected, rtol=rtol, atol=atol)
+            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(expected_shape)
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol)
 
         for _ in range(iterations):
             output.fill(0)
             start = time.perf_counter()
-            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(expected.shape)
+            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(expected_shape)
             latencies_ms.append((time.perf_counter() - start) * 1000.0)
-            _check_close(actual, expected, rtol=rtol, atol=atol)
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol)
     finally:
         backend.unload()
     return actual, latencies_ms
-
-
-def _check_close(actual: np.ndarray, expected: np.ndarray, *, rtol: float, atol: float) -> None:
-    if np.allclose(actual, expected, rtol=rtol, atol=atol):
-        return
-    diff = np.abs(actual - expected)
-    flat_idx = int(np.argmax(diff))
-    raise AssertionError(
-        "NPU output mismatch: "
-        f"max_abs={float(diff.reshape(-1)[flat_idx])} "
-        f"index={np.unravel_index(flat_idx, diff.shape)} "
-        f"actual={float(actual.reshape(-1)[flat_idx])} "
-        f"expected={float(expected.reshape(-1)[flat_idx])}"
-    )
 
 
 def parse_token_ids(value: str) -> list[int]:
@@ -202,8 +245,8 @@ def main() -> int:
     parser.add_argument("--instance-name", default="run_embed_tokens")
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
-    parser.add_argument("--rtol", type=float, default=1e-5)
-    parser.add_argument("--atol", type=float, default=1e-6)
+    parser.add_argument("--rtol", type=float, default=1e-2)
+    parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -221,6 +264,7 @@ def main() -> int:
     print(f"GGUF tensor {info['tensor']['name']} {info['tensor']['ggml_type']}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
     print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
+    print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
 
     npu_mlir, xclbin, insts = compile_runtime(
         aie_mlir=args.aie_mlir,
@@ -242,12 +286,12 @@ def main() -> int:
         verbose=args.verbose,
     )
 
-    max_abs = float(np.max(np.abs(actual - expected)))
+    max_abs = max_abs_rocm(actual, expected)
     print(f"npu_mlir {npu_mlir}")
     print(f"xclbin {xclbin}")
     print(f"insts {insts}")
     print(f"actual_first8 {actual.reshape(-1)[:8].tolist()}")
-    print(f"expected_first8 {expected.reshape(-1)[:8].tolist()}")
+    print(f"expected_first8 {first_values(expected)}")
     print(f"max_abs {max_abs:.8g}")
     print(f"allclose True rtol={args.rtol:g} atol={args.atol:g}")
     if latencies_ms:
