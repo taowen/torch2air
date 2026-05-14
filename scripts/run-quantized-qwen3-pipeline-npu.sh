@@ -15,25 +15,36 @@ NPU_ITERATIONS="${NPU_ITERATIONS:-1}"
 RMS_NORM_EPS="${RMS_NORM_EPS:-0.000001}"
 OUTPUT_ROWS="${OUTPUT_ROWS:-128}"
 OUTPUT_TILE_ROWS="${OUTPUT_TILE_ROWS:-32}"
+START_POSITION="${START_POSITION:-0}"
 
 case "$PIPELINE_STAGE" in
   embed_norm|pipeline_embed_norm)
     INCLUDE_QPROJ=0
     INCLUDE_QKV=0
+    INCLUDE_ROPE=0
     STEM="quantized_qwen3_pipeline_embed_norm"
     FUNC="run_pipeline_embed_norm"
     ;;
   embed_norm_qproj|pipeline_embed_norm_qproj)
     INCLUDE_QPROJ=1
     INCLUDE_QKV=0
+    INCLUDE_ROPE=0
     STEM="quantized_qwen3_pipeline_embed_norm_qproj"
     FUNC="run_pipeline_embed_norm_qproj"
     ;;
   embed_norm_qkv|pipeline_embed_norm_qkv)
     INCLUDE_QPROJ=1
     INCLUDE_QKV=1
+    INCLUDE_ROPE=0
     STEM="quantized_qwen3_pipeline_embed_norm_qkv"
     FUNC="run_pipeline_embed_norm_qkv"
+    ;;
+  embed_norm_qkv_rope|pipeline_embed_norm_qkv_rope)
+    INCLUDE_QPROJ=1
+    INCLUDE_QKV=1
+    INCLUDE_ROPE=1
+    STEM="quantized_qwen3_pipeline_embed_norm_qkv_rope"
+    FUNC="run_pipeline_embed_norm_qkv_rope"
     ;;
   *)
     echo "Unknown quantized_qwen3 pipeline stage: $PIPELINE_STAGE" >&2
@@ -51,6 +62,10 @@ if (( INCLUDE_QPROJ && (OUTPUT_TILE_ROWS <= 0 || OUTPUT_ROWS % OUTPUT_TILE_ROWS 
   echo "OUTPUT_TILE_ROWS must be positive and divide OUTPUT_ROWS." >&2
   exit 2
 fi
+if (( INCLUDE_ROPE && OUTPUT_ROWS != 128 )); then
+  echo "q/k norm+RoPE currently validates one 128-wide Qwen3 attention head, so OUTPUT_ROWS must be 128." >&2
+  exit 2
+fi
 
 AIR_HERD_ROWS="${AIR_HERD_ROWS:-$TOKEN_COUNT}"
 AIR_HERD_COLS="${AIR_HERD_COLS:-$BLOCKS_PER_ROW}"
@@ -64,6 +79,9 @@ NORM_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_input_layernorm.ml
 QPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_proj.mlir"
 KPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_proj.mlir"
 VPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_v_proj.mlir"
+ROPE_TABLE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_rope_table.mlir"
+Q_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_norm_rope.mlir"
+K_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_norm_rope.mlir"
 PIPELINE_DMA="$OUT_DIR/$STEM.dma.mlir"
 WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
 
@@ -94,12 +112,27 @@ if (( INCLUDE_QKV )); then
     --output-rows "$OUTPUT_ROWS" \
     --output-tile-rows "$OUTPUT_TILE_ROWS"
 fi
+if (( INCLUDE_ROPE )); then
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage rope_table \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT"
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage q_norm_rope \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT"
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage k_norm_rope \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT"
+fi
 
 check_contains "$EMBED_MLIR" 'scf\.parallel' 'embed_tokens explicit tile loop'
 check_contains "$EMBED_MLIR" 'memref\.subview' 'embed_tokens tile subview'
 check_contains "$EMBED_MLIR" 'memref\.copy' 'embed_tokens copy before AIR DMA lowering'
 check_contains "$NORM_MLIR" 'scf\.parallel' 'input_layernorm explicit tile loop'
-check_contains "$NORM_MLIR" 'math\.rsqrt' 'input_layernorm inverse square root'
+check_contains "$NORM_MLIR" 'func\.call @rms_norm_tile' 'input_layernorm external RMSNorm tile call'
+check_contains "$NORM_MLIR" 'link_with = "rms_norm\.o"' 'input_layernorm external RMSNorm link object'
 
 lower_air_fixture_to_dma "$EMBED_MLIR" "${STEM}_embed_tokens"
 EMBED_DMA="$DMA_IR"
@@ -138,6 +171,32 @@ if (( INCLUDE_QPROJ )); then
     check_contains "$VPROJ_MLIR" 'link_with = "q6k_linear\.o"' 'v_proj external Q6_K link object'
     compile_air_dma_fixture "$VPROJ_MLIR" "${STEM}_v_proj"
     VPROJ_AIE="$AIE_IR"
+    if (( INCLUDE_ROPE )); then
+      HERD_COLS=1
+      check_contains "$ROPE_TABLE_MLIR" 'air\.launch' 'rope_table official AIR launch'
+      check_contains "$ROPE_TABLE_MLIR" 'air\.herd' 'rope_table official AIR herd'
+      check_contains "$ROPE_TABLE_MLIR" 'air\.dma_memcpy_nd' 'rope_table explicit AIR DMA'
+      check_contains "$ROPE_TABLE_MLIR" 'func\.call @rope_table_tile' 'rope_table external tile kernel call'
+      check_contains "$ROPE_TABLE_MLIR" 'link_with = "rope_table\.o"' 'rope_table external link object'
+      compile_air_dma_fixture "$ROPE_TABLE_MLIR" "${STEM}_rope_table"
+      ROPE_TABLE_AIE="$AIE_IR"
+
+      check_contains "$Q_NORM_ROPE_MLIR" 'air\.launch' 'q_norm_rope official AIR launch'
+      check_contains "$Q_NORM_ROPE_MLIR" 'air\.herd' 'q_norm_rope official AIR herd'
+      check_contains "$Q_NORM_ROPE_MLIR" 'air\.dma_memcpy_nd' 'q_norm_rope explicit AIR DMA'
+      check_contains "$Q_NORM_ROPE_MLIR" 'func\.call @rms_norm_rope_tile' 'q_norm_rope external tile kernel call'
+      check_contains "$Q_NORM_ROPE_MLIR" 'link_with = "rms_norm_rope\.o"' 'q_norm_rope external link object'
+      compile_air_dma_fixture "$Q_NORM_ROPE_MLIR" "${STEM}_q_norm_rope"
+      Q_NORM_ROPE_AIE="$AIE_IR"
+
+      check_contains "$K_NORM_ROPE_MLIR" 'air\.launch' 'k_norm_rope official AIR launch'
+      check_contains "$K_NORM_ROPE_MLIR" 'air\.herd' 'k_norm_rope official AIR herd'
+      check_contains "$K_NORM_ROPE_MLIR" 'air\.dma_memcpy_nd' 'k_norm_rope explicit AIR DMA'
+      check_contains "$K_NORM_ROPE_MLIR" 'func\.call @rms_norm_rope_tile' 'k_norm_rope external tile kernel call'
+      check_contains "$K_NORM_ROPE_MLIR" 'link_with = "rms_norm_rope\.o"' 'k_norm_rope external link object'
+      compile_air_dma_fixture "$K_NORM_ROPE_MLIR" "${STEM}_k_norm_rope"
+      K_NORM_ROPE_AIE="$AIE_IR"
+    fi
   fi
   HERD_COLS="$BLOCKS_PER_ROW"
 fi
@@ -182,6 +241,14 @@ if (( INCLUDE_QKV )); then
   RUNNER_ARGS+=(
     --kproj-aie-mlir "$KPROJ_AIE"
     --vproj-aie-mlir "$VPROJ_AIE"
+  )
+fi
+if (( INCLUDE_ROPE )); then
+  RUNNER_ARGS+=(
+    --rope-table-aie-mlir "$ROPE_TABLE_AIE"
+    --q-norm-rope-aie-mlir "$Q_NORM_ROPE_AIE"
+    --k-norm-rope-aie-mlir "$K_NORM_ROPE_AIE"
+    --start-position "$START_POSITION"
   )
 fi
 

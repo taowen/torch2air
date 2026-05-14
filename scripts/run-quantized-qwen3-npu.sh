@@ -92,7 +92,10 @@ if [[ "$STAGE" == "embed_tokens" || "$STAGE" == "embed_tokens_input_layernorm" ]
   check_contains "$MLIR" 'memref\.alloc\(\) : memref<1x36xi32, 2>' 'packed Q4_K L1 tile'
   check_contains "$MLIR" 'memref\.alloc\(\) : memref<1x1x2xf32, 2>' 'host-decoded Q4_K scale L1 tile'
 fi
-if [[ "$STAGE" == "input_layernorm" || "$STAGE" == "embed_tokens_input_layernorm" ]]; then
+if [[ "$STAGE" == "input_layernorm" ]]; then
+  check_contains "$MLIR" 'func\.call @rms_norm_tile' 'external RMSNorm tile kernel call'
+  check_contains "$MLIR" 'link_with = "rms_norm\.o"' 'external RMSNorm link object'
+elif [[ "$STAGE" == "embed_tokens_input_layernorm" ]]; then
   check_contains "$MLIR" 'math\.rsqrt' 'RMSNorm inverse square root in fused MLIR'
 fi
 if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then

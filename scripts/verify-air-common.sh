@@ -14,7 +14,7 @@ command -v rg >/dev/null 2>&1 || {
 }
 
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/examples/amd_aie_experiments/generated}"
-DEVICE="${AIR_DEVICE:-npu1}"
+DEVICE="${AIR_DEVICE:-npu2_4col}"
 ROW_OFFSET="${AIR_ROW_OFFSET:-2}"
 COL_OFFSET="${AIR_COL_OFFSET:-0}"
 HERD_ROWS="${AIR_HERD_ROWS:-1}"

@@ -45,13 +45,15 @@ Verified checks:
 - `air-copy-to-dma` converts local/global copies to `air.dma_memcpy_nd`.
 - `air-dma-to-channel` produces matching `air.channel.put` and
   `air.channel.get`.
-- `air-to-aie` produces `aie.device(npu1)` and `aie.core`.
+- `air-to-aie` produces `aie.device(npu2_4col)` and `aie.core`.
 
 Notes:
 
 - The current toolchain rejects `device=npu4` with `Invalid aie.device option`.
-  The verification script defaults to `AIR_DEVICE=npu1`; override it with
-  `AIR_DEVICE=npu2` or another supported AIR/AIE device name when needed.
+  The local `RyzenAI-npu4` path is verified through `AIR_DEVICE=npu2_4col`,
+  which is also the verification script default. Lowering the upstream
+  external-kernel smoke test as `device=npu1` produced all-zero output on this
+  machine, so `npu1` is not a valid default here.
 - `air-place-herds` needs `row-anchor=2` for this NPU path so generated
   buffers are placed on tiles with local memory.
 - The direct fixture intentionally copies A, B, and C into L1, so
@@ -177,58 +179,61 @@ scripts/verify-quantized-qwen3-stage.sh embed_tokens
 Useful scale-up variants:
 
 ```bash
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens
 
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens
 
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh input_layernorm
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh input_layernorm
 
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh v_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh v_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 START_POSITION=1 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv_rope
+
+AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
 ```
 
@@ -259,7 +264,7 @@ Verified checks:
 - The generated artifact is tiled pre-AIR MLIR with `scf.parallel`,
   `memref.subview`, L1 `memref.alloc`, and `memref.copy`.
 - `air-opt` lowers it to `air.herd`, `air.dma_memcpy_nd`, channels, and
-  `aie.device(npu2)`.
+  `aie.device(npu2_4col)`.
 - Runtime compilation uses `air-opt --air-to-std --airrt-to-npu` followed by
   `aiecc --aie-generate-xclbin --aie-generate-npu-insts`.
 - Hardware execution uses MLIR-AIR's `air.backend.xrt.XRTBackend` directly; no
@@ -289,6 +294,15 @@ Verified checks:
 - `embed_tokens -> input_layernorm -> q/k/v` runs stage xclbins with shared
   `pyxrt.bo` handoff buffers. It does not copy intermediate hidden states
   through NumPy arrays between operators.
+- `rope_table` and `q/k_norm_rope` use official-style AIR external kernels.
+  The generated MLIR owns launch, herd placement, L1 buffers, and DMA; the
+  external `.cc` files are only tile compute bodies. RoPE theta is compiled
+  into `rope_table.o` as `ROPE_INV_FREQ_RATIO`, while the runtime ABI passes
+  only the position and output cosine/sine buffers.
+- `embed_tokens -> input_layernorm -> q/k/v -> rope_table -> q/k_norm_rope`
+  runs seven stage xclbins with shared `pyxrt.bo` handoff buffers. The verifier
+  reads intermediate buffers only after the NPU chain finishes, then compares
+  against PyTorch ROCm.
 - The `quantized_qwen3` reference path is generated from the same exported
   module boundaries. `src/models/quantized_qwen3/reference.py` loads the local
   `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
@@ -454,6 +468,20 @@ pipeline_embed_norm_qkv shared BO handoff, 1 token, output_rows 128, output_tile
   allclose True rtol=0.05 atol=0.2
   mean_ms 77.533
 
+pipeline_embed_norm_qkv_rope shared BO handoff, 1 token, output_rows 128, output_tile_rows 32, start_position 1:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.031209335
+  rope_cos_max_abs 2.9802322e-07
+  rope_sin_max_abs 1.4901161e-07
+  q_norm_rope_max_abs 2.8610229e-06
+  k_norm_rope_max_abs 1.5258789e-05
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 81.063
+
 pipeline_embed_norm_qkv shared BO handoff, 2 tokens, output_rows 128, output_tile_rows 32:
   reference safetensors_pytorch_rocm AMD Radeon 890M
   hidden_max_abs 0.0054986477
@@ -473,8 +501,8 @@ Notes:
   runtime failure.
 - Full-head projection verification uses `OUTPUT_ROWS=128` with
   `OUTPUT_TILE_ROWS=32`. The `128/16` shape creates eight projection tiles; on
-  `npu2` with the current row anchor, `air-to-aie` emits an out-of-range tile
-  row and does not reach hardware execution.
+  the current 4-column target and row anchor, `air-to-aie` emits an out-of-range
+  tile row and does not reach hardware execution.
 - Q6_K projection variants currently print AIE bank allocation warnings because
   the spike widens Q6_K halfwords to i32 in L1. The generated xclbin still runs
   and matches the PyTorch ROCm reference. Compact i16 L1 DMA is the next

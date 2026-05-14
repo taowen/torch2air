@@ -111,6 +111,10 @@ def compile_runtime(
     shutil.rmtree(aiecc_dir, ignore_errors=True)
     aiecc_dir.mkdir(parents=True, exist_ok=True)
     if link_objects:
+        for object_path in link_objects:
+            target_path = work_dir / object_path.name
+            if object_path.resolve() != target_path.resolve():
+                shutil.copy2(object_path, target_path)
         for object_dir in (work_dir / "air_project", aiecc_dir / "air_project"):
             object_dir.mkdir(parents=True, exist_ok=True)
             for object_path in link_objects:

@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
 from torch2air.export import (
@@ -19,6 +19,7 @@ from torch2air.weights.gguf import load_gguf_index
 DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf")
 DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 ATTENTION_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
+NORM_ROPE_NAMES = ("q_norm_rope", "k_norm_rope")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 
 
@@ -30,6 +31,18 @@ class EmbedTokensInputLayerNorm(torch.nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.input_layernorm(self.embed_tokens(input_ids))
+
+
+class RMSNormRope(torch.nn.Module):
+    def __init__(self, norm: torch.nn.Module) -> None:
+        super().__init__()
+        self.norm = norm
+
+    def forward(self, input: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        normed = self.norm(input)
+        half_dim = normed.shape[-1] // 2
+        rotated = torch.cat((-normed[..., half_dim:], normed[..., :half_dim]), dim=-1)
+        return normed * cos + rotated * sin
 
 
 def export_one(
@@ -275,6 +288,66 @@ def export_q_proj(
     )
 
 
+def export_rope_table(
+    *,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+) -> None:
+    config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+    head_dim = _head_dim(config)
+    render_to_file(
+        KERNEL_TEMPLATE_DIR,
+        "rope_table.mlir.j2",
+        output_dir / "run_rope_table.mlir",
+        stage_name="run_rope_table",
+        weight_prefix="model.rotary_emb.",
+        shape_exprs={sequence_length: "sequence_length"},
+        nodes=[],
+        aten_targets=[],
+        head_dim=head_dim,
+        sequence_length=sequence_length,
+    )
+    print("  run_rope_table: 0 aten ops")
+
+
+def export_norm_rope(
+    *,
+    norm_name: str,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+) -> None:
+    if norm_name not in NORM_ROPE_NAMES:
+        raise ValueError(f"norm_name must be one of {NORM_ROPE_NAMES}, got {norm_name!r}")
+    config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+    head_dim = _head_dim(config)
+    with torch.device("meta"):
+        model = Qwen3ForCausalLM(config)
+        attn = model.model.layers[0].self_attn
+        norm = attn.q_norm if norm_name == "q_norm_rope" else attn.k_norm
+        module = RMSNormRope(norm)
+    export_one(
+        f"run_{norm_name}",
+        module,
+        args=(
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
+        ),
+        output_dir=output_dir,
+        template_dir=KERNEL_TEMPLATE_DIR,
+        weight_prefix=f"model.layers.0.self_attn.{norm_name.removesuffix('_rope')}.",
+        shape_exprs={sequence_length: "sequence_length"},
+        template_name="rms_norm_rope.mlir.j2",
+        context={
+            "head_dim": head_dim,
+            "rms_norm_eps": float(config.rms_norm_eps),
+            "sequence_length": sequence_length,
+        },
+    )
+
+
 def export_pipeline_embed_norm(
     *,
     model_id: str,
@@ -373,6 +446,13 @@ def _dtype_of(node: object) -> str | None:
     return str(tensor_meta.dtype).removeprefix("torch.")
 
 
+def _head_dim(config: PretrainedConfig) -> int:
+    configured = getattr(config, "head_dim", None)
+    if configured is not None:
+        return int(configured)
+    return int(config.hidden_size) // int(config.num_attention_heads)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Export quantized Qwen3 AIR stages.")
     parser.add_argument(
@@ -385,6 +465,9 @@ def main() -> int:
             "q_proj",
             "k_proj",
             "v_proj",
+            "rope_table",
+            "q_norm_rope",
+            "k_norm_rope",
         ],
         default="embed_tokens",
     )
@@ -466,6 +549,19 @@ def main() -> int:
             sequence_length=args.sequence_length,
             output_rows_override=args.output_rows,
             output_tile_rows=args.output_tile_rows,
+        )
+    elif args.stage == "rope_table":
+        export_rope_table(
+            model_id=args.model_id,
+            output_dir=args.output_dir,
+            sequence_length=args.sequence_length,
+        )
+    elif args.stage in NORM_ROPE_NAMES:
+        export_norm_rope(
+            norm_name=args.stage,
+            model_id=args.model_id,
+            output_dir=args.output_dir,
+            sequence_length=args.sequence_length,
         )
     export_reference_module(
         model_id=args.model_id,

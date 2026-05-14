@@ -25,11 +25,37 @@ schedule is part of the generated MLIR:
 That is a good fit for Q4_K and FlashAttention-style kernels where tile size,
 memory space, DMA order, and double buffering are performance-critical.
 
-Avoid using `.cc` kernels or direct Python AIR builders to express the tiling
-strategy. They hide or bypass the MLIR artifact that we need to inspect and
-lower. A native kernel is acceptable only as the compute body inside a selected
-tile/herd, with the generated MLIR still owning launch/segment/herd placement,
-DMA, memory spaces, and operator boundaries.
+Do not use `.cc` kernels to express tiling. A native kernel is acceptable only
+as the compute body inside a selected tile/herd, with the generated MLIR still
+owning launch/segment/herd placement, DMA, memory spaces, and operator
+boundaries. Upstream MLIR-AIR often uses the Python AIR DSL to build that IR;
+`torch2air` emits the MLIR text directly so the export artifact is easy to
+inspect and keep close to the `torch.export` walk.
+
+## Official External-Kernel Check
+
+On 2026-05-14, `scripts/run-mlir-air-official-external-kernel-spike.sh`
+validated the smallest upstream external-kernel pattern on the local real NPU:
+
+- XRT reports `RyzenAI-npu4`, architecture `aie2p`, topology `6x8`.
+- MLIR-AIR treats `npu4`/Strix hardware as the `npu2` target family.
+- The upstream `test/xrt/05_extern_func` flow passes with
+  `air-to-aie="device=npu2_4col row-offset=2 col-offset=0"` and Peano target
+  `aie2p-none-unknown-elf`.
+- The same fixture returned all zeros when accidentally lowered as `device=npu1`,
+  so `npu1` is not a valid default on this machine.
+- The current recommended external-kernel attachment is:
+
+```mlir
+func.func private @tile_kernel(memref<1024xi32, 2>)
+    attributes {link_with = "tile_kernel.o", llvm.emit_c_interface}
+```
+
+Attaching `link_with` only to `air.herd` still appears in older upstream tests,
+but AIRToAIE now warns that the herd/core attachment is deprecated. The
+torch2air convention is therefore: put `link_with` and `llvm.emit_c_interface`
+on every external `func.func private` declaration, and keep AIR placement/DMA in
+the generated MLIR.
 
 For operator-to-operator experiments, follow the upstream MLIR-AIR llama style:
 build each operator as an independent stage first, then stitch or sequence those
@@ -43,7 +69,10 @@ The next verified steps, `embed_tokens -> input_layernorm -> q_proj` and
 add official AIR external kernels for Q4_K and Q6_K linear tile bodies.
 The latest q/k/v verification covers one full Qwen3 attention head
 (`OUTPUT_ROWS=128`) on real NPU hardware using 32 output rows per external
-kernel tile.
+kernel tile. The current RoPE step adds `rope_table` plus `q/k_norm_rope` in
+the same style: generated MLIR owns launch/herd/DMA/L1 placement, external
+objects provide only the tile compute body, and runtime handoff stays in shared
+`pyxrt.bo` buffers.
 
 ## Baseline IR Shape
 
@@ -128,7 +157,8 @@ Success criteria:
 - Generated IR contains `air.dma_memcpy_nd`.
 - Generated IR contains `air.channel.put` / `air.channel.get` after channel
   lowering.
-- Final IR contains `aie.device(npu4)` and at least one `aie.core`.
+- Final IR contains `aie.device(npu2_4col)` on the local `RyzenAI-npu4` machine
+  and at least one `aie.core`.
 - The file is small enough to be used as a regression test.
 
 Decision after spike:
@@ -346,7 +376,7 @@ Decision after spike:
 Current `quantized_qwen3.embed_tokens` command:
 
 ```bash
-AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens
 ```
 

@@ -15,6 +15,7 @@ from . import reference
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm
 from .run_embed_tokens import DEFAULT_GGUF, compile_runtime, parse_token_ids, prepare_inputs
 from .run_embed_tokens_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR
+from .run_pipeline import compile_rms_norm_object
 
 
 def prepare_layernorm_inputs(
@@ -123,11 +124,18 @@ def main() -> int:
     print(f"blocks_per_row {args.blocks_per_row} hidden_size {info['hidden_size']}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
 
+    rms_norm_object = compile_rms_norm_object(
+        work_dir=args.work_dir,
+        peano_install_dir=peano_install_dir,
+        hidden_size=hidden.shape[1],
+        eps=args.rms_norm_eps,
+    )
     npu_mlir, xclbin, insts = compile_runtime(
         aie_mlir=args.aie_mlir,
         work_dir=args.work_dir,
         instance_name=args.instance_name,
         peano_install_dir=peano_install_dir,
+        link_objects=(rms_norm_object,),
     )
     actual, latencies_ms = run_on_npu(
         xclbin=xclbin,

@@ -2,9 +2,16 @@
 //
 // Stage: {{ stage_name }}
 // Source aten targets: {{ aten_targets | join(", ") }}
-// Tiled Qwen3 RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight.
+// Tiled Qwen3 RMSNorm. AIR owns tiling and L3<->L1 copies; rms_norm_tile.o
+// owns the per-row RMSNorm body.
 
 module {
+  func.func private @rms_norm_tile(
+      memref<1x{{ hidden_size }}xf32, 2>,
+      memref<{{ hidden_size }}xf32, 2>,
+      memref<1x{{ hidden_size }}xf32, 2>)
+      attributes {link_with = "rms_norm.o", llvm.emit_c_interface}
+
   func.func @{{ stage_name }}(
       %hidden: memref<{{ sequence_length }}x{{ hidden_size }}xf32>,
       %rms_weight: memref<{{ hidden_size }}xf32>,
@@ -13,9 +20,6 @@ module {
     {% for value in index_constants %}
     %idx{{ value }} = arith.constant {{ value }} : index
     {% endfor %}
-    %f32_0 = arith.constant 0.0 : f32
-    %f32_inv_hidden = arith.constant {{ 1.0 / hidden_size }} : f32
-    %f32_eps = arith.constant {{ "%.12f"|format(rms_norm_eps) }} : f32
 
     scf.parallel (%launch_i, %launch_j) = (%idx0, %idx0) to (%idx1, %idx1) step (%idx1, %idx1) {
       scf.parallel (%tile_i, %tile_j) = (%idx0, %idx0) to (%idx{{ sequence_length }}, %idx1) step (%idx1, %idx1) {
@@ -33,23 +37,10 @@ module {
         memref.copy %rms_weight, %weight_l1
             : memref<{{ hidden_size }}xf32> to memref<{{ hidden_size }}xf32, 2>
 
-        %sum_squares = scf.for %sum_i = %idx0 to %idx{{ hidden_size }} step %idx1 iter_args(%acc = %f32_0) -> (f32) {
-          %sum_x = memref.load %hidden_l1[%idx0, %sum_i] : memref<1x{{ hidden_size }}xf32, 2>
-          %sum_sq = arith.mulf %sum_x, %sum_x : f32
-          %sum_next = arith.addf %acc, %sum_sq : f32
-          scf.yield %sum_next : f32
-        }
-        %variance = arith.mulf %sum_squares, %f32_inv_hidden : f32
-        %variance_eps = arith.addf %variance, %f32_eps : f32
-        %rstd = math.rsqrt %variance_eps : f32
-
-        scf.for %norm_i = %idx0 to %idx{{ hidden_size }} step %idx1 {
-          %norm_x = memref.load %hidden_l1[%idx0, %norm_i] : memref<1x{{ hidden_size }}xf32, 2>
-          %norm_w = memref.load %weight_l1[%norm_i] : memref<{{ hidden_size }}xf32, 2>
-          %norm_scaled = arith.mulf %norm_x, %rstd : f32
-          %norm_y = arith.mulf %norm_scaled, %norm_w : f32
-          memref.store %norm_y, %out_l1[%idx0, %norm_i] : memref<1x{{ hidden_size }}xf32, 2>
-        }
+        func.call @rms_norm_tile(%hidden_l1, %weight_l1, %out_l1)
+            : (memref<1x{{ hidden_size }}xf32, 2>,
+               memref<{{ hidden_size }}xf32, 2>,
+               memref<1x{{ hidden_size }}xf32, 2>) -> ()
 
         memref.copy %out_l1, %out_tile
             : memref<1x{{ hidden_size }}xf32, 2> to memref<1x{{ hidden_size }}xf32, strided<[{{ hidden_size }}, 1], offset: ?>>
