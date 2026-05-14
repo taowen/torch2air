@@ -15,7 +15,13 @@ from torch2air.runtime.compile import compile_input_layernorm_python_kernel
 from torch2air.runtime.compile import load_kernel_function
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
-from .reference_runtime import check_close_rocm, first_values, max_abs_rocm, rmsnorm_rocm
+from .reference_runtime import (
+    check_close_rocm,
+    first_values,
+    max_abs_rocm,
+    qwen3_rms_norm_module_rocm,
+    run_input_layernorm_module_rocm,
+)
 from .run_embed_tokens import DEFAULT_GGUF, DEFAULT_TENSOR, parse_token_ids, prepare_inputs
 
 
@@ -54,7 +60,12 @@ def prepare_layernorm_inputs(
         raise ValueError(f"{rms_weight_tensor} is too small for hidden_size={hidden_size}")
     payload = read_tensor_bytes(index.path, weight_entry, offset=0, size=hidden_size * 4)
     rms_weight = np.frombuffer(payload, dtype=np.float32).copy()
-    expected = rmsnorm_rocm(hidden_ref, rms_weight, eps)
+    reference_module = qwen3_rms_norm_module_rocm(
+        hidden_size=hidden_size,
+        weight=rms_weight,
+        eps=eps,
+    )
+    expected = run_input_layernorm_module_rocm(reference_module, hidden=hidden_ref)
     info = LayerNormInputInfo(
         source=embed_info.tensor,
         rms_weight=weight_entry,
@@ -150,7 +161,7 @@ def main() -> int:
     print(f"RMS weight {info.rms_weight.name} {info.rms_weight.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in info.token_ids)}")
     print(f"blocks_per_row {args.blocks_per_row} hidden_size {info.hidden_size}")
-    print(f"reference pytorch_rocm {torch.cuda.get_device_name(0)}")
+    print(f"reference pytorch_rocm Qwen3RMSNorm {torch.cuda.get_device_name(0)}")
 
     source_mlir, aie_mlir, xclbin, insts = compile_input_layernorm_python_kernel(
         kernel_py=args.kernel_py,

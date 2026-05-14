@@ -17,10 +17,11 @@ from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor
 
 from .reference_runtime import (
     check_close_rocm,
-    dequantize_q4_k_blocks_rocm,
     first_values,
     max_abs_rocm,
     q4k_block_f16_scales_rocm,
+    q4k_embedding_module_rocm,
+    run_embedding_module_rocm,
 )
 
 
@@ -89,9 +90,14 @@ def prepare_inputs(
         .cpu()
         .numpy()
     )
-    expected = dequantize_q4_k_blocks_rocm(raw_blocks).reshape(
-        len(token_ids),
-        blocks_per_row * 256,
+    reference_module = q4k_embedding_module_rocm(
+        num_embeddings=vocab_size,
+        token_ids=token_ids,
+        raw_blocks=raw_blocks,
+    )
+    expected = run_embedding_module_rocm(
+        reference_module,
+        token_ids=token_ids,
     )
     info = EmbedInputInfo(
         tensor=selected,
@@ -188,7 +194,7 @@ def main() -> int:
     print(f"GGUF tensor {info.tensor.name} {info.tensor.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
     print(f"blocks_per_row {args.blocks_per_row} hidden_size {info.hidden_size}")
-    print(f"reference pytorch_rocm {torch.cuda.get_device_name(0)}")
+    print(f"reference pytorch_rocm torch.nn.Embedding {torch.cuda.get_device_name(0)}")
 
     source_mlir, aie_mlir, xclbin, insts = compile_q4k_embedding_python_kernel(
         kernel_py=args.kernel_py,

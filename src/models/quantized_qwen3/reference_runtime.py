@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 
 def rocm_device() -> torch.device:
@@ -78,6 +79,64 @@ def dequantize_q4_k_blocks_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
     ).reshape(n_blocks, 256)
 
 
+def q4k_embedding_module_rocm(
+    *,
+    num_embeddings: int,
+    token_ids: list[int],
+    raw_blocks: np.ndarray,
+) -> torch.nn.Embedding:
+    rows = _q4k_embedding_rows_rocm(token_ids=token_ids, raw_blocks=raw_blocks)
+    device = rocm_device()
+    module = torch.nn.Embedding(
+        num_embeddings,
+        int(rows.shape[1]),
+        device=device,
+        dtype=torch.float32,
+    )
+    indices = torch.tensor(token_ids, device=device, dtype=torch.long)
+    with torch.no_grad():
+        module.weight[indices, :] = rows
+    module.eval()
+    return module
+
+
+def run_embedding_module_rocm(
+    module: torch.nn.Embedding,
+    *,
+    token_ids: list[int],
+) -> torch.Tensor:
+    input_ids = torch.tensor(token_ids, device=rocm_device(), dtype=torch.long).reshape(1, -1)
+    with torch.no_grad():
+        return module(input_ids).reshape(len(token_ids), int(module.weight.shape[1]))
+
+
+def qwen3_rms_norm_module_rocm(
+    *,
+    hidden_size: int,
+    weight: np.ndarray,
+    eps: float,
+) -> Qwen3RMSNorm:
+    module = Qwen3RMSNorm(hidden_size, eps=eps).to(device=rocm_device(), dtype=torch.float32)
+    with torch.no_grad():
+        module.weight.copy_(torch.as_tensor(np.ascontiguousarray(weight), device=rocm_device()))
+    module.eval()
+    return module
+
+
+def run_input_layernorm_module_rocm(
+    module: Qwen3RMSNorm,
+    *,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    hidden_t = hidden.to(device=rocm_device(), dtype=torch.float32).reshape(
+        1,
+        int(hidden.shape[0]),
+        int(hidden.shape[1]),
+    )
+    with torch.no_grad():
+        return module(hidden_t).reshape(int(hidden.shape[0]), int(hidden.shape[1]))
+
+
 def check_close_rocm(
     actual: np.ndarray,
     expected: torch.Tensor,
@@ -115,12 +174,18 @@ def max_abs_rocm(actual: np.ndarray, expected: torch.Tensor) -> float:
     return float(torch.max(torch.abs(actual_t - expected.to(torch.float32))).item())
 
 
-def rmsnorm_rocm(hidden: torch.Tensor, weight: np.ndarray, eps: float) -> torch.Tensor:
-    hidden_t = hidden.to(device=rocm_device(), dtype=torch.float32)
-    weight_t = torch.as_tensor(np.ascontiguousarray(weight), device=hidden_t.device)
-    variance = torch.mean(hidden_t * hidden_t, dim=-1, keepdim=True)
-    return hidden_t * torch.rsqrt(variance + eps) * weight_t.reshape(1, -1)
-
-
 def first_values(tensor: torch.Tensor, count: int = 8) -> list[float]:
     return [float(value) for value in tensor.reshape(-1)[:count].detach().cpu().tolist()]
+
+
+def _q4k_embedding_rows_rocm(
+    *,
+    token_ids: list[int],
+    raw_blocks: np.ndarray,
+) -> torch.Tensor:
+    if not token_ids:
+        raise ValueError("expected at least one token id")
+    if raw_blocks.shape[0] % len(token_ids) != 0:
+        raise ValueError("Q4_K block count must be divisible by token count")
+    blocks_per_row = raw_blocks.shape[0] // len(token_ids)
+    return dequantize_q4_k_blocks_rocm(raw_blocks).reshape(len(token_ids), blocks_per_row * 256)
