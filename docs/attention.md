@@ -93,7 +93,7 @@ func.func @run_attention_core(
 HEAD_DIM=128
 QUERY_TILE_ROWS=4
 KEY_TILE_ROWS=4
-SEQUENCE_LENGTH=8
+SEQUENCE_LENGTH=16
 ```
 
 MLIR 模板声明三个 channel：
@@ -146,7 +146,7 @@ L1 中保留三类状态：
 4. 最后一个 KV tile 结束时，用 `1 / row_sum` 归一化 `out_l1`。
 
 4-token 路径满足 `SEQUENCE_LENGTH == KEY_TILE_ROWS`，因此 `attention_core.cc`
-会走更直接的 single-tile 分支。8-token 路径已经进入两个 KV tile 的 online softmax
+会走更直接的 single-tile 分支。16-token 路径会进入四个 KV tile 的 online softmax
 路径，并在真实 NPU 上通过了 full-head `attention` 和 `self_attn` 验证。
 
 真实 Qwen3 q/k 的 score 很容易出现非常尖锐的 softmax。当前 tile body 对
@@ -158,7 +158,7 @@ kernel 里对实际贡献为 0 的项继续调用 `exp` 近似。非尖锐场景
 
 ## 调试经验
 
-这次 full-head `self_attn` 的失败最终收敛到 `attention_core`，经验是：
+这次 full-head `self_attn` 的失败最终收敛到 `attention_core` 的输入 DMA 等待，经验是：
 
 - 先把问题从完整 pipeline 拆成 standalone kernel。`q/k/v -> attention_core` 用同一个
   full-head AIE 产物、同一个真实 NPU 跑，证明 small-score 随机输入能过，大幅值 q/k
@@ -166,12 +166,16 @@ kernel 里对实际贡献为 0 的项继续调用 `exp` 近似。非尖锐场景
 - 不要只看最终 attention output。临时 debug external kernel 把 `score0..score3`、
   `tile_max`、`weight0..weight3` 写回 output buffer，直接确认 AIE 上的 dot product
   本身和 PyTorch ROCm 对得上。
-- score 对但 output 错，问题通常在 softmax/update path，而不是 channel 顺序。这里
-  具体表现是：引入较重的 `fast_exp` 路径后，AIE external kernel 的局部变量、整数转换
-  和 bit 拼装让部分 head 的 score/weight 被污染。
+- score 对但 output 错，不一定是 softmax/update path。16-token full-head 场景里，
+  失败表现是最后一个 V tile 还没有真正到 L1 就被 external kernel 使用，输出像旧
+  accumulator 被缩放后缺了一段 V 贡献。
+- `AIRRtToNpuPass.cpp` 对 MM2S input task 默认会 `dma_free_task`，不会等待输入 DMA
+  完成。对 attention 这种同一个 K/V FIFO 里反复投递 K、V tile 的场景，正式路径在
+  `airrt-to-npu` 后只针对 `run_attention_core` 把 Q/KV 输入 task 改成
+  `issue_token=true` + `aiex.dma_await_task`。
 - `double` 累加不是实用修复。它能表达更高精度，但在 AIE 上导致 program memory overflow。
   对这个 kernel，减少 tile body 复杂度比盲目提高精度更重要。
-- 当前 4-token 场景不需要在线状态。`SEQUENCE_LENGTH == KEY_TILE_ROWS` 时走 single-tile
+- 4-token 场景不需要在线状态。`SEQUENCE_LENGTH == KEY_TILE_ROWS` 时走 single-tile
   attention，既更简单，也避开了 first tile 后立刻从 L1 状态读回的风险。
 - sharp softmax 是必要的专门路径。真实模型的 q/k norm+RoPE 后幅值很大，score gap 经常
   远大于 20；这时 PyTorch softmax 实际上已经接近 one-hot，NPU 侧也应该直接表达这个事实。
@@ -233,32 +237,37 @@ AIR_STACK_SIZE=8192 ...
 
 `AIR_USE_LOCK_RACE_CONDITION_FIX=1` 会把 `use-lock-race-condition-fix=true` 传给
 `air-to-aie`，对应官方 extra dummy DMA BD 的 race workaround。它可以排查 lock/BD race，
-但不是数值修复。当前 16-token/full-head/large-score standalone failure 在
-`QUERY_TILE_ROWS=1`、`AIR_STACK_SIZE=8192`、`AIR_USE_LOCK_RACE_CONDITION_FIX=1` 下仍然
-复现：
+但不是数值修复。这次 16-token/full-head/large-score standalone failure 在这些开关下仍然
+复现，说明问题不在 stack 或 lock race：
 
 ```text
 attention_core mismatch: max_abs=0.932426393032074 index=(2,1560)
 actual=0.0 expected=0.932426393032074
 ```
 
-这说明当前卡点不像单纯 stack 不够或 AIR lock race，更像 attention_core 的在线状态更新
-路径在长 sequence / 尖锐 softmax 下需要进一步插桩确认。
+继续插桩后发现 score、softmax 权重和 K tile 都正确，错的是最后一段 V tile 没有在使用前
+到达 L1。修复点不是 external kernel 数学，而是 attention 的输入 DMA task 必须显式
+`await`。修复后同一个 16-token/full-head standalone 用例通过：
 
-复现这个 standalone 调试用例可以直接用：
+```text
+attention_core_max_abs 0.0013238788
+allclose True rtol=0.05 atol=0.2
+mean_ms 142.982
+```
+
+复现这个 standalone 验证用例可以直接用：
 
 ```bash
-TOKEN_COUNT=16 QUERY_TILE_ROWS=1 KEY_TILE_ROWS=4 \
+TOKEN_COUNT=16 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 \
   Q_HEADS=16 KV_HEADS=8 ATTENTION_SCALE=4.0 \
   ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.2 \
-  AIR_DUMP_DEP_GRAPHS=1 AIR_STACK_SIZE=8192 \
   UV=uv scripts/run-quantized-qwen3-attention-npu.sh
 ```
 
-## 8-token 机制实验结论
+## 8/16-token 机制实验结论
 
-把 `self_attn` 从 4 tokens 扩到 8 tokens 时，主要问题不在 attention 数学本身，而在
-AIR lowering 后的硬件资源和数据流顺序。
+把 `self_attn` 从 4 tokens 扩到 8/16 tokens 时，主要问题不在 attention 数学本身，而在
+AIR lowering 后的硬件资源、数据流顺序和 runtime 资源生命周期。
 
 第一类问题是 AIE stack。默认 `stack-size=1024` 时，8-token `attention_core` 会出现
 特定行输出重复或状态污染，例如后半段 query row 读到前面 row 的结果。检查
@@ -283,6 +292,12 @@ AIR channel 明确表达，不依赖循环里的多次 `air.dma_memcpy_nd` 被 l
 `aiecc` 会提示 bank-aware allocation 失败并退到 sequential allocation。现在真实 NPU
 能跑通，但这是后续 projection/o_proj 性能和稳定性优化的主要卡点。
 
+第五类问题是 XRT `hw_context` 数量。16-token full self_attn 当前是多个 xclbin 顺序执行：
+前置 stage 需要 8 个 context，再一次性加载 16 个 attention head 会在第 17 个 context
+触发 `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-22`。验证过逐个加载并释放 attention xclbin
+可以连续跑完 16 个 head，所以正式 runner 对 attention 和 o_proj 采用按需加载：保留 shared
+`pyxrt.bo`，但 kernel/context 只在对应 stage 执行期间存在。
+
 ## 后续定位规则
 
 遇到 attention 或后续 decode/prefill 的 NPU 问题时，按下面顺序定位：
@@ -301,7 +316,9 @@ AIR channel 明确表达，不依赖循环里的多次 `air.dma_memcpy_nd` 被 l
    比最终 Python 异常更有信息量。
 6. `air-place-herds` 的 `No valid placement found` 目前可能是非致命诊断；是否真正失败
    以 `air-to-aie`、`aiecc`、真实 NPU 运行和 PyTorch ROCm 对拍为准。
-7. 不把调试专用 ABI 留进正式路径。调试时可以临时写 debug buffer，但确认结论后，正式
+7. 多 xclbin pipeline 如果在 `CREATE_HWCTX` 失败，先数同时存活的 `pyxrt.hw_context`。
+   BO 可以跨 kernel 保留，context 不需要为后续 stage 常驻。
+8. 不把调试专用 ABI 留进正式路径。调试时可以临时写 debug buffer，但确认结论后，正式
    kernel 仍保持简单的 stage ABI 和 shared `pyxrt.bo` 交接。
 
 ## lowering 和运行
@@ -309,8 +326,8 @@ AIR channel 明确表达，不依赖循环里的多次 `air.dma_memcpy_nd` 被 l
 standalone attention 的验证脚本是：
 
 ```bash
-TOKEN_COUNT=8 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 NPU_ITERATIONS=1 NPU_WARMUP=0 \
-  ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.05 \
+TOKEN_COUNT=16 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 NPU_ITERATIONS=1 NPU_WARMUP=0 \
+  Q_HEADS=16 KV_HEADS=8 ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.2 \
   UV=uv scripts/run-quantized-qwen3-attention-npu.sh
 ```
 
@@ -331,7 +348,8 @@ TOKEN_COUNT=8 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 NPU_ITERATIONS=1 NPU_WARMUP=0 \
 完整 Qwen3 self-attn pipeline 的当前验证命令是：
 
 ```bash
-TOKEN_IDS=0,1,2,3,4,5,6,7 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 \
+TOKEN_IDS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 \
   NPU_ITERATIONS=1 NPU_WARMUP=0 \
   UV=uv scripts/run-quantized-qwen3-pipeline-npu.sh self_attn
 ```
@@ -354,29 +372,24 @@ host 读取中间 buffer 只用于最终校验，不参与 operator 之间的交
 最近一次记录的结果：
 
 ```text
-standalone attention_core, 4 tokens, 16 q heads / 8 kv heads, small-score input:
+standalone attention_core, 16 tokens, 16 q heads / 8 kv heads:
   reference pytorch_rocm AMD Radeon 890M
-  attention_core_max_abs 3.1739473e-05
+  attention_core_max_abs 0.0013238788
   allclose True rtol=0.05 atol=0.2
-  mean_ms 9.670
+  mean_ms 142.982
 
-standalone attention_core, 4 tokens, 16 q heads / 8 kv heads, large q/k repro:
-  attention_core_max_abs 3.8504601e-05
-  allclose True rtol=0.05 atol=0.2
-  mean_ms 8.974
-
-full self_attn pipeline, 8 tokens:
+full self_attn pipeline, 16 tokens:
   reference safetensors_pytorch_rocm AMD Radeon 890M
   handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope->attention_core->o_proj shared pyxrt BO
-  rope_cos_max_abs 2.4806999e-05
-  rope_sin_max_abs 3.3974648e-06
+  rope_cos_max_abs 2.6116613e-05
+  rope_sin_max_abs 3.4570694e-06
   q_norm_rope_max_abs 5.7220459e-06
   k_norm_rope_max_abs 9.1552734e-05
-  attention_core_max_abs 0.00095266104
+  attention_core_max_abs 0.0022195578
   o_proj_max_abs 0.053668097
   max_abs 0.16560259
   allclose True rtol=0.05 atol=0.2
-  mean_ms 9767.038
+  mean_ms 19559.311
 ```
 
 ## 为什么现在这样做
@@ -400,10 +413,12 @@ full self_attn pipeline, 8 tokens:
 - `KEY_TILE_ROWS` 固定为 4。`attention_core.cc` 现在显式展开了 4 行 K/V，避免 AIE L1
   栈数组带来的不稳定结果。
 - `SEQUENCE_LENGTH` 必须能整除 `QUERY_TILE_ROWS` 和 `KEY_TILE_ROWS`。
-- 当前完整 full-head `self_attn` 已经验证到 8 tokens。更长 context 需要继续验证
+- 当前完整 full-head `self_attn` 已经验证到 16 tokens。更长 context 需要继续验证
   token loop、channel FIFO 深度和 runtime sequence 的规模。
 - 当前默认 `AIR_STACK_SIZE=4096`。它解决了 8-token attention_core 的 L1 状态污染，但
   会减少每个 tile 可用于显式 L1 buffer 的空间。
+- 16-head attention 现在依赖按需加载 xclbin 来避开 `hw_context` 数量上限；后续如果做
+  stage stitching 或 fusion，需要重新评估 context 生命周期和 BO 分配策略。
 - projection 和 o_proj 的量化权重 tile 对 L1 bank 压力较大。现在能跑通，但后续需要把
   Q4_K/Q6_K 的 tile 形状和 ABI 再压低。
 - `air-place-herds` 对部分形状会打印 `No valid placement found` 诊断，但当前记录里仍能
@@ -415,7 +430,7 @@ full self_attn pipeline, 8 tokens:
 
 ## 后续工作
 
-1. 继续把 8-token 经验推广到 decode/prefill 更长 context，先验证 token loop 和 channel
+1. 继续把 16-token 经验推广到 decode/prefill 更长 context，先验证 token loop 和 channel
    顺序，再扩大 heads/tiles。
 2. 评估 `QUERY_TILE_ROWS` 和 `KEY_TILE_ROWS` 的组合，先保持单 herd，再考虑多 herd 或
    cascade。

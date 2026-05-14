@@ -653,8 +653,8 @@ def run_on_npu_projections_rope(
     rope_table_insts: Path,
     norm_rope_xclbins: dict[str, Path],
     norm_rope_insts: dict[str, Path],
-    attention_xclbin: Path | None,
-    attention_insts: Path | None,
+    attention_xclbins: list[Path],
+    attention_insts_paths: list[Path],
     oproj_xclbin: Path | None,
     oproj_insts: Path | None,
     packed_rows: np.ndarray,
@@ -735,22 +735,8 @@ def run_on_npu_projections_rope(
             insts=norm_rope_insts[stage_name],
         )
         norm_rope_kernels[stage_name] = (kernel, instr_v, bo_instr)
-    attention_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None = None
-    if attention_xclbin is not None and attention_insts is not None:
-        _, kernel, instr_v, bo_instr = load_xrt_kernel(
-            device,
-            xclbin=attention_xclbin,
-            insts=attention_insts,
-        )
-        attention_kernel = (kernel, instr_v, bo_instr)
-    oproj_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None = None
-    if oproj_xclbin is not None and oproj_insts is not None:
-        _, kernel, instr_v, bo_instr = load_xrt_kernel(
-            device,
-            xclbin=oproj_xclbin,
-            insts=oproj_insts,
-        )
-        oproj_kernel = (kernel, instr_v, bo_instr)
+    if len(attention_xclbins) != len(attention_insts_paths):
+        raise ValueError("attention_xclbins and attention_insts_paths must have the same length")
 
     bo_packed = xrt.bo(device, packed_rows.nbytes, xrt.bo.host_only, embed_kernel.group_id(3))
     bo_scales = xrt.bo(device, block_f16_scales.nbytes, xrt.bo.host_only, embed_kernel.group_id(4))
@@ -790,28 +776,6 @@ def run_on_npu_projections_rope(
         bo_norm_rope_outputs[stage_name] = xrt.bo(
             device, output.nbytes, xrt.bo.host_only, kernel.group_id(7)
         )
-    bo_attention_output: xrt.bo | None = None
-    if attention_kernel is not None:
-        assert attention_output is not None
-        attention_kernel_object = attention_kernel[0]
-        bo_attention_output = xrt.bo(
-            device,
-            attention_output.nbytes,
-            xrt.bo.host_only,
-            attention_kernel_object.group_id(6),
-        )
-    bo_oproj_weights: xrt.bo | None = None
-    bo_oproj_output: xrt.bo | None = None
-    if oproj_kernel is not None:
-        assert oproj_weights is not None
-        assert oproj_output is not None
-        oproj_kernel_object = oproj_kernel[0]
-        bo_oproj_weights = xrt.bo(
-            device, oproj_weights.nbytes, xrt.bo.host_only, oproj_kernel_object.group_id(4)
-        )
-        bo_oproj_output = xrt.bo(
-            device, oproj_output.nbytes, xrt.bo.host_only, oproj_kernel_object.group_id(5)
-        )
 
     for bo, array in (
         (bo_packed, packed_rows),
@@ -827,10 +791,6 @@ def run_on_npu_projections_rope(
     for stage_name, bo in bo_norm_rope_weights.items():
         bo.write(norm_rope_weights[stage_name], 0)
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-    if bo_oproj_weights is not None and oproj_weights is not None:
-        bo_oproj_weights.write(oproj_weights, 0)
-        bo_oproj_weights.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-
     actual_hidden = hidden
     actual_norm = norm_output
     actual_projections = projection_outputs
@@ -866,6 +826,7 @@ def run_on_npu_projections_rope(
             actual_attention,
             actual_oproj,
         ) = run_shared_bo_projections_rope_once(
+            device=device,
             embed_kernel=embed_kernel,
             embed_instr_v=embed_instr_v,
             embed_bo_instr=embed_bo_instr,
@@ -889,11 +850,10 @@ def run_on_npu_projections_rope(
             bo_sin=bo_sin,
             bo_norm_rope_weights=bo_norm_rope_weights,
             bo_norm_rope_outputs=bo_norm_rope_outputs,
-            attention_kernel=attention_kernel,
-            bo_attention_output=bo_attention_output,
-            oproj_kernel=oproj_kernel,
-            bo_oproj_weights=bo_oproj_weights,
-            bo_oproj_output=bo_oproj_output,
+            attention_xclbins=attention_xclbins,
+            attention_insts_paths=attention_insts_paths,
+            oproj_xclbin=oproj_xclbin,
+            oproj_insts=oproj_insts,
             packed_rows=packed_rows,
             block_f16_scales=block_f16_scales,
             hidden=hidden,
@@ -1015,8 +975,98 @@ def run_on_npu_projections_rope(
     )
 
 
+def run_attention_xclbins(
+    *,
+    device: xrt.device,
+    attention_xclbins: list[Path],
+    attention_insts_paths: list[Path],
+    bo_q: xrt.bo,
+    bo_k: xrt.bo,
+    bo_v: xrt.bo,
+    attention_output: np.ndarray,
+) -> xrt.bo:
+    bo_attention_output: xrt.bo | None = None
+    for xclbin, insts in zip(attention_xclbins, attention_insts_paths, strict=True):
+        context, kernel, instr_v, bo_instr = load_xrt_kernel(
+            device,
+            xclbin=xclbin,
+            insts=insts,
+        )
+        if bo_attention_output is None:
+            bo_attention_output = xrt.bo(
+                device,
+                attention_output.nbytes,
+                xrt.bo.host_only,
+                kernel.group_id(6),
+            )
+            bo_attention_output.write(attention_output, 0)
+            bo_attention_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        attention_run = kernel(
+            3,
+            bo_instr,
+            len(instr_v),
+            bo_q,
+            bo_k,
+            bo_v,
+            bo_attention_output,
+        )
+        attention_run.wait()
+        del bo_instr, instr_v, kernel, context
+    assert bo_attention_output is not None
+    return bo_attention_output
+
+
+def run_oproj_xclbin(
+    *,
+    device: xrt.device,
+    oproj_xclbin: Path,
+    oproj_insts: Path,
+    bo_attention_output: xrt.bo,
+    attention_output: np.ndarray,
+    oproj_weights: np.ndarray,
+    oproj_output: np.ndarray,
+    output_tile_rows: int,
+) -> xrt.bo:
+    context, kernel, instr_v, bo_instr = load_xrt_kernel(
+        device,
+        xclbin=oproj_xclbin,
+        insts=oproj_insts,
+    )
+    bo_oproj_weights = xrt.bo(
+        device,
+        oproj_weights.nbytes,
+        xrt.bo.host_only,
+        kernel.group_id(4),
+    )
+    bo_oproj_output = xrt.bo(
+        device,
+        oproj_output.nbytes,
+        xrt.bo.host_only,
+        kernel.group_id(5),
+    )
+    bo_oproj_weights.write(oproj_weights, 0)
+    bo_oproj_weights.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    bo_oproj_output.write(oproj_output, 0)
+    bo_oproj_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    run_projection_slices(
+        kernel=kernel,
+        instr_v=instr_v,
+        bo_instr=bo_instr,
+        bo_input=bo_attention_output,
+        bo_weights=bo_oproj_weights,
+        bo_output=bo_oproj_output,
+        input_array=attention_output,
+        weights_array=oproj_weights,
+        output_array=oproj_output,
+        output_tile_rows=output_tile_rows,
+    )
+    del bo_oproj_weights, bo_instr, instr_v, kernel, context
+    return bo_oproj_output
+
+
 def run_shared_bo_projections_rope_once(
     *,
+    device: xrt.device,
     embed_kernel: xrt.kernel,
     embed_instr_v: np.ndarray,
     embed_bo_instr: xrt.bo,
@@ -1040,11 +1090,10 @@ def run_shared_bo_projections_rope_once(
     bo_sin: xrt.bo,
     bo_norm_rope_weights: dict[str, xrt.bo],
     bo_norm_rope_outputs: dict[str, xrt.bo],
-    attention_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None,
-    bo_attention_output: xrt.bo | None,
-    oproj_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None,
-    bo_oproj_weights: xrt.bo | None,
-    bo_oproj_output: xrt.bo | None,
+    attention_xclbins: list[Path],
+    attention_insts_paths: list[Path],
+    oproj_xclbin: Path | None,
+    oproj_insts: Path | None,
     packed_rows: np.ndarray,
     block_f16_scales: np.ndarray,
     hidden: np.ndarray,
@@ -1090,12 +1139,8 @@ def run_shared_bo_projections_rope_once(
     for stage_name, bo in bo_norm_rope_outputs.items():
         bo.write(norm_rope_outputs[stage_name], 0)
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-    if bo_attention_output is not None and attention_output is not None:
-        bo_attention_output.write(attention_output, 0)
-        bo_attention_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-    if bo_oproj_output is not None and oproj_output is not None:
-        bo_oproj_output.write(oproj_output, 0)
-        bo_oproj_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    bo_attention_output: xrt.bo | None = None
+    bo_oproj_output: xrt.bo | None = None
 
     run_embed_chunks(
         embed_kernel=embed_kernel,
@@ -1152,37 +1197,30 @@ def run_shared_bo_projections_rope_once(
             bo_norm_rope_outputs[stage_name],
         )
         norm_rope_run.wait()
-    if attention_kernel is not None:
-        assert bo_attention_output is not None
-        kernel, instr_v, bo_instr = attention_kernel
-        attention_run = kernel(
-            3,
-            bo_instr,
-            len(instr_v),
-            bo_norm_rope_outputs["q_norm_rope"],
-            bo_norm_rope_outputs["k_norm_rope"],
-            bo_projection_outputs["v_proj"],
-            bo_attention_output,
+    if attention_xclbins:
+        assert attention_output is not None
+        bo_attention_output = run_attention_xclbins(
+            device=device,
+            attention_xclbins=attention_xclbins,
+            attention_insts_paths=attention_insts_paths,
+            bo_q=bo_norm_rope_outputs["q_norm_rope"],
+            bo_k=bo_norm_rope_outputs["k_norm_rope"],
+            bo_v=bo_projection_outputs["v_proj"],
+            attention_output=attention_output,
         )
-        attention_run.wait()
-    if oproj_kernel is not None:
+    if oproj_xclbin is not None and oproj_insts is not None:
         assert bo_attention_output is not None
-        assert bo_oproj_weights is not None
-        assert bo_oproj_output is not None
-        kernel, instr_v, bo_instr = oproj_kernel
         assert oproj_weights is not None
         assert oproj_output is not None
         assert attention_output is not None
-        run_projection_slices(
-            kernel=kernel,
-            instr_v=instr_v,
-            bo_instr=bo_instr,
-            bo_input=bo_attention_output,
-            bo_weights=bo_oproj_weights,
-            bo_output=bo_oproj_output,
-            input_array=attention_output,
-            weights_array=oproj_weights,
-            output_array=oproj_output,
+        bo_oproj_output = run_oproj_xclbin(
+            device=device,
+            oproj_xclbin=oproj_xclbin,
+            oproj_insts=oproj_insts,
+            bo_attention_output=bo_attention_output,
+            attention_output=attention_output,
+            oproj_weights=oproj_weights,
+            oproj_output=oproj_output,
             output_tile_rows=output_tile_rows,
         )
 

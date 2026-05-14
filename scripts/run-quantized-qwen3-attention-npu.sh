@@ -24,31 +24,42 @@ source "$ROOT_DIR/scripts/verify-air-common.sh"
 
 WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-attention-core-${TOKEN_COUNT}tok-q${Q_HEADS}-kv${KV_HEADS}}"
 
-ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core.mlir"
+ATTENTION_AIES=()
 
-"$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
-  --stage attention_core \
-  --gguf "$GGUF_PATH" \
-  --sequence-length "$TOKEN_COUNT" \
-  --query-tile-rows "$QUERY_TILE_ROWS" \
-  --key-tile-rows "$KEY_TILE_ROWS" \
-  --q-heads "$Q_HEADS" \
-  --kv-heads "$KV_HEADS"
+for (( head = 0; head < Q_HEADS; head++ )); do
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage attention_core \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT" \
+    --query-tile-rows "$QUERY_TILE_ROWS" \
+    --key-tile-rows "$KEY_TILE_ROWS" \
+    --q-heads "$Q_HEADS" \
+    --kv-heads "$KV_HEADS" \
+    --attention-head-index "$head"
 
-check_contains "$ATTENTION_MLIR" 'air\.launch' 'attention_core official AIR launch'
-check_contains "$ATTENTION_MLIR" 'air\.herd' 'attention_core official AIR herd'
-check_contains "$ATTENTION_MLIR" 'air\.channel\.put' 'attention_core explicit AIR channel put'
-check_contains "$ATTENTION_MLIR" 'air\.channel\.get' 'attention_core explicit AIR channel get'
-check_contains "$ATTENTION_MLIR" 'scf\.for %q_block' 'attention_core q-block loop'
-check_contains "$ATTENTION_MLIR" 'scf\.for %kv_block' 'attention_core kv-block loop'
-check_contains "$ATTENTION_MLIR" 'func\.call @attention_core_tile' 'attention_core external tile kernel call'
-check_contains "$ATTENTION_MLIR" 'link_with = "attention_core\.o"' 'attention_core external link object'
+  if (( Q_HEADS == 1 )); then
+    ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core.mlir"
+    ATTENTION_STEM="quantized_qwen3_attention_core_${TOKEN_COUNT}tok"
+  else
+    ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core_head_${head}.mlir"
+    ATTENTION_STEM="quantized_qwen3_attention_core_${TOKEN_COUNT}tok_head_${head}"
+  fi
 
-compile_air_dma_fixture "$ATTENTION_MLIR" "quantized_qwen3_attention_core_${TOKEN_COUNT}tok"
-ATTENTION_AIE="$AIE_IR"
+  check_contains "$ATTENTION_MLIR" 'air\.launch' "attention_core head $head official AIR launch"
+  check_contains "$ATTENTION_MLIR" 'air\.herd' "attention_core head $head official AIR herd"
+  check_contains "$ATTENTION_MLIR" 'air\.channel\.put' "attention_core head $head explicit AIR channel put"
+  check_contains "$ATTENTION_MLIR" 'air\.channel\.get' "attention_core head $head explicit AIR channel get"
+  check_contains "$ATTENTION_MLIR" 'scf\.for %q_block' "attention_core head $head q-block loop"
+  check_contains "$ATTENTION_MLIR" 'scf\.for %kv_block' "attention_core head $head kv-block loop"
+  check_contains "$ATTENTION_MLIR" 'func\.call @attention_core_tile' "attention_core head $head external tile kernel call"
+  check_contains "$ATTENTION_MLIR" 'link_with = "attention_core\.o"' "attention_core head $head external link object"
+
+  compile_air_dma_fixture "$ATTENTION_MLIR" "$ATTENTION_STEM"
+  ATTENTION_AIES+=("$AIE_IR")
+done
 
 "$UV" run --no-sync python -m models.quantized_qwen3.run_attention_core \
-  --aie-mlir "$ATTENTION_AIE" \
+  --aie-mlir "${ATTENTION_AIES[@]}" \
   --work-dir "$WORK_DIR" \
   --sequence-length "$TOKEN_COUNT" \
   --head-dim "$HEAD_DIM" \

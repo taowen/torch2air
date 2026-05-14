@@ -408,6 +408,7 @@ def export_attention_core(
     key_tile_rows: int,
     q_heads: int,
     kv_heads: int,
+    attention_head_index: int,
 ) -> None:
     config = AutoConfig.from_pretrained(model_id, local_files_only=True)
     head_dim = _head_dim(config)
@@ -421,17 +422,27 @@ def export_attention_core(
         raise ValueError("attention_core currently uses key_tile_rows=4")
     if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
         raise ValueError(f"q_heads={q_heads} must be a positive multiple of kv_heads={kv_heads}")
+    if attention_head_index < 0 or attention_head_index >= q_heads:
+        raise ValueError(
+            f"attention_head_index={attention_head_index} must be in [0, {q_heads})"
+        )
     q_total_dim = q_heads * head_dim
     kv_total_dim = kv_heads * head_dim
+    output_name = (
+        "run_attention_core.mlir"
+        if q_heads == 1
+        else f"run_attention_core_head_{attention_head_index}.mlir"
+    )
     render_to_file(
         KERNEL_TEMPLATE_DIR,
         "attention_core.mlir.j2",
-        output_dir / "run_attention_core.mlir",
+        output_dir / output_name,
         stage_name="run_attention_core",
         weight_prefix="model.layers.0.self_attn.",
         shape_exprs={sequence_length: "sequence_length"},
         nodes=[],
         aten_targets=[],
+        attention_head_index=attention_head_index,
         head_dim=head_dim,
         key_tile_rows=key_tile_rows,
         kv_heads=kv_heads,
@@ -611,6 +622,7 @@ def main() -> int:
     )
     parser.add_argument("--q-heads", type=int, default=1)
     parser.add_argument("--kv-heads", type=int, default=1)
+    parser.add_argument("--attention-head-index", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -698,6 +710,7 @@ def main() -> int:
             key_tile_rows=args.key_tile_rows,
             q_heads=args.q_heads,
             kv_heads=args.kv_heads,
+            attention_head_index=args.attention_head_index,
         )
     export_reference_module(
         model_id=args.model_id,

@@ -52,6 +52,8 @@ def compile_runtime(
     )
     if link_objects:
         _dedupe_private_func_declarations(npu_mlir)
+    if instance_name == "run_attention_core":
+        _await_attention_input_dma(npu_mlir)
     subprocess.run(
         [
             aiecc,
@@ -171,4 +173,34 @@ def _dedupe_private_func_declarations(path: Path) -> None:
                 continue
             seen.add(symbol)
         output.append(line)
+    path.write_text("\n".join(output) + "\n")
+
+
+def _await_attention_input_dma(path: Path) -> None:
+    input_channels = ("@air_attention_q", "@air_attention_kv")
+    awaiting_tasks: set[str] = set()
+    current_task: str | None = None
+    output: list[str] = []
+
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if (
+            " = aiex.dma_configure_task_for " in line
+            and any(channel in line for channel in input_channels)
+        ):
+            current_task = stripped.split(" = ", 1)[0]
+            awaiting_tasks.add(current_task)
+            output.append(line)
+            continue
+        if current_task is not None and stripped == "}":
+            output.append(f"{line} {{issue_token = true}}")
+            current_task = None
+            continue
+        if stripped.startswith("aiex.dma_free_task("):
+            task = stripped.removeprefix("aiex.dma_free_task(").removesuffix(")")
+            if task in awaiting_tasks:
+                output.append(line.replace("aiex.dma_free_task", "aiex.dma_await_task"))
+                continue
+        output.append(line)
+
     path.write_text("\n".join(output) + "\n")

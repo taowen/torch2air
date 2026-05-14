@@ -61,6 +61,10 @@ dump_air_dependency_graph() {
   if [[ "$AIR_DUMP_DEP_GRAPHS" != "1" ]]; then
     return
   fi
+  if is_explicit_async_air "$input"; then
+    echo "Skipping dependency graph for explicit async AIR input: $input"
+    return
+  fi
 
   local graph_dir="$OUT_DIR/$stem.$phase.dep-graph"
   rm -rf "$graph_dir"
@@ -71,6 +75,12 @@ dump_air_dependency_graph() {
     --air-dependency-parse-graph="output-dir=$graph_dir show-cores=true" \
     -o /dev/null
   echo "Generated dependency graph: $graph_dir"
+}
+
+is_explicit_async_air() {
+  local input="$1"
+
+  rg -q 'air\.(launch|segment|herd|execute|channel\.(put|get)) async' "$input"
 }
 
 check_contains() {
@@ -131,13 +141,21 @@ compile_air_dma_fixture() {
   dump_air_dependency_graph "$input" "$stem" "pre-channel"
 
   set_air_opt_flags "$stem" "channel"
-  air-opt "${AIR_OPT_FLAGS[@]}" "$input" \
-    --air-dependency \
-    --air-dma-to-channel \
-    --canonicalize \
-    --cse \
-    --air-place-herds="num-rows=$HERD_ROWS num-cols=$HERD_COLS row-anchor=$ROW_OFFSET col-anchor=$COL_OFFSET" \
-    -o "$CHANNEL_IR"
+  if is_explicit_async_air "$input"; then
+    air-opt "${AIR_OPT_FLAGS[@]}" "$input" \
+      --canonicalize \
+      --cse \
+      --air-place-herds="num-rows=$HERD_ROWS num-cols=$HERD_COLS row-anchor=$ROW_OFFSET col-anchor=$COL_OFFSET" \
+      -o "$CHANNEL_IR"
+  else
+    air-opt "${AIR_OPT_FLAGS[@]}" "$input" \
+      --air-dependency \
+      --air-dma-to-channel \
+      --canonicalize \
+      --cse \
+      --air-place-herds="num-rows=$HERD_ROWS num-cols=$HERD_COLS row-anchor=$ROW_OFFSET col-anchor=$COL_OFFSET" \
+      -o "$CHANNEL_IR"
+  fi
 
   check_contains "$CHANNEL_IR" 'air\.channel\.put' 'air.channel.put after channel lowering'
   check_contains "$CHANNEL_IR" 'air\.channel\.get' 'air.channel.get after channel lowering'

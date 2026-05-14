@@ -191,9 +191,9 @@ OPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_o_proj.mlir"
 ROPE_TABLE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_rope_table.mlir"
 Q_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_norm_rope.mlir"
 K_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_norm_rope.mlir"
-ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core.mlir"
 PIPELINE_DMA="$OUT_DIR/$STEM.dma.mlir"
 WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
+ATTENTION_AIES=()
 
 "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
   --stage embed_tokens \
@@ -246,14 +246,17 @@ if (( INCLUDE_ROPE )); then
     --kv-heads "$KV_HEADS"
 fi
 if (( INCLUDE_ATTENTION )); then
-  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
-    --stage attention_core \
-    --gguf "$GGUF_PATH" \
-    --sequence-length "$TOKEN_COUNT" \
-    --query-tile-rows "$QUERY_TILE_ROWS" \
-    --key-tile-rows "$KEY_TILE_ROWS" \
-    --q-heads "$Q_HEADS" \
-    --kv-heads "$KV_HEADS"
+  for (( head = 0; head < Q_HEADS; head++ )); do
+    "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+      --stage attention_core \
+      --gguf "$GGUF_PATH" \
+      --sequence-length "$TOKEN_COUNT" \
+      --query-tile-rows "$QUERY_TILE_ROWS" \
+      --key-tile-rows "$KEY_TILE_ROWS" \
+      --q-heads "$Q_HEADS" \
+      --kv-heads "$KV_HEADS" \
+      --attention-head-index "$head"
+  done
 fi
 if (( INCLUDE_OPROJ )); then
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
@@ -350,16 +353,25 @@ if (( INCLUDE_QPROJ )); then
       if (( INCLUDE_ATTENTION )); then
         HERD_ROWS=1
         HERD_COLS=1
-        check_contains "$ATTENTION_MLIR" 'air\.launch' 'attention_core official AIR launch'
-        check_contains "$ATTENTION_MLIR" 'air\.herd' 'attention_core official AIR herd'
-        check_contains "$ATTENTION_MLIR" 'air\.channel\.put' 'attention_core explicit AIR channel put'
-        check_contains "$ATTENTION_MLIR" 'air\.channel\.get' 'attention_core explicit AIR channel get'
-        check_contains "$ATTENTION_MLIR" 'scf\.for %q_block' 'attention_core q-block loop'
-        check_contains "$ATTENTION_MLIR" 'scf\.for %kv_block' 'attention_core kv-block loop'
-        check_contains "$ATTENTION_MLIR" 'func\.call @attention_core_tile' 'attention_core external tile kernel call'
-        check_contains "$ATTENTION_MLIR" 'link_with = "attention_core\.o"' 'attention_core external link object'
-        compile_air_dma_fixture "$ATTENTION_MLIR" "${STEM}_attention_core"
-        ATTENTION_AIE="$AIE_IR"
+        for (( head = 0; head < Q_HEADS; head++ )); do
+          if (( Q_HEADS == 1 )); then
+            ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core.mlir"
+            ATTENTION_STEM="${STEM}_attention_core"
+          else
+            ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core_head_${head}.mlir"
+            ATTENTION_STEM="${STEM}_attention_core_head_${head}"
+          fi
+          check_contains "$ATTENTION_MLIR" 'air\.launch' "attention_core head $head official AIR launch"
+          check_contains "$ATTENTION_MLIR" 'air\.herd' "attention_core head $head official AIR herd"
+          check_contains "$ATTENTION_MLIR" 'air\.channel\.put' "attention_core head $head explicit AIR channel put"
+          check_contains "$ATTENTION_MLIR" 'air\.channel\.get' "attention_core head $head explicit AIR channel get"
+          check_contains "$ATTENTION_MLIR" 'scf\.for %q_block' "attention_core head $head q-block loop"
+          check_contains "$ATTENTION_MLIR" 'scf\.for %kv_block' "attention_core head $head kv-block loop"
+          check_contains "$ATTENTION_MLIR" 'func\.call @attention_core_tile' "attention_core head $head external tile kernel call"
+          check_contains "$ATTENTION_MLIR" 'link_with = "attention_core\.o"' "attention_core head $head external link object"
+          compile_air_dma_fixture "$ATTENTION_MLIR" "$ATTENTION_STEM"
+          ATTENTION_AIES+=("$AIE_IR")
+        done
       fi
       if (( INCLUDE_OPROJ )); then
         HERD_ROWS=1
@@ -442,7 +454,7 @@ if (( INCLUDE_ROPE )); then
 fi
 if (( INCLUDE_ATTENTION )); then
   RUNNER_ARGS+=(
-    --attention-aie-mlir "$ATTENTION_AIE"
+    --attention-aie-mlir "${ATTENTION_AIES[@]}"
     --query-tile-rows "$QUERY_TILE_ROWS"
     --key-tile-rows "$KEY_TILE_ROWS"
   )

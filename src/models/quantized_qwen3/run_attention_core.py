@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,14 @@ from .air_runtime import compile_runtime, load_xrt_kernel
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm
 from .stages.attention import compile_attention_core_object, reference_attention_core
 from .stages.rope import HEAD_DIM
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionKernel:
+    context: xrt.hw_context
+    kernel: xrt.kernel
+    instr_v: np.ndarray
+    bo_instr: xrt.bo
 
 
 def deterministic_tensor(*, rows: int, cols: int, seed: int, scale: float) -> torch.Tensor:
@@ -26,8 +35,8 @@ def deterministic_tensor(*, rows: int, cols: int, seed: int, scale: float) -> to
 
 def run_attention_core_on_npu(
     *,
-    xclbin: Path,
-    insts: Path,
+    xclbins: list[Path],
+    insts_paths: list[Path],
     q: np.ndarray,
     k: np.ndarray,
     v: np.ndarray,
@@ -38,13 +47,30 @@ def run_attention_core_on_npu(
     rtol: float,
     atol: float,
 ) -> tuple[np.ndarray, list[float]]:
+    if not xclbins or len(xclbins) != len(insts_paths):
+        raise ValueError("xclbins and insts_paths must be non-empty lists with the same length")
     device = xrt.device(0)
-    _, kernel, instr_v, bo_instr = load_xrt_kernel(device, xclbin=xclbin, insts=insts)
+    attention_kernels: list[AttentionKernel] = []
+    for xclbin, insts in zip(xclbins, insts_paths, strict=True):
+        context, kernel, instr_v, bo_instr = load_xrt_kernel(
+            device,
+            xclbin=xclbin,
+            insts=insts,
+        )
+        attention_kernels.append(
+            AttentionKernel(
+                context=context,
+                kernel=kernel,
+                instr_v=instr_v,
+                bo_instr=bo_instr,
+            )
+        )
 
-    bo_q = xrt.bo(device, q.nbytes, xrt.bo.host_only, kernel.group_id(3))
-    bo_k = xrt.bo(device, k.nbytes, xrt.bo.host_only, kernel.group_id(4))
-    bo_v = xrt.bo(device, v.nbytes, xrt.bo.host_only, kernel.group_id(5))
-    bo_output = xrt.bo(device, output.nbytes, xrt.bo.host_only, kernel.group_id(6))
+    first_kernel = attention_kernels[0].kernel
+    bo_q = xrt.bo(device, q.nbytes, xrt.bo.host_only, first_kernel.group_id(3))
+    bo_k = xrt.bo(device, k.nbytes, xrt.bo.host_only, first_kernel.group_id(4))
+    bo_v = xrt.bo(device, v.nbytes, xrt.bo.host_only, first_kernel.group_id(5))
+    bo_output = xrt.bo(device, output.nbytes, xrt.bo.host_only, first_kernel.group_id(6))
     for bo, array in (
         (bo_q, q),
         (bo_k, k),
@@ -60,8 +86,17 @@ def run_attention_core_on_npu(
         bo_output.write(output, 0)
         bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
         start = time.perf_counter()
-        run = kernel(3, bo_instr, len(instr_v), bo_q, bo_k, bo_v, bo_output)
-        run.wait()
+        for attention_kernel in attention_kernels:
+            run = attention_kernel.kernel(
+                3,
+                attention_kernel.bo_instr,
+                len(attention_kernel.instr_v),
+                bo_q,
+                bo_k,
+                bo_v,
+                bo_output,
+            )
+            run.wait()
         if iteration >= warmup:
             latencies_ms.append((time.perf_counter() - start) * 1000.0)
         bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
@@ -75,7 +110,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run standalone quantized_qwen3 attention core on NPU."
     )
-    parser.add_argument("--aie-mlir", type=Path, required=True)
+    parser.add_argument("--aie-mlir", type=Path, nargs="+", required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--sequence-length", type=int, required=True)
     parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
@@ -101,6 +136,8 @@ def main() -> int:
         raise SystemExit("attention_core currently uses key_tile_rows=4")
     if args.q_heads <= 0 or args.kv_heads <= 0 or args.q_heads % args.kv_heads != 0:
         raise SystemExit("q_heads must be a positive multiple of kv_heads")
+    if len(args.aie_mlir) != args.q_heads:
+        raise SystemExit("--aie-mlir must pass one AIE MLIR per q head")
     peano_install_dir = os.environ.get("PEANO_INSTALL_DIR")
     if not peano_install_dir:
         raise SystemExit("PEANO_INSTALL_DIR is not set; source scripts/npu-common.sh first")
@@ -140,16 +177,24 @@ def main() -> int:
         query_tile_rows=args.query_tile_rows,
         key_tile_rows=args.key_tile_rows,
     )
-    _, xclbin, insts = compile_runtime(
-        aie_mlir=args.aie_mlir,
-        work_dir=args.work_dir,
-        instance_name="run_attention_core",
-        peano_install_dir=peano_install_dir,
-        link_objects=(object_path,),
-    )
+    xclbins: list[Path] = []
+    insts_paths: list[Path] = []
+    for index, aie_mlir in enumerate(args.aie_mlir):
+        runtime_work_dir = (
+            args.work_dir if len(args.aie_mlir) == 1 else args.work_dir / f"head_{index}"
+        )
+        _, xclbin, insts = compile_runtime(
+            aie_mlir=aie_mlir,
+            work_dir=runtime_work_dir,
+            instance_name="run_attention_core",
+            peano_install_dir=peano_install_dir,
+            link_objects=(object_path,),
+        )
+        xclbins.append(xclbin)
+        insts_paths.append(insts)
     actual, latencies_ms = run_attention_core_on_npu(
-        xclbin=xclbin,
-        insts=insts,
+        xclbins=xclbins,
+        insts_paths=insts_paths,
         q=q,
         k=k,
         v=v,
@@ -167,8 +212,10 @@ def main() -> int:
         f"q_heads {args.q_heads} kv_heads {args.kv_heads} "
         f"query_tile_rows {args.query_tile_rows} key_tile_rows {args.key_tile_rows}"
     )
-    print(f"attention_core_xclbin {xclbin}")
-    print(f"attention_core_insts {insts}")
+    for index, (xclbin, insts) in enumerate(zip(xclbins, insts_paths, strict=True)):
+        label = "attention_core" if len(xclbins) == 1 else f"attention_core_head{index}"
+        print(f"{label}_xclbin {xclbin}")
+        print(f"{label}_insts {insts}")
     print(f"attention_core_first8 {actual.reshape(-1)[:8].tolist()}")
     print(f"attention_core_expected_first8 {first_values(expected)}")
     print(f"attention_core_max_abs {max_abs_rocm(actual, expected):.8g}")

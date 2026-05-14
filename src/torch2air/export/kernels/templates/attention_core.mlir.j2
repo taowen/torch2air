@@ -3,7 +3,7 @@
 // Stage: {{ stage_name }}
 // Source aten targets: {{ aten_targets | join(", ") }}
 // Official-style AIR external kernel:
-// - AIR owns q-head/q-block/kv-block tiling and L3<->L1 channel movement.
+// - AIR owns static q-head/q-block/kv-block tiling and L3<->L1 channel movement.
 // - attention_core.o owns online-softmax updates for one Q row and one K/V tile.
 
 module {
@@ -26,12 +26,12 @@ module {
       %k: memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
       %v: memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
       %output: memref<{{ sequence_length }}x{{ q_total_dim }}xf32>) {
-    {% set index_constants = [0, 1, 2, sequence_length, head_dim, q_total_dim, kv_total_dim, query_tile_rows, key_tile_rows] | unique | list | sort %}
+    {% set index_constants = [1] | unique | list | sort %}
     {% for value in index_constants %}
     %idx{{ value }} = arith.constant {{ value }} : index
     {% endfor %}
 
-    air.launch (%launch_i, %launch_j) in (%launch_s_i=%idx1, %launch_s_j=%idx1)
+    %launch_done = air.launch async (%launch_i) in (%launch_s_i=%idx1)
         args(%launch_q=%q, %launch_k=%k, %launch_v=%v, %launch_output=%output)
         : memref<{{ sequence_length }}x{{ q_total_dim }}xf32>,
           memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
@@ -39,45 +39,48 @@ module {
           memref<{{ sequence_length }}x{{ q_total_dim }}xf32> {
       {% set launch_index_constants = [
         0, 1, sequence_length, head_dim, q_total_dim, kv_total_dim,
-        query_tile_rows, key_tile_rows, q_heads, q_heads_per_kv_head
+        query_tile_rows, key_tile_rows
       ] | unique | list | sort %}
       {% for value in launch_index_constants %}
       %lidx{{ value }} = arith.constant {{ value }} : index
       {% endfor %}
-      scf.for %q_head = %lidx0 to %lidx{{ q_heads }} step %lidx1 {
-        %q_col = arith.muli %q_head, %lidx{{ head_dim }} : index
-        %kv_head = arith.divui %q_head, %lidx{{ q_heads_per_kv_head }} : index
-        %kv_col = arith.muli %kv_head, %lidx{{ head_dim }} : index
-      scf.for %q_put_block = %lidx0 to %lidx{{ sequence_length }} step %lidx{{ query_tile_rows }} {
-        air.channel.put @attention_q[]
+      %q_col = arith.constant {{ attention_head_index * head_dim }} : index
+      %kv_col = arith.constant {{ (attention_head_index // q_heads_per_kv_head) * head_dim }} : index
+      %launch_start = air.wait_all async
+      %host_done = scf.for %q_put_block = %lidx0 to %lidx{{ sequence_length }} step %lidx{{ query_tile_rows }}
+          iter_args(%q_token = %launch_start) -> (!air.async.token) {
+        %q_put = air.channel.put async [%q_token] @attention_q[]
             (%launch_q[%q_put_block, %q_col]
              [%lidx{{ query_tile_rows }}, %lidx{{ head_dim }}]
              [%lidx{{ q_total_dim }}, %lidx1])
             : (memref<{{ sequence_length }}x{{ q_total_dim }}xf32>)
-        scf.for %kv_put_block = %lidx0 to %lidx{{ sequence_length }} step %lidx{{ key_tile_rows }} {
-          air.channel.put @attention_kv[]
+        %kv_done = scf.for %kv_put_block = %lidx0 to %lidx{{ sequence_length }} step %lidx{{ key_tile_rows }}
+            iter_args(%kv_token = %q_put) -> (!air.async.token) {
+          %k_put = air.channel.put async [%kv_token] @attention_kv[]
               (%launch_k[%kv_put_block, %kv_col]
                [%lidx{{ key_tile_rows }}, %lidx{{ head_dim }}]
                [%lidx{{ kv_total_dim }}, %lidx1])
               : (memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>)
-          air.channel.put @attention_kv[]
+          %v_put = air.channel.put async [%k_put] @attention_kv[]
               (%launch_v[%kv_put_block, %kv_col]
                [%lidx{{ key_tile_rows }}, %lidx{{ head_dim }}]
                [%lidx{{ kv_total_dim }}, %lidx1])
               : (memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>)
+          scf.yield %v_put : !air.async.token
         }
-        air.channel.get @attention_output[]
+        %host_output_ready = air.wait_all async [%q_token, %kv_done]
+        %output_get = air.channel.get async [%host_output_ready] @attention_output[]
             (%launch_output[%q_put_block, %q_col]
              [%lidx{{ query_tile_rows }}, %lidx{{ head_dim }}]
              [%lidx{{ q_total_dim }}, %lidx1])
             : (memref<{{ sequence_length }}x{{ q_total_dim }}xf32>)
-      }
+        scf.yield %output_get : !air.async.token
       }
 
-      air.segment @attention_core_segment {
+      %segment_done = air.segment @attention_core_segment async {
         %seg_rows = arith.constant 1 : index
         %seg_cols = arith.constant 1 : index
-        air.herd @attention_core_herd tile (%tile_i, %tile_j)
+        %herd_done = air.herd @attention_core_herd async tile (%tile_i, %tile_j)
             in (%herd_s_i=%seg_rows, %herd_s_j=%seg_cols) {
           %hidx0 = arith.constant 0 : index
           %hidx1 = arith.constant 1 : index
@@ -85,64 +88,92 @@ module {
           %hseq = arith.constant {{ sequence_length }} : index
           %hq = arith.constant {{ query_tile_rows }} : index
           %hkv = arith.constant {{ key_tile_rows }} : index
-          %hheads = arith.constant {{ q_heads }} : index
 
-          %meta_l1 = memref.alloc() : memref<3xi32, 2 : i32>
-          %q_l1 = memref.alloc() : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
-          %k_l1 = memref.alloc() : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
-          %v_l1 = memref.alloc() : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
-          %row_max_l1 = memref.alloc() : memref<{{ query_tile_rows }}xf32, 2 : i32>
-          %row_sum_l1 = memref.alloc() : memref<{{ query_tile_rows }}xf32, 2 : i32>
-          %out_l1 = memref.alloc() : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+          %meta_alloc, %meta_l1 = air.execute -> (memref<3xi32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<3xi32, 2 : i32>
+            air.execute_terminator %alloc : memref<3xi32, 2 : i32>
+          }
+          %q_alloc, %q_l1 = air.execute -> (memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+            air.execute_terminator %alloc : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+          }
+          %k_alloc, %k_l1 = air.execute -> (memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+            air.execute_terminator %alloc : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+          }
+          %v_alloc, %v_l1 = air.execute -> (memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+            air.execute_terminator %alloc : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+          }
+          %row_max_alloc, %row_max_l1 = air.execute -> (memref<{{ query_tile_rows }}xf32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<{{ query_tile_rows }}xf32, 2 : i32>
+            air.execute_terminator %alloc : memref<{{ query_tile_rows }}xf32, 2 : i32>
+          }
+          %row_sum_alloc, %row_sum_l1 = air.execute -> (memref<{{ query_tile_rows }}xf32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<{{ query_tile_rows }}xf32, 2 : i32>
+            air.execute_terminator %alloc : memref<{{ query_tile_rows }}xf32, 2 : i32>
+          }
+          %out_alloc, %out_l1 = air.execute -> (memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>) {
+            %alloc = memref.alloc() : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+            air.execute_terminator %alloc : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+          }
 
-          scf.for %head_i = %hidx0 to %hheads step %hidx1 {
-          scf.for %q_block = %hidx0 to %hseq step %hq {
+          %alloc_done = air.wait_all async [%meta_alloc, %q_alloc, %k_alloc, %v_alloc, %row_max_alloc, %row_sum_alloc, %out_alloc]
+          %core_done = scf.for %q_block = %hidx0 to %hseq step %hq
+              iter_args(%q_token = %alloc_done) -> (!air.async.token) {
             %q_block_i32 = arith.index_cast %q_block : index to i32
-            memref.store %q_block_i32, %meta_l1[%hidx0] : memref<3xi32, 2 : i32>
-
-            air.channel.get @attention_q[]
+            %store_q_base = air.execute [%q_token] {
+              memref.store %q_block_i32, %meta_l1[%hidx0] : memref<3xi32, 2 : i32>
+            }
+            %q_get = air.channel.get async [%store_q_base] @attention_q[]
                 (%q_l1[] [] [])
                 : (memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>)
+            %q_ready = air.wait_all async [%store_q_base, %q_get]
 
-            scf.for %kv_block = %hidx0 to %hseq step %hkv {
+            %kv_done = scf.for %kv_block = %hidx0 to %hseq step %hkv
+                iter_args(%kv_token = %q_ready) -> (!air.async.token) {
               %kv_block_i32 = arith.index_cast %kv_block : index to i32
-              memref.store %kv_block_i32, %meta_l1[%hidx1] : memref<3xi32, 2 : i32>
-
-              air.channel.get @attention_kv[]
+              %store_kv_base = air.execute [%kv_token] {
+                memref.store %kv_block_i32, %meta_l1[%hidx1] : memref<3xi32, 2 : i32>
+              }
+              %k_get = air.channel.get async [%store_kv_base] @attention_kv[]
                   (%k_l1[] [] [])
                   : (memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>)
-              air.channel.get @attention_kv[]
+              %v_get = air.channel.get async [%k_get] @attention_kv[]
                   (%v_l1[] [] [])
                   : (memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>)
+              %kv_ready = air.wait_all async [%store_kv_base, %k_get, %v_get]
 
-              scf.for %q_inner = %hidx0 to %hq step %hidx1 {
+              %rows_done = scf.for %q_inner = %hidx0 to %hq step %hidx1
+                  iter_args(%row_token = %kv_ready) -> (!air.async.token) {
                 %q_inner_i32 = arith.index_cast %q_inner : index to i32
-                memref.store %q_inner_i32, %meta_l1[%hidx2] : memref<3xi32, 2 : i32>
-                func.call @attention_core_tile(
-                    %meta_l1, %q_l1, %k_l1, %v_l1, %row_max_l1, %row_sum_l1, %out_l1)
-                    : (memref<3xi32, 2 : i32>,
-                       memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>,
-                       memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>,
-                       memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>,
-                       memref<{{ query_tile_rows }}xf32, 2 : i32>,
-                       memref<{{ query_tile_rows }}xf32, 2 : i32>,
-                       memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>) -> ()
+                %store_q_inner = air.execute [%row_token] {
+                  memref.store %q_inner_i32, %meta_l1[%hidx2] : memref<3xi32, 2 : i32>
+                }
+                %call_done = air.execute [%store_q_inner] {
+                  func.call @attention_core_tile(
+                      %meta_l1, %q_l1, %k_l1, %v_l1, %row_max_l1, %row_sum_l1, %out_l1)
+                      : (memref<3xi32, 2 : i32>,
+                         memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>,
+                         memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>,
+                         memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>,
+                         memref<{{ query_tile_rows }}xf32, 2 : i32>,
+                         memref<{{ query_tile_rows }}xf32, 2 : i32>,
+                         memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>) -> ()
+                }
+                scf.yield %call_done : !air.async.token
               }
+              scf.yield %rows_done : !air.async.token
             }
 
-            air.channel.put @attention_output[]
+            %output_ready = air.wait_all async [%q_token, %kv_done]
+            %output_put = air.channel.put async [%output_ready] @attention_output[]
                 (%out_l1[] [] [])
                 : (memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>)
-          }
+            scf.yield %output_put : !air.async.token
           }
 
-          memref.dealloc %meta_l1 : memref<3xi32, 2 : i32>
-          memref.dealloc %q_l1 : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
-          memref.dealloc %k_l1 : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
-          memref.dealloc %v_l1 : memref<{{ key_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
-          memref.dealloc %row_max_l1 : memref<{{ query_tile_rows }}xf32, 2 : i32>
-          memref.dealloc %row_sum_l1 : memref<{{ query_tile_rows }}xf32, 2 : i32>
-          memref.dealloc %out_l1 : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
+          %done = air.wait_all async [%core_done]
         }
       }
     }

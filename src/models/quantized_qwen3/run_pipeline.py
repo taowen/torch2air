@@ -71,7 +71,7 @@ def main() -> int:
     parser.add_argument("--rope-table-aie-mlir", type=Path, default=None)
     parser.add_argument("--q-norm-rope-aie-mlir", type=Path, default=None)
     parser.add_argument("--k-norm-rope-aie-mlir", type=Path, default=None)
-    parser.add_argument("--attention-aie-mlir", type=Path, default=None)
+    parser.add_argument("--attention-aie-mlir", type=Path, nargs="+", default=None)
     parser.add_argument("--q-norm-weight-tensor", default=DEFAULT_Q_NORM_WEIGHT_TENSOR)
     parser.add_argument("--k-norm-weight-tensor", default=DEFAULT_K_NORM_WEIGHT_TENSOR)
     parser.add_argument("--start-position", type=int, default=0)
@@ -100,7 +100,7 @@ def main() -> int:
     rope_table_aie_mlir: Path | None = args.rope_table_aie_mlir
     q_norm_rope_aie_mlir: Path | None = args.q_norm_rope_aie_mlir
     k_norm_rope_aie_mlir: Path | None = args.k_norm_rope_aie_mlir
-    attention_aie_mlir: Path | None = args.attention_aie_mlir
+    attention_aie_mlirs: list[Path] | None = args.attention_aie_mlir
     projection_output_rows = {
         "q_proj": args.qproj_output_rows or args.output_rows,
         "k_proj": args.kproj_output_rows or args.output_rows,
@@ -135,7 +135,7 @@ def main() -> int:
             "q/k norm+RoPE pipeline requires q/k/v projections plus "
             "--rope-table-aie-mlir, --q-norm-rope-aie-mlir, and --k-norm-rope-aie-mlir"
         )
-    run_attention = attention_aie_mlir is not None
+    run_attention = attention_aie_mlirs is not None
     if run_attention and not run_rope:
         raise SystemExit("attention pipeline requires q/k/v projections plus q/k norm+RoPE")
     run_self_attn = oproj_aie_mlir is not None
@@ -145,13 +145,18 @@ def main() -> int:
         args.q_heads <= 0 or args.kv_heads <= 0 or args.q_heads % args.kv_heads != 0
     ):
         raise SystemExit("q_heads must be a positive multiple of kv_heads")
+    if (
+        run_attention
+        and attention_aie_mlirs is not None
+        and len(attention_aie_mlirs) != args.q_heads
+    ):
+        raise SystemExit("--attention-aie-mlir must pass one AIE MLIR per q head")
     if run_attention and len(args.token_ids) % args.query_tile_rows != 0:
         raise SystemExit("attention query tile rows must divide token count")
     if run_attention and len(args.token_ids) % args.key_tile_rows != 0:
         raise SystemExit("attention key tile rows must divide token count")
     if run_attention and args.key_tile_rows != 4:
         raise SystemExit("attention_core currently uses key_tile_rows=4")
-
     qproj_prepared: QProjPrepared | None = None
     projection_prepared: QKVPrepared | None = None
     rope_prepared: QKVRopePrepared | None = None
@@ -401,8 +406,8 @@ def main() -> int:
         actual_cos = None
         actual_sin = None
         actual_norm_rope = {}
-        attention_xclbin = None
-        attention_insts = None
+        attention_xclbins = []
+        attention_insts_paths = []
         actual_attention = None
         actual_attention_expected = None
         oproj_xclbin = None
@@ -477,7 +482,7 @@ def main() -> int:
                     link_objects=(rms_norm_rope_object,),
                 )
             if run_attention:
-                assert attention_aie_mlir is not None
+                assert attention_aie_mlirs is not None
                 attention_core_object = compile_attention_core_object(
                     work_dir=args.work_dir / "attention_core",
                     peano_install_dir=peano_install_dir,
@@ -486,16 +491,22 @@ def main() -> int:
                     query_tile_rows=args.query_tile_rows,
                     key_tile_rows=args.key_tile_rows,
                 )
-                _, attention_xclbin, attention_insts = compile_runtime(
-                    aie_mlir=attention_aie_mlir,
-                    work_dir=args.work_dir / "attention_core",
-                    instance_name="run_attention_core",
-                    peano_install_dir=peano_install_dir,
-                    link_objects=(attention_core_object,),
-                )
+                attention_xclbins = []
+                attention_insts_paths = []
+                for index, aie_mlir in enumerate(attention_aie_mlirs):
+                    runtime_work_dir = args.work_dir / "attention_core" / f"head_{index}"
+                    _, attention_xclbin, attention_insts = compile_runtime(
+                        aie_mlir=aie_mlir,
+                        work_dir=runtime_work_dir,
+                        instance_name="run_attention_core",
+                        peano_install_dir=peano_install_dir,
+                        link_objects=(attention_core_object,),
+                    )
+                    attention_xclbins.append(attention_xclbin)
+                    attention_insts_paths.append(attention_insts)
             else:
-                attention_xclbin = None
-                attention_insts = None
+                attention_xclbins = []
+                attention_insts_paths = []
             if run_self_attn:
                 assert oproj_aie_mlir is not None
                 assert self_attn_prepared is not None
@@ -542,8 +553,8 @@ def main() -> int:
                 rope_table_insts=rope_table_insts,
                 norm_rope_xclbins=norm_rope_xclbins,
                 norm_rope_insts=norm_rope_insts,
-                attention_xclbin=attention_xclbin,
-                attention_insts=attention_insts,
+                attention_xclbins=attention_xclbins,
+                attention_insts_paths=attention_insts_paths,
                 oproj_xclbin=oproj_xclbin,
                 oproj_insts=oproj_insts,
                 packed_rows=packed_rows,
@@ -623,8 +634,8 @@ def main() -> int:
             actual_cos = None
             actual_sin = None
             actual_norm_rope = {}
-            attention_xclbin = None
-            attention_insts = None
+            attention_xclbins = []
+            attention_insts_paths = []
             actual_attention = None
             actual_attention_expected = None
             oproj_xclbin = None
@@ -687,8 +698,8 @@ def main() -> int:
         actual_cos = None
         actual_sin = None
         actual_norm_rope = {}
-        attention_xclbin = None
-        attention_insts = None
+        attention_xclbins = []
+        attention_insts_paths = []
         actual_attention = None
         actual_attention_expected = None
         oproj_xclbin = None
@@ -715,9 +726,12 @@ def main() -> int:
         for stage_name in norm_rope_xclbins:
             print(f"{stage_name}_xclbin {norm_rope_xclbins[stage_name]}")
             print(f"{stage_name}_insts {norm_rope_insts[stage_name]}")
-    if attention_xclbin is not None and attention_insts is not None:
-        print(f"attention_core_xclbin {attention_xclbin}")
-        print(f"attention_core_insts {attention_insts}")
+    for index, (attention_xclbin, attention_insts) in enumerate(
+        zip(attention_xclbins, attention_insts_paths, strict=True)
+    ):
+        label = "attention_core" if len(attention_xclbins) == 1 else f"attention_core_head{index}"
+        print(f"{label}_xclbin {attention_xclbin}")
+        print(f"{label}_insts {attention_insts}")
     if oproj_xclbin is not None and oproj_insts is not None:
         print(f"o_proj_xclbin {oproj_xclbin}")
         print(f"o_proj_insts {oproj_insts}")
