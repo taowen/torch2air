@@ -14,6 +14,12 @@
 | [attention-tile-limits.md](attention-tile-limits.md) | attention tile size 先选多大。 | `KEY_TILE_ROWS=8`，`QUERY_TILE_ROWS<=32`。 |
 | [python-air-dsl-kernel.md](python-air-dsl-kernel.md) | Python kernel 应该怎么写。 | 用 MLIR-AIR Python DSL，不要用 Python 拼 MLIR 字符串。 |
 | [herd-scalar-accumulator.md](herd-scalar-accumulator.md) | herd 内标量累加怎么写。 | 用 L1 scalar memref，不要依赖 `scf.for iter_args`。 |
+| [external-kernel-tile-abi.md](external-kernel-tile-abi.md) | Python AIR 怎么调用 AIE external tile kernel。 | private `func.func` 带 `link_with`，调用 L1 memref，`air-to-std` 后跑 `symbol-dce`。 |
+| [packed-weight-tile-layout.md](packed-weight-tile-layout.md) | 压缩权重和 side data 怎么组织成一个 L1 tile。 | host 先重排成 tile kernel 直接消费的连续记录，避免 tile body 解析复杂格式。 |
+| [output-feature-chunking.md](output-feature-chunking.md) | output 维度太大时怎么先分段跑通。 | 固定 xclbin 计算一段 output features，host 多次 launch 拼完整输出。 |
+| [output-parallel-herd.md](output-parallel-herd.md) | 怎么沿 output feature 维做多列 AIE 并行。 | 每列负责 disjoint output slice，复制共享 input，保持每 tile 的 L1 footprint 小。 |
+| [static-token-buckets.md](static-token-buckets.md) | 动态 token 长度怎么落到固定 NPU graph。 | 用固定 token bucket，多余长度由 host 拆 launch，tail 用 pad/mask。 |
+| [export-aten-linear-kernel.md](export-aten-linear-kernel.md) | `aten.linear.default` 怎么接入自定义 AIR kernel。 | generated export Python 直接映射到 kernel builder，不包第二层 graph。 |
 
 维护规则：
 

@@ -13,12 +13,15 @@ from typing import cast
 from torch2air.export.builder import AirBuilder
 from torch2air.export.input_layernorm import InputLayerNormAirBuilder
 from torch2air.export.q4k_embedding import Q4KEmbeddingAirBuilder
+from torch2air.export.q4k_linear import Q4KLinearAirBuilder
 
 
 AIR_OPT_DIAGNOSTIC_FLAGS = (
     "--mlir-print-op-on-diagnostic=false",
     "--mlir-disable-diagnostic-notes",
 )
+Q4K_LINEAR_KERNEL_SOURCE = Path(__file__).resolve().parents[1] / "export" / "kernels" / "q4k_linear.cc"
+Q4K_LINEAR_LINK_OBJECT = "q4k_linear.o"
 
 
 def compile_q4k_embedding_python_kernel(
@@ -82,6 +85,87 @@ def compile_input_layernorm_python_kernel(
         peano_install_dir=str(peano),
     )
     return source_mlir, aie_mlir, xclbin, insts
+
+
+def compile_q4k_linear_python_kernel(
+    *,
+    kernel_py: Path,
+    function_name: str,
+    work_dir: Path,
+    instance_name: str,
+    output_features: int,
+    output_tile_rows: int = 16,
+) -> tuple[Path, Path, Path, Path, Path]:
+    _, _, peano = prepend_air_tool_paths()
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    builder = Q4KLinearAirBuilder(
+        function_name=instance_name,
+        output_features=output_features,
+        output_tile_rows=output_tile_rows,
+    )
+    load_kernel_function(kernel_py, function_name)(builder)
+    _, hidden_size, _ = builder.linear_shape()
+    source_mlir = work_dir / f"{instance_name}.air.mlir"
+    source_mlir.write_text(builder.render_air())
+    object_file = compile_q4k_linear_object(
+        work_dir=work_dir,
+        peano_install_dir=peano,
+        hidden_size=hidden_size,
+        output_tile_rows=output_tile_rows,
+    )
+    aie_mlir = lower_scf_air_to_aie(
+        source_mlir=source_mlir,
+        work_dir=work_dir,
+        stem=instance_name,
+        herd_rows=builder.herd_rows(),
+        herd_cols=builder.herd_cols(),
+    )
+    _, xclbin, insts = compile_runtime(
+        aie_mlir=aie_mlir,
+        work_dir=work_dir,
+        instance_name=instance_name,
+        peano_install_dir=str(peano),
+    )
+    return source_mlir, aie_mlir, xclbin, insts, object_file
+
+
+def compile_q4k_linear_object(
+    *,
+    work_dir: Path,
+    peano_install_dir: Path,
+    hidden_size: int,
+    output_tile_rows: int,
+) -> Path:
+    object_file = work_dir / Q4K_LINEAR_LINK_OBJECT
+    aieopt_dir = Path(installed_tool("aie-opt", "MLIR_AIE_INSTALL_DIR")).resolve().parent.parent
+    target_triple = f"{os.environ.get('AIE_TARGET', 'aie2p')}-none-unknown-elf"
+    subprocess.run(
+        [
+            str(peano_install_dir / "bin" / "clang++"),
+            "-O2",
+            "-std=c++20",
+            f"--target={target_triple}",
+            "-Wno-parentheses",
+            "-Wno-attributes",
+            "-Wno-macro-redefined",
+            "-Wno-empty-body",
+            "-Wno-unused-command-line-argument",
+            "-DNDEBUG",
+            f"-I{aieopt_dir / 'include'}",
+            f"-DHIDDEN_SIZE={hidden_size}",
+            f"-DOUTPUT_TILE_ROWS={output_tile_rows}",
+            f"-DBLOCKS_PER_ROW={hidden_size // 256}",
+            "-c",
+            str(Q4K_LINEAR_KERNEL_SOURCE),
+            "-o",
+            str(object_file),
+        ],
+        check=True,
+        cwd=work_dir,
+    )
+    return object_file
 
 
 def prepend_air_tool_paths() -> tuple[Path, Path, Path]:
@@ -182,6 +266,7 @@ def compile_runtime(
             str(aie_mlir),
             *AIR_OPT_DIAGNOSTIC_FLAGS,
             "--air-to-std",
+            "--symbol-dce",
             "--airrt-to-npu",
             "--canonicalize",
             "-o",
@@ -209,6 +294,10 @@ def compile_runtime(
         check=True,
         cwd=work_dir,
     )
+    if not xclbin.exists():
+        raise RuntimeError(f"aiecc did not generate xclbin: {xclbin}")
+    if not insts.exists():
+        raise RuntimeError(f"aiecc did not generate NPU instructions: {insts}")
     return npu_mlir, xclbin, insts
 
 
