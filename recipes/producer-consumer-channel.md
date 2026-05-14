@@ -39,4 +39,7 @@ consumer:
 - 不要把 stage 间中间结果先写回 public BO 再读回来。
 - 不要在同一个 xclbin 能表达时提前拆成多个 xclbin。
 
-验证状态：真实 NPU 通过；lowering 产生了 tile-to-tile `aie.flow`。
+## 检查
+
+lowered IR 应该包含 tile-to-tile `aie.flow`。如果中间结果出现在 public ABI
+或 host runtime sequence 里，说明 handoff 仍然经过了 host-visible BO。

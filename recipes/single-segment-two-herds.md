@@ -37,4 +37,7 @@ air.launch
 - 不要为了独立 compute island 先拆成多个 xclbin。
 - 不要引入 graph/manifest 描述 AIR 已经能表达的拓扑。
 
-验证状态：真实 NPU 通过；观察到两个 herd 分别放到不同 AIE tile。
+## 检查
+
+`air-place-herds` 后，多个 herd 应该被放到不同 AIE tile；最终 runtime sequence
+仍然只包含 public input/output 的 DMA。

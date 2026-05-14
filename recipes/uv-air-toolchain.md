@@ -41,5 +41,3 @@ check_npu_device
 - 不要使用其他项目的 `.venv`。
 - 不要直接相信 `uv run aircc` 命中的 binary。
 - 不要在函数内部临时 import 工具链模块。
-
-验证状态：Python 3.12 + uv + pyxrt +真实 NPU 已通过多个 xclbin 实验。

@@ -1,9 +1,11 @@
 # Output Feature Chunking
 
-问题：一个 kernel 暂时只能覆盖部分 output feature/channel 时，怎样先用固定形状 NPU
-graph 拼出完整 output tensor？
+问题：一个 fixed-shape NPU kernel 只能覆盖部分 output feature/channel 时，怎样拼出完整
+output tensor？
 
-稳定做法是让一个 xclbin 固定计算一段 output features：
+## 做法
+
+让一个 xclbin 固定计算一段 output features：
 
 ```text
 input:        shared input tile or vector
@@ -14,25 +16,18 @@ output_chunk: output_chunk_features
 host 按 output feature 切完整权重：
 
 ```text
-rows [0:chunk) -> launch
+rows [0:chunk)       -> launch
 rows [chunk:2*chunk) -> launch
 ...
 ```
 
-每次 launch 的输出写入完整结果数组的对应 slice。这个模式先验证 stage 编排和数值正确性；
-正式 runtime 后续应把这些 slice 对应到 shared device BO。
+每次 launch 的输出写入完整结果的对应 slice。生产 runtime 可以把这些 slice 对应到 shared
+device BO；验证 runner 可以回读后拼 host array。
 
-验证记录使用 GGUF Q4_K projection，单列 herd：
+## 规则
 
-| output_tile_rows | launch count | max_abs | mean_ms | 备注 |
-| --- | ---: | ---: | ---: | --- |
-| 16 | 128 | `2.8610229e-06` | `1748.456` | 无 L1 allocation warning |
-| 32 | 64 | `2.8610229e-06` | `1725.858` | `32x152xi32` bank-aware allocation failed |
-| 64 | 32 | `2.8610229e-06` | `1696.613` | `64x152xi32` bank-aware allocation failed |
-
-结论：
-
-- 单列 output chunk 正确，但当前 external dot body 太慢。
-- 32/64-row tile 虽然能跑通，L1 bank allocation 已经不干净。
-- 保守策略是保持较小的 per-tile output chunk；提速优先做 vectorized tile body 和多列
-  并行，而不是继续增大单 tile rows。
+- chunk size 必须整除 full output feature count。
+- public output shape 固定为当前 chunk，不在 AIR 里引入动态 shape。
+- 增大单 tile rows 前先检查 L1 footprint 和 bank allocation。
+- 如果一个大 tile 触发 L1 warning，优先用多列 herd 或更多 host launches，而不是硬塞进
+  单个 tile。

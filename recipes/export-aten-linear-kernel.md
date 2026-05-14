@@ -1,54 +1,45 @@
 # Export Aten Linear Kernel
 
-问题：已经验证过的 AIR kernel，怎样接回正式 `torch2air.export`，同时不重新包装
-PyTorch 导出的对象？
+问题：已经验证过的 AIR kernel，怎样接回正式 `torch2air.export`，同时不重新包装 PyTorch
+导出的对象？
 
-正式路径保持一层映射：
+## 做法
+
+保持一层映射：
 
 ```text
 torch.export ExportedProgram
   -> generated Python export
   -> op-specific AIR builder
-  -> AIR external-kernel schedule or AIR compute schedule
+  -> AIR schedule + optional external tile body
 ```
 
-不要把 PyTorch 导出的对象再包一层 graph。kernel builder 只消费生成的
-`builder.define_tensor(...)` 和 `builder.emit_kernel("aten.linear.default", ...)`，
-让 generated export 成为 single source of truth。
+generated export 只定义 tensor metadata 并发出原始 aten op：
 
-验证记录使用 GGUF Q4_K projection。decode 配置：
-
-```text
-sequence_length = 1
-output_rows per xclbin = 64
-output_tile_rows per AIE tile = 16
-herd = 1 x 4
-weight tile ABI = memref<16x152xi32, 2>
+```python
+builder.define_tensor("input", shape=(1, 1, 1024), dtype="float32")
+builder.define_tensor("weight", shape=(2048, 1024), dtype="float32")
+builder.emit_kernel("aten.linear.default", output="output", inputs=("input", "weight"))
 ```
 
-完整 projection 由 host 连续跑 output chunks。真实 NPU 对拍结果：
+op-specific builder 再决定：
 
-```text
-q_proj  S=1 output=2048 chunk=64 max_abs=2.8610229e-06
-k_proj  S=1 output=1024 chunk=64 max_abs=2.8610229e-06
-o_proj  S=1 output=1024 chunk=64 max_abs=3.3378601e-06
-```
+- public ABI；
+- fixed shape；
+- herd 尺寸；
+- L3/L1 DMA；
+- external tile function 名字和 link object。
 
-实现细节：
+## 规则
 
-- external function 名字由 op-specific builder 固定。
-- link object 由 compile helper 放到 `aiecc` 工作目录。
-- `compile_runtime` 必须检查 `xclbin` 和 `insts.bin` 是否真的生成；`aiecc` 可能返回 0
-  但缺少 xclbin。
-- prefill 使用固定 `S=8` bucket；当前每个 xclbin 只计算一个 16-row output tile。
+- 不要把 `ExportedProgram` 再包装成 torch2air graph。
+- 不要写 `graph.json` 或 manifest 作为中间层。
+- external object 由 compile helper 放到 `aiecc` 工作目录。
+- `compile_runtime` 必须显式检查 `xclbin` 和 `insts.bin` 是否生成。
+- prefill/decode 这类 shape 差异用不同固定 bucket 表达，不在 AIR public ABI 里引入动态
+  memref。
 
-`S=8` 验证记录：
+## 适用边界
 
-```text
-q_proj  S=8 output=2048 chunk=16 max_abs=4.2915344e-06
-k_proj  S=8 output=1024 chunk=16 max_abs=3.3378601e-06
-o_proj  S=8 output=1024 chunk=16 max_abs=5.4836273e-06
-```
-
-当前性能仍由 correctness-first dot body 主导。这个 recipe 证明正式路径接通，不代表
-projection 已经达到可接受吞吐。
+这个模式适合一个 exported aten op 对应一个本地 AIR kernel 的场景。复合 op 如果会拆成太多
+launch，应先设计 fused stage kernel，而不是把内部每个 aten 都直接变成 production stage。

@@ -45,5 +45,3 @@ consumer:
 - 不要给 `cos` / `sin` 这类强配对小输出各建一条内部 channel。
 - 不要默认用动态 L3 scratch 做 intra-xclbin stage handoff；先验证 lowering 和 runtime
   sequence。
-
-验证状态：`4/16 tokens`、`start_position=0/7` 均在真实 NPU 对拍通过。

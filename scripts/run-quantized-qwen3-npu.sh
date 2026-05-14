@@ -48,7 +48,7 @@ case "$STAGE" in
       --warmup "$NPU_WARMUP" \
       --iterations "$NPU_ITERATIONS"
     ;;
-  q_proj|k_proj|o_proj)
+  q_proj|k_proj|v_proj|o_proj)
     if [[ "$TOKEN_COUNT" == "8" ]]; then
       OUTPUT_ROWS="${OUTPUT_ROWS:-16}"
     else

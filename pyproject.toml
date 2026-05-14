@@ -1,7 +1,7 @@
 [project]
 name = "torch2air"
 version = "0.1.0"
-description = "AIR backend experiments for PyTorch-exported models."
+description = "AIR backend for PyTorch-exported models."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

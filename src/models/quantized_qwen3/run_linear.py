@@ -11,34 +11,39 @@ import torch
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
 
 from torch2air.export.q4k_linear import Q4KLinearAirBuilder
+from torch2air.export.q6k_linear import Q6KLinearAirBuilder
 from torch2air.runtime.compile import compile_q4k_linear_python_kernel
+from torch2air.runtime.compile import compile_q6k_linear_python_kernel
 from torch2air.runtime.compile import load_kernel_function
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from .reference_runtime import (
     check_close_rocm,
     dequantize_q4_k_blocks_rocm,
+    dequantize_q6_k_blocks_rocm,
     first_values,
     max_abs_rocm,
     q4k_block_f16_scales_rocm,
+    q6k_block_f16_scales_rocm,
     rocm_device,
 )
 from .run_embed_tokens import DEFAULT_GGUF, parse_token_ids
 from .run_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR, prepare_layernorm_inputs
 
-Q4K_LINEAR_STAGES = ("q_proj", "k_proj", "o_proj")
+LINEAR_STAGES = ("q_proj", "k_proj", "v_proj", "o_proj")
 DEFAULT_STAGE = "q_proj"
 DEFAULT_LAYER_INPUT_BLOCKS_PER_ROW = 4
 
 
 @dataclass(frozen=True, slots=True)
-class Q4KLinearInputInfo:
+class LinearInputInfo:
     stage: str
     source_name: str
     source_type: str
     rms_weight_name: str
     rms_weight_type: str
     projection_weight: GGUFTensorEntry
+    weight_type: str
     token_ids: list[int]
     hidden_size: int
     output_features: int
@@ -49,16 +54,16 @@ class Q4KLinearInputInfo:
 
 
 def projection_weight_tensor(stage: str) -> str:
-    validate_q4k_linear_stage(stage)
+    validate_linear_stage(stage)
     return f"model.layers.0.self_attn.{stage}.weight"
 
 
-def validate_q4k_linear_stage(stage: str) -> None:
-    if stage not in Q4K_LINEAR_STAGES:
-        raise ValueError(f"stage must be one of {Q4K_LINEAR_STAGES}, got {stage!r}")
+def validate_linear_stage(stage: str) -> None:
+    if stage not in LINEAR_STAGES:
+        raise ValueError(f"stage must be one of {LINEAR_STAGES}, got {stage!r}")
 
 
-def prepare_q4k_linear_inputs(
+def prepare_linear_inputs(
     *,
     stage: str,
     gguf_path: Path,
@@ -69,14 +74,12 @@ def prepare_q4k_linear_inputs(
     output_rows: int,
     output_tile_rows: int,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, torch.Tensor, Q4KLinearInputInfo]:
-    validate_q4k_linear_stage(stage)
+) -> tuple[np.ndarray, np.ndarray, torch.Tensor, LinearInputInfo]:
+    validate_linear_stage(stage)
     if len(token_ids) not in {1, 8}:
-        raise ValueError("formal Q4_K linear supports decode S=1 or prefill S=8")
+        raise ValueError("formal quantized linear supports decode S=1 or prefill S=8")
     index = load_gguf_index(gguf_path)
     weight_entry = index.tensors[projection_tensor]
-    if weight_entry.ggml_type != "Q4_K" or weight_entry.physical_dtype != "uint32":
-        raise ValueError(f"{projection_tensor} must be Q4_K uint32, got {weight_entry}")
     output_features, row_words = (int(dim) for dim in weight_entry.physical_shape)
     if output_features % output_rows != 0:
         raise ValueError(f"output_features={output_features} must be divisible by {output_rows}")
@@ -84,10 +87,11 @@ def prepare_q4k_linear_inputs(
         raise ValueError(f"output_rows={output_rows} must be divisible by {output_tile_rows}")
     if output_rows // output_tile_rows > 4:
         raise ValueError("output_rows/output_tile_rows must fit in 4 NPU columns")
-    if row_words % 36 != 0:
-        raise ValueError(f"Q4_K row word width must be a multiple of 36, got {row_words}")
-    model_blocks_per_row = row_words // 36
-    hidden_size = model_blocks_per_row * 256
+    model_blocks_per_row, hidden_size = _linear_weight_shape(
+        projection_tensor=projection_tensor,
+        weight_entry=weight_entry,
+        row_words=row_words,
+    )
     hidden, hidden_rocm, source_name, source_type, rms_name, rms_type = _prepare_linear_input(
         stage=stage,
         gguf_path=gguf_path,
@@ -99,35 +103,26 @@ def prepare_q4k_linear_inputs(
     )
 
     payload = read_tensor_bytes(index.path, weight_entry, offset=0, size=weight_entry.nbytes)
-    raw_blocks = np.frombuffer(payload, dtype=np.uint8).copy().reshape(
-        output_features * model_blocks_per_row,
-        144,
-    )
-    packed_weight = _append_q4k_scale_bits(
-        packed_rows=np.frombuffer(payload, dtype=np.int32).copy().reshape(
-            output_features,
-            row_words,
-        ),
-        raw_blocks=raw_blocks,
-        output_features=output_features,
-        blocks_per_row=model_blocks_per_row,
-    )
-    reference = _q4k_linear_reference_module_rocm(
-        raw_blocks=raw_blocks,
+    packed_weight, reference = _prepare_linear_weight_and_reference_rocm(
+        payload=payload,
+        weight_entry=weight_entry,
         hidden_size=hidden_size,
         output_features=output_features,
+        row_words=row_words,
+        blocks_per_row=model_blocks_per_row,
     )
     expected = reference(hidden_rocm.reshape(1, len(token_ids), hidden_size)).reshape(
         len(token_ids),
         output_features,
     )
-    info = Q4KLinearInputInfo(
+    info = LinearInputInfo(
         stage=stage,
         source_name=source_name,
         source_type=source_type,
         rms_weight_name=rms_name,
         rms_weight_type=rms_type,
         projection_weight=weight_entry,
+        weight_type=weight_entry.ggml_type,
         token_ids=token_ids,
         hidden_size=hidden_size,
         output_features=output_features,
@@ -154,7 +149,7 @@ def _prepare_linear_input(
     eps: float,
     hidden_size: int,
 ) -> tuple[np.ndarray, torch.Tensor, str, str, str, str]:
-    if stage in {"q_proj", "k_proj"}:
+    if stage in {"q_proj", "k_proj", "v_proj"}:
         _, _, normed_hidden, layernorm_info = prepare_layernorm_inputs(
             gguf_path=gguf_path,
             token_ids=token_ids,
@@ -185,7 +180,7 @@ def _prepare_linear_input(
             "none",
             "none",
         )
-    raise ValueError(f"unsupported Q4_K linear stage: {stage}")
+    raise ValueError(f"unsupported quantized linear stage: {stage}")
 
 
 def deterministic_o_proj_input_rocm(*, token_ids: list[int], hidden_size: int) -> torch.Tensor:
@@ -193,6 +188,77 @@ def deterministic_o_proj_input_rocm(*, token_ids: list[int], hidden_size: int) -
     tokens = torch.tensor(token_ids, device=device, dtype=torch.float32).reshape(-1, 1)
     features = torch.arange(hidden_size, device=device, dtype=torch.float32).reshape(1, -1)
     return torch.sin((tokens + 1.0) * 0.17 + (features + 1.0) * 0.013).to(torch.float32)
+
+
+def _linear_weight_shape(
+    *,
+    projection_tensor: str,
+    weight_entry: GGUFTensorEntry,
+    row_words: int,
+) -> tuple[int, int]:
+    if weight_entry.ggml_type == "Q4_K" and weight_entry.physical_dtype == "uint32":
+        if row_words % 36 != 0:
+            raise ValueError(f"Q4_K row word width must be a multiple of 36, got {row_words}")
+        blocks_per_row = row_words // 36
+        return blocks_per_row, blocks_per_row * 256
+    if weight_entry.ggml_type == "Q6_K" and weight_entry.physical_dtype == "uint16":
+        if row_words % 105 != 0:
+            raise ValueError(f"Q6_K row halfword width must be a multiple of 105, got {row_words}")
+        blocks_per_row = row_words // 105
+        return blocks_per_row, blocks_per_row * 256
+    raise ValueError(
+        f"{projection_tensor} must be Q4_K uint32 or Q6_K uint16, got {weight_entry}"
+    )
+
+
+def _prepare_linear_weight_and_reference_rocm(
+    *,
+    payload: bytes,
+    weight_entry: GGUFTensorEntry,
+    hidden_size: int,
+    output_features: int,
+    row_words: int,
+    blocks_per_row: int,
+) -> tuple[np.ndarray, torch.nn.Linear]:
+    if weight_entry.ggml_type == "Q4_K":
+        raw_blocks = np.frombuffer(payload, dtype=np.uint8).copy().reshape(
+            output_features * blocks_per_row,
+            144,
+        )
+        packed_weight = _append_q4k_scale_bits(
+            packed_rows=np.frombuffer(payload, dtype=np.int32).copy().reshape(
+                output_features,
+                row_words,
+            ),
+            raw_blocks=raw_blocks,
+            output_features=output_features,
+            blocks_per_row=blocks_per_row,
+        )
+        reference = _q4k_linear_reference_module_rocm(
+            raw_blocks=raw_blocks,
+            hidden_size=hidden_size,
+            output_features=output_features,
+        )
+        return np.ascontiguousarray(packed_weight), reference
+    if weight_entry.ggml_type == "Q6_K":
+        raw_halfwords = np.frombuffer(payload, dtype=np.uint16).copy().reshape(
+            output_features,
+            row_words,
+        )
+        raw_blocks = raw_halfwords.reshape(output_features * blocks_per_row, 105)
+        packed_weight = _append_q6k_scale_bits(
+            packed_rows=raw_halfwords,
+            raw_blocks=raw_blocks,
+            output_features=output_features,
+            blocks_per_row=blocks_per_row,
+        )
+        reference = _q6k_linear_reference_module_rocm(
+            raw_blocks=raw_blocks,
+            hidden_size=hidden_size,
+            output_features=output_features,
+        )
+        return np.ascontiguousarray(packed_weight), reference
+    raise ValueError(f"unsupported linear weight type: {weight_entry.ggml_type}")
 
 
 def _append_q4k_scale_bits(
@@ -217,6 +283,28 @@ def _append_q4k_scale_bits(
     return packed
 
 
+def _append_q6k_scale_bits(
+    *,
+    packed_rows: np.ndarray,
+    raw_blocks: np.ndarray,
+    output_features: int,
+    blocks_per_row: int,
+) -> np.ndarray:
+    row_words = blocks_per_row * 105
+    scale_values = (
+        q6k_block_f16_scales_rocm(raw_blocks)
+        .reshape(output_features, blocks_per_row)
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    scale_bits = np.ascontiguousarray(scale_values.astype(np.float32, copy=False)).view(np.int32)
+    packed = np.empty((output_features, row_words + blocks_per_row), dtype=np.int32)
+    packed[:, :row_words] = packed_rows.astype(np.int32, copy=False)
+    packed[:, row_words:] = scale_bits.reshape(output_features, blocks_per_row)
+    return packed
+
+
 def _q4k_linear_reference_module_rocm(
     *,
     raw_blocks: np.ndarray,
@@ -224,6 +312,26 @@ def _q4k_linear_reference_module_rocm(
     output_features: int,
 ) -> torch.nn.Linear:
     rows = dequantize_q4_k_blocks_rocm(raw_blocks).reshape(output_features, hidden_size)
+    module = torch.nn.Linear(
+        hidden_size,
+        output_features,
+        bias=False,
+        device=rocm_device(),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        module.weight.copy_(rows)
+    module.eval()
+    return module
+
+
+def _q6k_linear_reference_module_rocm(
+    *,
+    raw_blocks: np.ndarray,
+    hidden_size: int,
+    output_features: int,
+) -> torch.nn.Linear:
+    rows = dequantize_q6_k_blocks_rocm(raw_blocks).reshape(output_features, hidden_size)
     module = torch.nn.Linear(
         hidden_size,
         output_features,
@@ -322,8 +430,8 @@ def _run_output_chunks(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile and run formal Q4_K linear kernel.")
-    parser.add_argument("--stage", choices=Q4K_LINEAR_STAGES, default=DEFAULT_STAGE)
+    parser = argparse.ArgumentParser(description="Compile and run formal quantized linear kernels.")
+    parser.add_argument("--stage", choices=LINEAR_STAGES, default=DEFAULT_STAGE)
     parser.add_argument("--kernel-py", type=Path, required=True)
     parser.add_argument("--function-name")
     parser.add_argument("--gguf", type=Path, default=DEFAULT_GGUF)
@@ -345,7 +453,7 @@ def main() -> int:
     os.environ.setdefault("XRT_HACK_UNSECURE_LOADING_XCLBIN", "1")
     function_name = args.function_name or f"run_{args.stage}"
     projection_tensor = args.projection_tensor or projection_weight_tensor(args.stage)
-    hidden, packed_weight, expected, info = prepare_q4k_linear_inputs(
+    hidden, packed_weight, expected, info = prepare_linear_inputs(
         stage=args.stage,
         gguf_path=args.gguf,
         token_ids=args.token_ids,
@@ -361,32 +469,45 @@ def main() -> int:
         function_name,
         args.output_rows,
         args.output_tile_rows,
+        info.weight_type,
     )
     if sequence_length != len(args.token_ids):
         raise SystemExit(f"token count must match exported {args.stage} sequence length")
     if hidden_size != info.hidden_size:
         raise SystemExit(f"input width must match exported {args.stage} hidden size")
     if output_features != args.output_rows:
-        raise SystemExit("compiled output rows must match Q4KLinearAirBuilder output shape")
+        raise SystemExit("compiled output rows must match quantized linear output shape")
 
     print(f"stage {info.stage}")
     print(f"input_source {info.source_name} {info.source_type}")
     print(f"RMS weight {info.rms_weight_name} {info.rms_weight_type}")
-    print(f"Q4_K weight {info.projection_weight.name} {info.projection_weight.ggml_type}")
+    print(f"{info.weight_type} weight {info.projection_weight.name}")
     print(f"token_ids {','.join(str(v) for v in info.token_ids)}")
     print(f"hidden_size {info.hidden_size} output_features {info.output_features}")
     print(f"output_rows {info.output_rows} output_tile_rows {info.output_tile_rows}")
     print(f"blocks_per_row {info.blocks_per_row} weight_words {info.weight_words}")
     print(f"reference pytorch_rocm torch.nn.Linear {torch.cuda.get_device_name(0)}")
 
-    source_mlir, aie_mlir, xclbin, insts, object_file = compile_q4k_linear_python_kernel(
-        kernel_py=args.kernel_py,
-        function_name=function_name,
-        work_dir=args.work_dir,
-        instance_name=function_name,
-        output_features=args.output_rows,
-        output_tile_rows=args.output_tile_rows,
-    )
+    if info.weight_type == "Q4_K":
+        source_mlir, aie_mlir, xclbin, insts, object_file = compile_q4k_linear_python_kernel(
+            kernel_py=args.kernel_py,
+            function_name=function_name,
+            work_dir=args.work_dir,
+            instance_name=function_name,
+            output_features=args.output_rows,
+            output_tile_rows=args.output_tile_rows,
+        )
+    elif info.weight_type == "Q6_K":
+        source_mlir, aie_mlir, xclbin, insts, object_file = compile_q6k_linear_python_kernel(
+            kernel_py=args.kernel_py,
+            function_name=function_name,
+            work_dir=args.work_dir,
+            instance_name=function_name,
+            output_features=args.output_rows,
+            output_tile_rows=args.output_tile_rows,
+        )
+    else:
+        raise SystemExit(f"unsupported linear weight type: {info.weight_type}")
     actual, latencies_ms = run_on_npu(
         xclbin=xclbin,
         insts=insts,
@@ -423,12 +544,22 @@ def _kernel_shape(
     function_name: str,
     output_features: int,
     output_tile_rows: int,
+    weight_type: str,
 ) -> tuple[int, int, int]:
-    builder = Q4KLinearAirBuilder(
-        function_name=function_name,
-        output_features=output_features,
-        output_tile_rows=output_tile_rows,
-    )
+    if weight_type == "Q4_K":
+        builder = Q4KLinearAirBuilder(
+            function_name=function_name,
+            output_features=output_features,
+            output_tile_rows=output_tile_rows,
+        )
+    elif weight_type == "Q6_K":
+        builder = Q6KLinearAirBuilder(
+            function_name=function_name,
+            output_features=output_features,
+            output_tile_rows=output_tile_rows,
+        )
+    else:
+        raise ValueError(f"unsupported linear weight type: {weight_type}")
     load_kernel_function(kernel_py, function_name)(builder)
     return builder.linear_shape()
 

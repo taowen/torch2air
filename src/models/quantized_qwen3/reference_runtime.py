@@ -28,6 +28,17 @@ def q4k_block_f16_scales_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
     return torch.stack([d, dmin], dim=1)
 
 
+def q6k_block_f16_scales_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
+    if raw_blocks.dtype != np.uint16 or raw_blocks.ndim != 2 or raw_blocks.shape[1] != 105:
+        raise ValueError(
+            f"Expected uint16 Q6_K blocks with shape [N, 105], "
+            f"got {raw_blocks.shape} {raw_blocks.dtype}"
+        )
+    device = rocm_device()
+    d_words = torch.as_tensor(np.array(raw_blocks[:, 104:105], copy=True, order="C"), device=device)
+    return d_words.view(torch.float16).to(torch.float32).reshape(-1)
+
+
 def dequantize_q4_k_blocks_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
     if raw_blocks.dtype != np.uint8 or raw_blocks.ndim != 2 or raw_blocks.shape[1] != 144:
         raise ValueError(
@@ -77,6 +88,68 @@ def dequantize_q4_k_blocks_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
         d * scale.to(torch.float32).reshape(n_blocks, 8, 1) * qs
         - dmin * minimum.to(torch.float32).reshape(n_blocks, 8, 1)
     ).reshape(n_blocks, 256)
+
+
+def dequantize_q6_k_blocks_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
+    if raw_blocks.dtype != np.uint16 or raw_blocks.ndim != 2 or raw_blocks.shape[1] != 105:
+        raise ValueError(
+            f"Expected uint16 Q6_K blocks with shape [N, 105], "
+            f"got {raw_blocks.shape} {raw_blocks.dtype}"
+        )
+    device = rocm_device()
+    raw_bytes = raw_blocks.view(np.uint8).reshape(raw_blocks.shape[0], 210)
+    raw = torch.as_tensor(np.array(raw_bytes, copy=True, order="C"), device=device)
+    n_blocks = raw.shape[0]
+    ql = raw[:, 0:128].to(torch.int32)
+    qh = raw[:, 128:192].to(torch.int32)
+    scales = raw[:, 192:208].to(torch.int8).to(torch.int32)
+    d = q6k_block_f16_scales_rocm(raw_blocks).reshape(n_blocks, 1)
+    output = torch.empty((n_blocks, 256), device=device, dtype=torch.float32)
+    lanes = torch.arange(32, device=device, dtype=torch.long)
+    scale_lane = lanes // 16
+
+    for half_index in range(2):
+        ql_base = half_index * 64
+        qh_base = half_index * 32
+        scale_base = half_index * 8
+        output_base = half_index * 128
+        ql0 = ql[:, ql_base : ql_base + 32]
+        ql1 = ql[:, ql_base + 32 : ql_base + 64]
+        qh_part = qh[:, qh_base : qh_base + 32]
+
+        q1 = torch.bitwise_or(
+            torch.bitwise_and(ql0, 0x0F),
+            torch.bitwise_left_shift(torch.bitwise_and(qh_part, 0x03), 4),
+        ).to(torch.float32) - 32.0
+        q2 = torch.bitwise_or(
+            torch.bitwise_and(ql1, 0x0F),
+            torch.bitwise_left_shift(
+                torch.bitwise_and(torch.bitwise_right_shift(qh_part, 2), 0x03),
+                4,
+            ),
+        ).to(torch.float32) - 32.0
+        q3 = torch.bitwise_or(
+            torch.bitwise_right_shift(ql0, 4),
+            torch.bitwise_left_shift(
+                torch.bitwise_and(torch.bitwise_right_shift(qh_part, 4), 0x03),
+                4,
+            ),
+        ).to(torch.float32) - 32.0
+        q4 = torch.bitwise_or(
+            torch.bitwise_right_shift(ql1, 4),
+            torch.bitwise_left_shift(torch.bitwise_right_shift(qh_part, 6), 4),
+        ).to(torch.float32) - 32.0
+
+        s1 = scales[:, scale_base + scale_lane + 0].to(torch.float32)
+        s2 = scales[:, scale_base + scale_lane + 2].to(torch.float32)
+        s3 = scales[:, scale_base + scale_lane + 4].to(torch.float32)
+        s4 = scales[:, scale_base + scale_lane + 6].to(torch.float32)
+        output[:, output_base : output_base + 32] = d * s1 * q1
+        output[:, output_base + 32 : output_base + 64] = d * s2 * q2
+        output[:, output_base + 64 : output_base + 96] = d * s3 * q3
+        output[:, output_base + 96 : output_base + 128] = d * s4 * q4
+
+    return output
 
 
 def q4k_embedding_module_rocm(

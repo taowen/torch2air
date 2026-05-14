@@ -9,7 +9,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 : "${XRT_DIR:=/opt/xilinx/xrt}"
 : "${AIE_TARGET:=aie2p}"
-: "${NPU_WORK_ROOT:=$ROOT_DIR/.cache/npu-spikes}"
+: "${NPU_WORK_ROOT:=$ROOT_DIR/.cache/npu}"
 : "${UV:=uv}"
 
 source "$XRT_DIR/setup.sh" >/tmp/torch2air-xrt-setup.log

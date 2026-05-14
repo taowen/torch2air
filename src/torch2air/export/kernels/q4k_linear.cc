@@ -10,6 +10,8 @@
 
 #include <cstdint>
 
+#include <aie_api/aie.hpp>
+
 #ifndef OUTPUT_TILE_ROWS
 #define OUTPUT_TILE_ROWS 16
 #endif
@@ -25,6 +27,7 @@
 #define Q4K_WORDS_PER_BLOCK 36
 #define Q4K_ROW_WORDS (BLOCKS_PER_ROW * Q4K_WORDS_PER_BLOCK)
 #define Q4K_WEIGHT_WORDS (Q4K_ROW_WORDS + BLOCKS_PER_ROW * 2)
+#define DOT_VECTOR_LANES 16
 
 static inline uint8_t q4k_byte(const uint32_t *__restrict block, int byte_offset) {
   const uint32_t word = block[byte_offset >> 2];
@@ -58,23 +61,46 @@ static inline float f32_from_bits(uint32_t bits) {
   return value.f;
 }
 
+static inline void q4k_fill_weights_16(
+    const uint32_t *__restrict block,
+    int subblock,
+    int lane_base,
+    float d,
+    float dmin,
+    float *__restrict weights) {
+  uint32_t scale = 0;
+  uint32_t minimum = 0;
+  q4k_scale_min(block, subblock, scale, minimum);
+  const float scaled_d = d * (float)scale;
+  const float scaled_min = dmin * (float)minimum;
+  const int q_base = 16 + (subblock >> 1) * 32 + lane_base;
+  for (int lane = 0; lane < DOT_VECTOR_LANES; ++lane) {
+    const uint32_t q_byte = q4k_byte(block, q_base + lane);
+    const uint32_t q = (subblock & 1) == 0 ? (q_byte & 15u) : (q_byte >> 4);
+    weights[lane] = scaled_d * (float)q - scaled_min;
+  }
+}
+
 static inline float q4k_dot_block(
     const uint32_t *__restrict block,
     const float *__restrict hidden,
     float d,
     float dmin) {
-  float acc = 0.0f;
-  for (int local = 0; local < 256; ++local) {
-    uint32_t scale = 0;
-    uint32_t minimum = 0;
-    q4k_scale_min(block, local >> 5, scale, minimum);
-    const int q_byte_offset = ((local >> 6) * 32) + (local & 31);
-    const uint32_t q_byte = q4k_byte(block, 16 + q_byte_offset);
-    const uint32_t q = (local & 32) == 0 ? (q_byte & 15u) : (q_byte >> 4);
-    const float w = d * (float)scale * (float)q - dmin * (float)minimum;
-    acc += w * hidden[local];
+  ::aie::accum<accfloat, DOT_VECTOR_LANES> acc =
+      ::aie::zeros<accfloat, DOT_VECTOR_LANES>();
+  alignas(64) float weights[DOT_VECTOR_LANES];
+  for (int subblock = 0; subblock < 8; ++subblock) {
+    const int hidden_base = subblock * 32;
+    for (int lane_base = 0; lane_base < 32; lane_base += DOT_VECTOR_LANES) {
+      q4k_fill_weights_16(block, subblock, lane_base, d, dmin, weights);
+      const ::aie::vector<float, DOT_VECTOR_LANES> hidden_v =
+          ::aie::load_v<DOT_VECTOR_LANES>(hidden + hidden_base + lane_base);
+      const ::aie::vector<float, DOT_VECTOR_LANES> weight_v =
+          ::aie::load_v<DOT_VECTOR_LANES>(weights);
+      acc = ::aie::add(acc, ::aie::mul(hidden_v, weight_v));
+    }
   }
-  return acc;
+  return ::aie::reduce_add(acc.to_vector<float>());
 }
 
 extern "C" {

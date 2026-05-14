@@ -3,8 +3,8 @@
 ## 问题
 
 在 AIE herd 内用 `scf.for iter_args` 做标量累加，AIR/AIE 编译可以通过，但真实 NPU
-运行时可能得到错误状态。RMSNorm 的 `sum_squares` 曾表现为 0，输出退化成
-`hidden * weight * rsqrt(eps)`。
+运行时可能得到错误状态。典型表现是 reduction 结果保持初值，后续输出只反映了
+非 reduction 分支的计算。
 
 ## 做法
 
@@ -27,4 +27,4 @@ sum_squares = load(sum_l1, [idx(0)])
 
 - herd 内跨 loop 的标量状态优先用 L1 memref 表达。
 - `scf.for iter_args` 可以用于 AIR graph 编排 token，但不要先用于核心数值累加。
-- 数值像 `rsqrt(eps)` 时，优先怀疑 reduction 状态没有传出来。
+- 数值表现为只使用初始值时，优先怀疑 reduction 状态没有传出来。

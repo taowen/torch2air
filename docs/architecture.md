@@ -4,7 +4,7 @@
 close to how `torch2vk` actually works: model export scripts call a local
 `export_one(...)` helper several times with concrete modules and arguments.
 That helper uses `torch.export`, walks the exported PyTorch object directly, and
-renders files from templates.
+emits the small Python file consumed by the next compile/run step.
 
 Do not build an intermediate graph format, registry system, manifest layer, or
 runtime abstraction until a concrete model export proves that one is needed.
@@ -18,8 +18,8 @@ models.quantized_qwen3.export
   -> export_one(name, module, args, kwargs, ...)
   -> torch.export.export(...)
   -> iterate exported_program.graph_module.graph.nodes
-  -> render Jinja templates for tiled pre-AIR MLIR
-  -> lower with air-opt / aircc
+  -> generate a small Python AIR kernel file
+  -> compile that Python kernel to AIR MLIR / AIE / xclbin
   -> run with existing XRT tooling
 ```
 
@@ -40,19 +40,22 @@ Current project layout should stay small:
 src/
   torch2air/
     export/
-      templates.py          # small Jinja helpers only
-      kernels/              # reusable tiled MLIR kernel templates
+      program.py            # direct ExportedProgram traversal and renderer
+      builder.py            # tiny generated-export builder protocol
+      air_dsl.py            # narrow AIR Python DSL helpers
+      q4k_embedding.py      # op-specific Python AIR builder
+      q4k_linear.py         # Q4_K linear Python AIR builder
+      q6k_linear.py         # Q6_K linear Python AIR builder
+      kernels/              # narrow external tile compute bodies
     weights/
       gguf.py               # GGUF tensor metadata and packed reads
   models/
     quantized_qwen3/
       export.py             # model-specific export_one(...) calls
-      quantization.py       # model-specific quantized tensor naming
-      reference.py          # generated PyTorch ROCm reference wrappers
       reference_runtime.py  # small ROCm check/debug helpers
-      run.py                # thin CLI dispatch for model runners
       run_embed_tokens.py   # embed_tokens XRT execution and reference check
-      run_linear.py         # Q4_K linear external-kernel XRT execution
+      run_input_layernorm.py
+      run_linear.py         # Q4_K/Q6_K linear external-kernel XRT execution
       generated/            # ignored generated files
 scripts/
   install-air-tools.sh
@@ -83,7 +86,7 @@ def export_one(
     for node in program.graph_module.graph.nodes:
         # Inspect aten target, tensor_meta, args, kwargs directly.
         ...
-    # Render generated tiled MLIR directly from this context.
+    # Render the generated Python AIR kernel directly from this context.
 ```
 
 Then the model export calls it explicitly:
@@ -121,28 +124,26 @@ artifacts, for example:
 
 ```text
 src/models/quantized_qwen3/generated/
-  run_text_layer.mlir
+  run_q_proj.py
 ```
 
-The generated model artifact is tiled MLIR, not hand-written AIR dialect and
-not a Python AIR builder. It should look like the spike fixtures:
-`scf.parallel`, `memref.subview`, `memref.alloc(..., 2)`, `memref.copy`, and
-tile-local `linalg`/`arith`/`scf` work. `air-opt` is responsible for lowering
-that into `air.launch`, `air.herd`, `air.dma_memcpy_nd`, channels, and AIE IR.
+The generated model artifact is a small Python function that defines tensors
+and emits the exported aten operator directly. It is not wrapped into a
+torch2air graph object. The runtime runner chooses the concrete AIR builder for
+that operator, so one exported aten op maps to one local kernel implementation.
 
 Some kernels need the official AIR external-kernel style earlier than the
-pure-MLIR body is practical. In that case the exported artifact is still MLIR
-that owns the AIR launch/segment/herd shape and L3<->L1 DMA, while the native
-object owns only the tile-local compute body. `quantized_qwen3` attention
-projections follow that pattern with `q4k_linear_tile` and `q6k_linear_tile`:
-the templates emit direct AIR plus private `func.func` declarations carrying
-`link_with = "q4k_linear.o"` or `link_with = "q6k_linear.o"`, and the Peano
-objects live under the concrete operator implementation that uses them.
+pure-MLIR body is practical. `quantized_qwen3` attention projections follow
+that pattern with `q4k_linear_tile` and `q6k_linear_tile`: the Python AIR
+builder emits launch/segment/herd, L3<->L1 DMA, and private `func.func`
+declarations carrying `link_with = "q4k_linear.o"` or
+`link_with = "q6k_linear.o"`. The Peano objects own only the tile-local compute
+body.
 
-Reusable operator bodies should be real Python AIR DSL kernels, not forwarding
-wrappers around `builder.emit_kernel`. The model package chooses a stage and
-passes concrete Qwen3 shapes, tensor names, and module metadata; it should not
-own a growing library of generic operator templates.
+Reusable operator bodies should be real Python AIR DSL kernels. The model
+package chooses a stage and passes concrete Qwen3 shapes, tensor names, and
+module metadata; it should not own a growing library of generic operator
+templates.
 
 Do not put model-stage tiling in ad hoc `.cc` files. Native code is acceptable
 only as a narrow external tile compute body, kept under
@@ -183,35 +184,20 @@ consume the previous stage's output buffer directly. Do not insert graph JSON,
 manifest objects, `.npy` files, or host-side repacking between operators.
 
 For adjacent Qwen3 stages, keep the model export simple and official-looking:
-generate each operator as its own tiled MLIR stage, then connect the stages with
-the existing AIR/XRT mechanisms. The current full-hidden
-`embed_tokens -> input_layernorm` path runs two stage xclbins with one shared
-`pyxrt.bo` for the hidden-state memref. That avoids a host-side intermediate
-copy while staying inside pyxrt's device, kernel, BO, and run concepts.
+generate each operator as its own Python AIR kernel, then connect the stages
+with existing AIR/XRT mechanisms. The current production runners validate one
+operator at a time against PyTorch ROCm. Multi-operator execution should follow
+the torch2vk-style shape: separate xclbins may hand off through shared
+`pyxrt.bo` device buffers, without introducing a torch2air runtime object.
 
-The exporter also generates a stitched AIR module in the same style as
-MLIR-AIR's upstream llama multi-launch examples: independent stage bodies are
-renamed and connected by an arg map. On this Python 3.12 environment, pyxrt does
-not expose the ELF loader used by those examples. The xclbin `aircc` path for
-the stitched module currently overflows AIE program memory for the full Q4_K
-embedding body, so the runnable path remains separate xclbins with a shared BO
-until the ELF binding or a smaller embedded body is available.
-
-`embed_tokens -> input_layernorm -> q/k/v` extends the same runnable boundary:
-stage xclbins share pyxrt BOs for the hidden and normalized-hidden memrefs. The
-q/k/v projections run sequentially from the same normalized-hidden BO and write
-separate output BOs. This is intentionally close to the torch2vk model: separate
-compiled programs can hand off through device buffers without inventing a
-torch2air runtime object.
-The current full-head q/k/v verification uses `OUTPUT_ROWS=128` and
-`OUTPUT_TILE_ROWS=32`; the earlier 64-row half-head shape remains available by
-overriding those environment variables.
+The current verified projection shape is decode `S=1` with `output_rows=64`
+and fixed prefill bucket `S=8` with `output_rows=16`. Longer prefill should be
+host-split into fixed buckets until a larger bucket has real NPU evidence.
 
 When two adjacent operators can be fused without changing the schedule shape,
-keep that as an explicit experiment. The current
-`embed_tokens_input_layernorm` spike proves L1 handoff for one Q4_K block. Full
-hidden RMSNorm should not replace the separate stages until it works for all
-four Q4_K blocks on real NPU hardware.
+keep that work behind real NPU verification. Full hidden RMSNorm should not
+replace the separate stages until it works for all four Q4_K blocks on real NPU
+hardware.
 
 ## Runtime Boundary
 
@@ -242,8 +228,9 @@ Initial useful milestone:
 - Load the Qwen3 PyTorch module on meta tensors.
 - Call local `export_one(...)` for one small boundary first.
 - Traverse the returned `ExportedProgram` directly.
-- Render one concrete file from the traversed nodes.
-- That file is a tiled `.mlir` file consumed by `air-opt`.
+- Render one concrete Python AIR kernel from the traversed nodes.
+- The runner compiles that Python kernel to AIR MLIR, lowers it, and runs it
+  with existing AIR/XRT APIs.
 - Keep quantized packed weight handling tied to real GGUF tensor metadata.
 
 Only broaden from there once the simple path produces a real artifact that the
@@ -260,4 +247,4 @@ next compile/run step can consume.
 - No IREE `vmfb` path for this project.
 
 The working rule is: direct `export_one(...)`, direct PyTorch graph traversal,
-simple templates, and existing AIR/XRT runtime APIs.
+small Python AIR kernels, and existing AIR/XRT runtime APIs.

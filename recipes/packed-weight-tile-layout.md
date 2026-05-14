@@ -1,15 +1,11 @@
 # Packed Weight Tile Layout
 
-问题：压缩权重格式通常有 main payload 和 side data。为了让 AIE external tile kernel
-简单稳定，host 应该怎样把它们放进一个 L1 memref？
+问题：压缩权重格式通常有 main payload 和 side data。为了让 AIE external tile kernel 简单
+稳定，host 应该怎样把它们放进一个 L1 memref？
 
-稳定原则：
+## 做法
 
-- host 负责从模型文件格式解包、重排和补齐。
-- tile kernel 只读连续 tile 记录，不解析全局模型格式。
-- side data 跟随它服务的 output row，避免第二个 scale buffer 和额外 DMA。
-
-一个可复用 layout 是每个 output row 一个连续记录：
+每个 output row 使用一个连续 record：
 
 ```text
 compressed payload: payload_words_per_row
@@ -17,40 +13,46 @@ side words:         side_words_per_row
 total words:        payload_words_per_row + side_words_per_row
 ```
 
-验证记录使用 GGUF Q4_K projection。对 `hidden_size=1024`：
+host 负责从模型文件格式切片、补 side data、必要时做窄类型到 ABI word 的临时 widening。
+tile kernel 只消费连续 row records，不解析全局模型文件。
+
+## Q4_K 例子
+
+对 `hidden_size=1024`：
 
 ```text
 blocks_per_row = 4
-row_words      = 4 * 36 = 144
-scale_words    = 4 * 2  = 8
+payload_words  = 4 * 36 = 144
+side_words     = 4 * 2  = 8
 weight_words   = 152
 ```
 
-L1 ABI：
-
-```mlir
-memref<16x152xi32, 2 : i32>
-```
-
-每个 block 的 side words 是 host 从 GGUF Q4_K header 解出的 `d` 和 `dmin` 的
-f32 bit pattern：
+每个 block 的 side words 是 `d` 和 `dmin` 的 f32 bit pattern：
 
 ```text
 words[144 + block * 2 + 0] = bitcast_i32(float32(d))
 words[144 + block * 2 + 1] = bitcast_i32(float32(dmin))
 ```
 
-这样 external kernel 只接一个 weight memref，不需要第二个 scale memref，也避免在
-AIE tile body 里做 fp16 header conversion。
+## Q6_K 例子
 
-真实 NPU 结果：
+Q6_K block 是 `105` 个 `uint16` halfword：
 
 ```text
-input  embed_tokens -> input_layernorm token 0
-weight q_proj.weight rows [0:16)
-max_abs 1.1920929e-07
-mean_ms 13.684
+ql[128 bytes], qh[64 bytes], scales[16 bytes], d[fp16]
 ```
 
-这个 recipe 只证明 layout 和 ABI 正确。当前 dot body 是 correctness-first C++ 写法，
-性能不代表正式 projection kernel。
+当前简单 ABI 可以先把 halfword widen 成 `i32`，再追加每个 block 的 f32 `d`：
+
+```text
+blocks_per_row = 4
+payload_words  = 4 * 105 = 420
+side_words     = 4
+weight_words   = 424
+```
+
+## 取舍
+
+- 单个 weight memref 比额外 scale buffer 更简单，DMA 更少。
+- host 只解 block-level scale side data，不 host-dequantize 完整权重值。
+- widening 会增加 L1 footprint；稳定后再单独做 compact i16/byte ABI。
