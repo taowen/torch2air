@@ -9,21 +9,19 @@ import numpy as np
 import pyxrt as xrt
 import torch
 
+from .air_runtime import compile_runtime, load_xrt_kernel
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm
-from .run_embed_tokens import compile_runtime
-from .run_pipeline import (
-    HEAD_DIM,
-    compile_attention_core_object,
-    load_xrt_kernel,
-    reference_attention_core,
-)
+from .stages.attention import compile_attention_core_object, reference_attention_core
+from .stages.rope import HEAD_DIM
 
 
 def deterministic_tensor(*, rows: int, cols: int, seed: int, scale: float) -> torch.Tensor:
     device = torch.device("cuda")
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
-    return torch.randn((rows, cols), device=device, generator=generator, dtype=torch.float32) * scale
+    return (
+        torch.randn((rows, cols), device=device, generator=generator, dtype=torch.float32) * scale
+    )
 
 
 def run_attention_core_on_npu(
@@ -74,13 +72,17 @@ def run_attention_core_on_npu(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run standalone quantized_qwen3 attention core on NPU.")
+    parser = argparse.ArgumentParser(
+        description="Run standalone quantized_qwen3 attention core on NPU."
+    )
     parser.add_argument("--aie-mlir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--sequence-length", type=int, required=True)
     parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
     parser.add_argument("--query-tile-rows", type=int, default=4)
     parser.add_argument("--key-tile-rows", type=int, default=4)
+    parser.add_argument("--q-heads", type=int, default=1)
+    parser.add_argument("--kv-heads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
@@ -96,6 +98,8 @@ def main() -> int:
         raise SystemExit("attention key tile rows must divide sequence length")
     if args.key_tile_rows != 4:
         raise SystemExit("attention_core currently uses key_tile_rows=4")
+    if args.q_heads <= 0 or args.kv_heads <= 0 or args.q_heads % args.kv_heads != 0:
+        raise SystemExit("q_heads must be a positive multiple of kv_heads")
     peano_install_dir = os.environ.get("PEANO_INSTALL_DIR")
     if not peano_install_dir:
         raise SystemExit("PEANO_INSTALL_DIR is not set; source scripts/npu-common.sh first")
@@ -103,23 +107,25 @@ def main() -> int:
 
     q_ref = deterministic_tensor(
         rows=args.sequence_length,
-        cols=args.head_dim,
+        cols=args.q_heads * args.head_dim,
         seed=args.seed,
         scale=0.25,
     )
     k_ref = deterministic_tensor(
         rows=args.sequence_length,
-        cols=args.head_dim,
+        cols=args.kv_heads * args.head_dim,
         seed=args.seed + 1,
         scale=0.25,
     )
     v_ref = deterministic_tensor(
         rows=args.sequence_length,
-        cols=args.head_dim,
+        cols=args.kv_heads * args.head_dim,
         seed=args.seed + 2,
         scale=0.25,
     )
-    expected = reference_attention_core(q=q_ref, k=k_ref, v=v_ref)
+    expected = reference_attention_core(
+        q=q_ref, k=k_ref, v=v_ref, q_heads=args.q_heads, kv_heads=args.kv_heads
+    )
     q = np.ascontiguousarray(q_ref.detach().cpu().numpy())
     k = np.ascontiguousarray(k_ref.detach().cpu().numpy())
     v = np.ascontiguousarray(v_ref.detach().cpu().numpy())
@@ -157,6 +163,7 @@ def main() -> int:
     print(f"reference pytorch_rocm {torch.cuda.get_device_name(0)}")
     print(
         f"sequence_length {args.sequence_length} head_dim {args.head_dim} "
+        f"q_heads {args.q_heads} kv_heads {args.kv_heads} "
         f"query_tile_rows {args.query_tile_rows} key_tile_rows {args.key_tile_rows}"
     )
     print(f"attention_core_xclbin {xclbin}")

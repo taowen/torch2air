@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +13,7 @@ from air.backend.xrt import XRTBackend, XRTCompileArtifact
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
+from .air_runtime import compile_runtime
 from .reference_runtime import (
     check_close_rocm,
     first_values,
@@ -56,7 +55,9 @@ def prepare_inputs(
         raise ValueError(f"Q4_K row word width must be a multiple of 36, got {model_row_words}")
     model_blocks_per_row = model_row_words // 36
     if blocks_per_row <= 0 or blocks_per_row > model_blocks_per_row:
-        raise ValueError(f"blocks_per_row must be in [1, {model_blocks_per_row}], got {blocks_per_row}")
+        raise ValueError(
+            f"blocks_per_row must be in [1, {model_blocks_per_row}], got {blocks_per_row}"
+        )
     for token_id in token_ids:
         if token_id < 0 or token_id >= vocab_size:
             raise ValueError(f"token id {token_id} is outside [0, {vocab_size})")
@@ -88,7 +89,9 @@ def prepare_inputs(
         .numpy()
     )
     reference_output = reference.run_embed_tokens(input=token_ids_array(token_ids))["embedding"]
-    expected = reference_output.reshape(len(token_ids), model_blocks_per_row * 256)[:, : blocks_per_row * 256]
+    expected = reference_output.reshape(len(token_ids), model_blocks_per_row * 256)[
+        :, : blocks_per_row * 256
+    ]
     info = EmbedInputInfo(
         tensor=selected,
         token_ids=token_ids,
@@ -106,100 +109,6 @@ def prepare_inputs(
 
 def token_ids_array(token_ids: list[int]) -> np.ndarray:
     return np.array([token_ids], dtype=np.int64)
-
-
-def compile_runtime(
-    *,
-    aie_mlir: Path,
-    work_dir: Path,
-    instance_name: str,
-    peano_install_dir: str,
-    link_objects: tuple[Path, ...] = (),
-) -> tuple[Path, Path, Path]:
-    work_dir.mkdir(parents=True, exist_ok=True)
-    aiecc_dir = work_dir / "aiecc"
-    shutil.rmtree(aiecc_dir, ignore_errors=True)
-    aiecc_dir.mkdir(parents=True, exist_ok=True)
-    if link_objects:
-        for object_path in link_objects:
-            target_path = work_dir / object_path.name
-            if object_path.resolve() != target_path.resolve():
-                shutil.copy2(object_path, target_path)
-        for object_dir in (work_dir / "air_project", aiecc_dir / "air_project"):
-            object_dir.mkdir(parents=True, exist_ok=True)
-            for object_path in link_objects:
-                shutil.copy2(object_path, object_dir / object_path.name)
-
-    npu_mlir = work_dir / f"{instance_name}.npu.mlir"
-    xclbin = work_dir / f"{instance_name}.xclbin"
-    insts = work_dir / f"{instance_name}.insts.bin"
-    air_opt = installed_tool("air-opt", "MLIR_AIR_INSTALL_DIR")
-    aiecc = installed_tool("aiecc", "MLIR_AIE_INSTALL_DIR")
-
-    subprocess.run(
-        [
-            air_opt,
-            str(aie_mlir),
-            "--air-to-std",
-            "--airrt-to-npu",
-            "--canonicalize",
-            "-o",
-            str(npu_mlir),
-        ],
-        check=True,
-    )
-    if link_objects:
-        _dedupe_private_func_declarations(npu_mlir)
-    subprocess.run(
-        [
-            aiecc,
-            "--no-aiesim",
-            "--no-xchesscc",
-            "--no-xbridge",
-            "--no-compile-host",
-            f"--tmpdir={aiecc_dir}",
-            "--aie-generate-xclbin",
-            f"--xclbin-name={xclbin}",
-            "--aie-generate-npu-insts",
-            f"--npu-insts-name={insts}",
-            f"--xclbin-instance-name={instance_name}",
-            f"--peano={peano_install_dir}",
-            "-O",
-            "0",
-            str(npu_mlir),
-        ],
-        check=True,
-        cwd=work_dir,
-    )
-    return npu_mlir, xclbin, insts
-
-
-def installed_tool(name: str, install_env: str) -> str:
-    install_dir = os.environ.get(install_env)
-    if install_dir:
-        candidate = Path(install_dir) / "bin" / name
-        if candidate.exists():
-            return str(candidate)
-    found = shutil.which(name)
-    if not found:
-        raise RuntimeError(f"{name} is not on PATH and {install_env} is not set")
-    return found
-
-
-def _dedupe_private_func_declarations(path: Path) -> None:
-    seen: set[str] = set()
-    output: list[str] = []
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("aie.device("):
-            seen.clear()
-        if stripped.startswith("func.func private @"):
-            symbol = stripped.split("@", 1)[1].split("(", 1)[0]
-            if symbol in seen:
-                continue
-            seen.add(symbol)
-        output.append(line)
-    path.write_text("\n".join(output) + "\n")
 
 
 def run_on_npu(
@@ -229,13 +138,17 @@ def run_on_npu(
     try:
         for _ in range(warmup):
             output.fill(0)
-            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(expected_shape)
+            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(
+                expected_shape
+            )
             check_close_rocm(actual, expected, rtol=rtol, atol=atol)
 
         for _ in range(iterations):
             output.fill(0)
             start = time.perf_counter()
-            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(expected_shape)
+            actual = np.asarray(func(packed_rows, block_f16_scales, output)[2]).reshape(
+                expected_shape
+            )
             latencies_ms.append((time.perf_counter() - start) * 1000.0)
             check_close_rocm(actual, expected, rtol=rtol, atol=atol)
     finally:

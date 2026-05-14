@@ -12,11 +12,12 @@ import torch
 from air.backend.xrt import XRTBackend, XRTCompileArtifact
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
+from .air_runtime import compile_runtime
 from . import reference
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm
-from .run_embed_tokens import DEFAULT_GGUF, EmbedInputInfo, compile_runtime, parse_token_ids, prepare_inputs
+from .run_embed_tokens import DEFAULT_GGUF, EmbedInputInfo, parse_token_ids, prepare_inputs
 from .run_embed_tokens_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR
-from .run_pipeline import compile_rms_norm_object
+from .stages.embed_norm import compile_rms_norm_object
 
 
 @dataclass(frozen=True, slots=True)

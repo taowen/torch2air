@@ -14,11 +14,11 @@ from air.backend.xrt import XRTBackend, XRTCompileArtifact
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
+from .air_runtime import compile_runtime
 from .reference_runtime import check_close_rocm, first_values, max_abs_rocm, rmsnorm_rocm
 from .run_embed_tokens import (
     DEFAULT_GGUF,
     EmbedInputInfo,
-    compile_runtime,
     parse_token_ids,
     prepare_inputs,
     token_ids_array,
@@ -61,7 +61,9 @@ def prepare_fused_inputs(
     rms_weight = np.frombuffer(payload, dtype=np.float32).copy()
 
     if blocks_per_row == embed_info.model_blocks_per_row:
-        expected = reference.run_embed_tokens_input_layernorm(input_ids=token_ids_array(token_ids))["mul_1"]
+        expected = reference.run_embed_tokens_input_layernorm(input_ids=token_ids_array(token_ids))[
+            "mul_1"
+        ]
         expected = expected.reshape(len(token_ids), hidden_size)
     else:
         layernorm = reference._input_layernorm(reference.get_model())

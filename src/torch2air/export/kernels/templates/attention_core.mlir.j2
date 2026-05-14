@@ -3,7 +3,7 @@
 // Stage: {{ stage_name }}
 // Source aten targets: {{ aten_targets | join(", ") }}
 // Official-style AIR external kernel:
-// - AIR owns q-block/kv-block tiling and L3<->L1 channel movement.
+// - AIR owns q-head/q-block/kv-block tiling and L3<->L1 channel movement.
 // - attention_core.o owns online-softmax updates for one Q row and one K/V tile.
 
 module {
@@ -22,48 +22,56 @@ module {
       attributes {link_with = "attention_core.o", llvm.emit_c_interface}
 
   func.func @{{ stage_name }}(
-      %q: memref<{{ sequence_length }}x{{ head_dim }}xf32>,
-      %k: memref<{{ sequence_length }}x{{ head_dim }}xf32>,
-      %v: memref<{{ sequence_length }}x{{ head_dim }}xf32>,
-      %output: memref<{{ sequence_length }}x{{ head_dim }}xf32>) {
-    {% set index_constants = [0, 1, 2, sequence_length, head_dim, query_tile_rows, key_tile_rows] | unique | list | sort %}
+      %q: memref<{{ sequence_length }}x{{ q_total_dim }}xf32>,
+      %k: memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
+      %v: memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
+      %output: memref<{{ sequence_length }}x{{ q_total_dim }}xf32>) {
+    {% set index_constants = [0, 1, 2, sequence_length, head_dim, q_total_dim, kv_total_dim, query_tile_rows, key_tile_rows] | unique | list | sort %}
     {% for value in index_constants %}
     %idx{{ value }} = arith.constant {{ value }} : index
     {% endfor %}
 
     air.launch (%launch_i, %launch_j) in (%launch_s_i=%idx1, %launch_s_j=%idx1)
         args(%launch_q=%q, %launch_k=%k, %launch_v=%v, %launch_output=%output)
-        : memref<{{ sequence_length }}x{{ head_dim }}xf32>,
-          memref<{{ sequence_length }}x{{ head_dim }}xf32>,
-          memref<{{ sequence_length }}x{{ head_dim }}xf32>,
-          memref<{{ sequence_length }}x{{ head_dim }}xf32> {
-      {% for value in index_constants %}
+        : memref<{{ sequence_length }}x{{ q_total_dim }}xf32>,
+          memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
+          memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>,
+          memref<{{ sequence_length }}x{{ q_total_dim }}xf32> {
+      {% set launch_index_constants = [
+        0, 1, sequence_length, head_dim, q_total_dim, kv_total_dim,
+        query_tile_rows, key_tile_rows, q_heads, q_heads_per_kv_head
+      ] | unique | list | sort %}
+      {% for value in launch_index_constants %}
       %lidx{{ value }} = arith.constant {{ value }} : index
       {% endfor %}
-
+      scf.for %q_head = %lidx0 to %lidx{{ q_heads }} step %lidx1 {
+        %q_col = arith.muli %q_head, %lidx{{ head_dim }} : index
+        %kv_head = arith.divui %q_head, %lidx{{ q_heads_per_kv_head }} : index
+        %kv_col = arith.muli %kv_head, %lidx{{ head_dim }} : index
       scf.for %q_put_block = %lidx0 to %lidx{{ sequence_length }} step %lidx{{ query_tile_rows }} {
         air.channel.put @attention_q[]
-            (%launch_q[%q_put_block, %lidx0]
+            (%launch_q[%q_put_block, %q_col]
              [%lidx{{ query_tile_rows }}, %lidx{{ head_dim }}]
-             [%lidx{{ head_dim }}, %lidx1])
-            : (memref<{{ sequence_length }}x{{ head_dim }}xf32>)
+             [%lidx{{ q_total_dim }}, %lidx1])
+            : (memref<{{ sequence_length }}x{{ q_total_dim }}xf32>)
         scf.for %kv_put_block = %lidx0 to %lidx{{ sequence_length }} step %lidx{{ key_tile_rows }} {
           air.channel.put @attention_kv[]
-              (%launch_k[%kv_put_block, %lidx0]
+              (%launch_k[%kv_put_block, %kv_col]
                [%lidx{{ key_tile_rows }}, %lidx{{ head_dim }}]
-               [%lidx{{ head_dim }}, %lidx1])
-              : (memref<{{ sequence_length }}x{{ head_dim }}xf32>)
+               [%lidx{{ kv_total_dim }}, %lidx1])
+              : (memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>)
           air.channel.put @attention_kv[]
-              (%launch_v[%kv_put_block, %lidx0]
+              (%launch_v[%kv_put_block, %kv_col]
                [%lidx{{ key_tile_rows }}, %lidx{{ head_dim }}]
-               [%lidx{{ head_dim }}, %lidx1])
-              : (memref<{{ sequence_length }}x{{ head_dim }}xf32>)
+               [%lidx{{ kv_total_dim }}, %lidx1])
+              : (memref<{{ sequence_length }}x{{ kv_total_dim }}xf32>)
         }
         air.channel.get @attention_output[]
-            (%launch_output[%q_put_block, %lidx0]
+            (%launch_output[%q_put_block, %q_col]
              [%lidx{{ query_tile_rows }}, %lidx{{ head_dim }}]
-             [%lidx{{ head_dim }}, %lidx1])
-            : (memref<{{ sequence_length }}x{{ head_dim }}xf32>)
+             [%lidx{{ q_total_dim }}, %lidx1])
+            : (memref<{{ sequence_length }}x{{ q_total_dim }}xf32>)
+      }
       }
 
       air.segment @attention_core_segment {
@@ -75,9 +83,9 @@ module {
           %hidx1 = arith.constant 1 : index
           %hidx2 = arith.constant 2 : index
           %hseq = arith.constant {{ sequence_length }} : index
-          %hhead = arith.constant {{ head_dim }} : index
           %hq = arith.constant {{ query_tile_rows }} : index
           %hkv = arith.constant {{ key_tile_rows }} : index
+          %hheads = arith.constant {{ q_heads }} : index
 
           %meta_l1 = memref.alloc() : memref<3xi32, 2 : i32>
           %q_l1 = memref.alloc() : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
@@ -87,6 +95,7 @@ module {
           %row_sum_l1 = memref.alloc() : memref<{{ query_tile_rows }}xf32, 2 : i32>
           %out_l1 = memref.alloc() : memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>
 
+          scf.for %head_i = %hidx0 to %hheads step %hidx1 {
           scf.for %q_block = %hidx0 to %hseq step %hq {
             %q_block_i32 = arith.index_cast %q_block : index to i32
             memref.store %q_block_i32, %meta_l1[%hidx0] : memref<3xi32, 2 : i32>
@@ -124,6 +133,7 @@ module {
             air.channel.put @attention_output[]
                 (%out_l1[] [] [])
                 : (memref<{{ query_tile_rows }}x{{ head_dim }}xf32, 2 : i32>)
+          }
           }
 
           memref.dealloc %meta_l1 : memref<3xi32, 2 : i32>

@@ -21,6 +21,7 @@ from torch2air.weights.gguf import load_gguf_index
 DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf")
 DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 ATTENTION_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
+SELF_ATTN_LINEAR_NAMES = (*ATTENTION_PROJ_NAMES, "o_proj")
 NORM_ROPE_NAMES = ("q_norm_rope", "k_norm_rope")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 
@@ -39,15 +40,20 @@ class EmbedTokensInputLayerNorm(torch.nn.Module):
 
 
 class RMSNormRope(torch.nn.Module):
-    def __init__(self, norm: torch.nn.Module) -> None:
+    def __init__(self, norm: torch.nn.Module, head_count: int, head_dim: int) -> None:
         super().__init__()
         self.norm = norm
+        self.head_count = head_count
+        self.head_dim = head_dim
 
     def forward(self, input: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        normed = self.norm(input)
-        half_dim = normed.shape[-1] // 2
+        leading_shape = input.shape[:-1]
+        heads = input.reshape(*leading_shape, self.head_count, self.head_dim)
+        normed = self.norm(heads)
+        half_dim = self.head_dim // 2
         rotated = torch.cat((-normed[..., half_dim:], normed[..., :half_dim]), dim=-1)
-        return normed * cos + rotated * sin
+        output = normed * cos.unsqueeze(-2) + rotated * sin.unsqueeze(-2)
+        return output.reshape(*leading_shape, self.head_count * self.head_dim)
 
 
 def export_one(
@@ -209,7 +215,7 @@ def export_input_layernorm(
     )
 
 
-def export_attention_proj(
+def export_self_attn_linear(
     *,
     proj_name: str,
     model_id: str,
@@ -219,23 +225,32 @@ def export_attention_proj(
     output_rows_override: int | None = None,
     output_tile_rows: int = 32,
 ) -> None:
-    if proj_name not in ATTENTION_PROJ_NAMES:
-        raise ValueError(f"proj_name must be one of {ATTENTION_PROJ_NAMES}, got {proj_name!r}")
+    if proj_name not in SELF_ATTN_LINEAR_NAMES:
+        raise ValueError(f"proj_name must be one of {SELF_ATTN_LINEAR_NAMES}, got {proj_name!r}")
     config = AutoConfig.from_pretrained(model_id, local_files_only=True)
     model_hidden_size = int(config.hidden_size)
     if model_hidden_size % 256 != 0:
         raise ValueError(f"Q4_K hidden_size must be divisible by 256, got {model_hidden_size}")
-    blocks_per_row = model_hidden_size // 256
     with torch.device("meta"):
         model = Qwen3ForCausalLM(config)
     module = getattr(model.model.layers[0].self_attn, proj_name)
+    proj_input_size = int(module.in_features)
     proj_output_size = int(module.out_features)
-    output_rows = output_rows_override or 128
+    if proj_input_size % 256 != 0:
+        raise ValueError(f"{proj_name} input size must be divisible by 256, got {proj_input_size}")
+    blocks_per_row = proj_input_size // 256
+    output_rows = output_rows_override or (128 if proj_name in ATTENTION_PROJ_NAMES else proj_output_size)
     if output_rows <= 0 or output_rows > proj_output_size:
         raise ValueError(f"output_rows must be in [1, {proj_output_size}], got {output_rows}")
     if output_tile_rows <= 0 or output_rows % output_tile_rows != 0:
         raise ValueError(
             f"output_tile_rows must be positive and divide output_rows={output_rows}, got {output_tile_rows}"
+        )
+    output_tiles = output_rows // output_tile_rows
+    output_parallel_tiles = min(4, output_tiles)
+    if output_tiles % output_parallel_tiles != 0:
+        raise ValueError(
+            f"output_tiles={output_tiles} must be divisible by output_parallel_tiles={output_parallel_tiles}"
         )
     tensor_name = f"model.layers.0.self_attn.{proj_name}.weight"
     tensor_entry = load_gguf_index(gguf_path).tensors[tensor_name]
@@ -250,7 +265,7 @@ def export_attention_proj(
     export_one(
         f"run_{proj_name}",
         module,
-        args=(torch.zeros((1, sequence_length, model_hidden_size), dtype=torch.float32, device="meta"),),
+        args=(torch.zeros((1, sequence_length, proj_input_size), dtype=torch.float32, device="meta"),),
         output_dir=output_dir,
         template_dir=KERNEL_TEMPLATE_DIR,
         weight_prefix=f"model.layers.0.self_attn.{proj_name}.",
@@ -260,16 +275,41 @@ def export_attention_proj(
             "proj_name": proj_name,
             "ggml_type": tensor_entry.ggml_type,
             "blocks_per_row": blocks_per_row,
-            "hidden_size": model_hidden_size,
+            "hidden_size": proj_input_size,
             "model_hidden_size": model_hidden_size,
             "output_rows": output_rows,
             "output_tile_rows": output_tile_rows,
-            "output_tiles": output_rows // output_tile_rows,
+            "output_tile_groups": output_tiles // output_parallel_tiles,
+            "output_tiles": output_tiles,
+            "output_parallel_tiles": output_parallel_tiles,
             "proj_output_size": proj_output_size,
             "row_words": blocks_per_row * 36,
             "weight_words": weight_words,
             "sequence_length": sequence_length,
         },
+    )
+
+
+def export_attention_proj(
+    *,
+    proj_name: str,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+    gguf_path: Path = DEFAULT_GGUF,
+    output_rows_override: int | None = None,
+    output_tile_rows: int = 32,
+) -> None:
+    if proj_name not in ATTENTION_PROJ_NAMES:
+        raise ValueError(f"proj_name must be one of {ATTENTION_PROJ_NAMES}, got {proj_name!r}")
+    export_self_attn_linear(
+        proj_name=proj_name,
+        model_id=model_id,
+        output_dir=output_dir,
+        sequence_length=sequence_length,
+        gguf_path=gguf_path,
+        output_rows_override=output_rows_override,
+        output_tile_rows=output_tile_rows,
     )
 
 
@@ -322,21 +362,25 @@ def export_norm_rope(
     model_id: str,
     output_dir: Path,
     sequence_length: int,
+    q_heads: int,
+    kv_heads: int,
 ) -> None:
     if norm_name not in NORM_ROPE_NAMES:
         raise ValueError(f"norm_name must be one of {NORM_ROPE_NAMES}, got {norm_name!r}")
     config = AutoConfig.from_pretrained(model_id, local_files_only=True)
     head_dim = _head_dim(config)
+    head_count = q_heads if norm_name == "q_norm_rope" else kv_heads
+    total_dim = head_count * head_dim
     with torch.device("meta"):
         model = Qwen3ForCausalLM(config)
         attn = model.model.layers[0].self_attn
         norm = cast(torch.nn.Module, getattr(attn, "q_norm" if norm_name == "q_norm_rope" else "k_norm"))
-        module = RMSNormRope(norm)
+        module = RMSNormRope(norm, head_count=head_count, head_dim=head_dim)
     export_one(
         f"run_{norm_name}",
         module,
         args=(
-            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
+            torch.zeros((1, sequence_length, total_dim), dtype=torch.float32, device="meta"),
             torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
             torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
         ),
@@ -346,9 +390,11 @@ def export_norm_rope(
         shape_exprs={sequence_length: "sequence_length"},
         template_name="rms_norm_rope.mlir.j2",
         context={
+            "head_count": head_count,
             "head_dim": head_dim,
             "rms_norm_eps": float(config.rms_norm_eps),
             "sequence_length": sequence_length,
+            "total_dim": total_dim,
         },
     )
 
@@ -360,6 +406,8 @@ def export_attention_core(
     sequence_length: int,
     query_tile_rows: int,
     key_tile_rows: int,
+    q_heads: int,
+    kv_heads: int,
 ) -> None:
     config = AutoConfig.from_pretrained(model_id, local_files_only=True)
     head_dim = _head_dim(config)
@@ -371,6 +419,10 @@ def export_attention_core(
         raise ValueError(f"sequence_length={sequence_length} must be divisible by key_tile_rows={key_tile_rows}")
     if key_tile_rows != 4:
         raise ValueError("attention_core currently uses key_tile_rows=4")
+    if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
+        raise ValueError(f"q_heads={q_heads} must be a positive multiple of kv_heads={kv_heads}")
+    q_total_dim = q_heads * head_dim
+    kv_total_dim = kv_heads * head_dim
     render_to_file(
         KERNEL_TEMPLATE_DIR,
         "attention_core.mlir.j2",
@@ -382,6 +434,11 @@ def export_attention_core(
         aten_targets=[],
         head_dim=head_dim,
         key_tile_rows=key_tile_rows,
+        kv_heads=kv_heads,
+        kv_total_dim=kv_total_dim,
+        q_heads=q_heads,
+        q_heads_per_kv_head=q_heads // kv_heads,
+        q_total_dim=q_total_dim,
         query_tile_rows=query_tile_rows,
         sequence_length=sequence_length,
     )
@@ -444,12 +501,13 @@ def export_reference_module(
             "_EmbedTokensInputLayerNorm(root)",
         ),
     ]
-    for proj_name in ATTENTION_PROJ_NAMES:
+    for proj_name in SELF_ATTN_LINEAR_NAMES:
+        module = getattr(model.model.layers[0].self_attn, proj_name)
         exports.append(
             (
                 proj_name,
-                getattr(model.model.layers[0].self_attn, proj_name),
-                (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
+                module,
+                (torch.zeros((1, sequence_length, int(module.in_features)), dtype=torch.float32, device="meta"),),
                 None,
                 f"_attention_proj(root, {proj_name!r})",
             )
@@ -505,6 +563,7 @@ def main() -> int:
             "q_proj",
             "k_proj",
             "v_proj",
+            "o_proj",
             "rope_table",
             "q_norm_rope",
             "k_norm_rope",
@@ -550,6 +609,8 @@ def main() -> int:
         default=4,
         help="attention_core K/V rows per tile.",
     )
+    parser.add_argument("--q-heads", type=int, default=1)
+    parser.add_argument("--kv-heads", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -603,6 +664,16 @@ def main() -> int:
             output_rows_override=args.output_rows,
             output_tile_rows=args.output_tile_rows,
         )
+    elif args.stage == "o_proj":
+        export_self_attn_linear(
+            proj_name=args.stage,
+            model_id=args.model_id,
+            gguf_path=args.gguf,
+            output_dir=args.output_dir,
+            sequence_length=args.sequence_length,
+            output_rows_override=args.output_rows,
+            output_tile_rows=args.output_tile_rows,
+        )
     elif args.stage == "rope_table":
         export_rope_table(
             model_id=args.model_id,
@@ -615,6 +686,8 @@ def main() -> int:
             model_id=args.model_id,
             output_dir=args.output_dir,
             sequence_length=args.sequence_length,
+            q_heads=args.q_heads,
+            kv_heads=args.kv_heads,
         )
     elif args.stage == "attention_core":
         export_attention_core(
@@ -623,6 +696,8 @@ def main() -> int:
             sequence_length=args.sequence_length,
             query_tile_rows=args.query_tile_rows,
             key_tile_rows=args.key_tile_rows,
+            q_heads=args.q_heads,
+            kv_heads=args.kv_heads,
         )
     export_reference_module(
         model_id=args.model_id,

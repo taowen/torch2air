@@ -14,10 +14,18 @@ NPU_WARMUP="${NPU_WARMUP:-0}"
 NPU_ITERATIONS="${NPU_ITERATIONS:-1}"
 RMS_NORM_EPS="${RMS_NORM_EPS:-0.000001}"
 OUTPUT_ROWS="${OUTPUT_ROWS:-128}"
+QPROJ_OUTPUT_ROWS="${QPROJ_OUTPUT_ROWS:-}"
+KPROJ_OUTPUT_ROWS="${KPROJ_OUTPUT_ROWS:-}"
+VPROJ_OUTPUT_ROWS="${VPROJ_OUTPUT_ROWS:-}"
+OPROJ_OUTPUT_ROWS="${OPROJ_OUTPUT_ROWS:-}"
 OUTPUT_TILE_ROWS="${OUTPUT_TILE_ROWS:-32}"
+PROJECTION_SLICE_ROWS="${PROJECTION_SLICE_ROWS:-$((OUTPUT_TILE_ROWS * 4))}"
 START_POSITION="${START_POSITION:-0}"
 QUERY_TILE_ROWS="${QUERY_TILE_ROWS:-4}"
 KEY_TILE_ROWS="${KEY_TILE_ROWS:-4}"
+Q_HEADS="${Q_HEADS:-}"
+KV_HEADS="${KV_HEADS:-}"
+HEAD_DIM=128
 
 case "$PIPELINE_STAGE" in
   embed_norm|pipeline_embed_norm)
@@ -25,6 +33,7 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QKV=0
     INCLUDE_ROPE=0
     INCLUDE_ATTENTION=0
+    INCLUDE_OPROJ=0
     STEM="quantized_qwen3_pipeline_embed_norm"
     FUNC="run_pipeline_embed_norm"
     ;;
@@ -33,6 +42,7 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QKV=0
     INCLUDE_ROPE=0
     INCLUDE_ATTENTION=0
+    INCLUDE_OPROJ=0
     STEM="quantized_qwen3_pipeline_embed_norm_qproj"
     FUNC="run_pipeline_embed_norm_qproj"
     ;;
@@ -41,6 +51,7 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QKV=1
     INCLUDE_ROPE=0
     INCLUDE_ATTENTION=0
+    INCLUDE_OPROJ=0
     STEM="quantized_qwen3_pipeline_embed_norm_qkv"
     FUNC="run_pipeline_embed_norm_qkv"
     ;;
@@ -49,6 +60,7 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QKV=1
     INCLUDE_ROPE=1
     INCLUDE_ATTENTION=0
+    INCLUDE_OPROJ=0
     STEM="quantized_qwen3_pipeline_embed_norm_qkv_rope"
     FUNC="run_pipeline_embed_norm_qkv_rope"
     ;;
@@ -57,8 +69,18 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QKV=1
     INCLUDE_ROPE=1
     INCLUDE_ATTENTION=1
+    INCLUDE_OPROJ=0
     STEM="quantized_qwen3_pipeline_embed_norm_qkv_rope_attention"
     FUNC="run_pipeline_embed_norm_qkv_rope_attention"
+    ;;
+  self_attn|pipeline_self_attn)
+    INCLUDE_QPROJ=1
+    INCLUDE_QKV=1
+    INCLUDE_ROPE=1
+    INCLUDE_ATTENTION=1
+    INCLUDE_OPROJ=1
+    STEM="quantized_qwen3_pipeline_self_attn"
+    FUNC="run_pipeline_self_attn"
     ;;
   *)
     echo "Unknown quantized_qwen3 pipeline stage: $PIPELINE_STAGE" >&2
@@ -74,18 +96,56 @@ if [[ -z "$TOKEN_IDS" ]]; then
   fi
 fi
 
+if (( INCLUDE_OPROJ )); then
+  Q_HEADS="${Q_HEADS:-16}"
+  KV_HEADS="${KV_HEADS:-8}"
+  QPROJ_OUTPUT_ROWS="${QPROJ_OUTPUT_ROWS:-$((Q_HEADS * HEAD_DIM))}"
+  KPROJ_OUTPUT_ROWS="${KPROJ_OUTPUT_ROWS:-$((KV_HEADS * HEAD_DIM))}"
+  VPROJ_OUTPUT_ROWS="${VPROJ_OUTPUT_ROWS:-$((KV_HEADS * HEAD_DIM))}"
+  OPROJ_OUTPUT_ROWS="${OPROJ_OUTPUT_ROWS:-1024}"
+else
+  Q_HEADS="${Q_HEADS:-1}"
+  KV_HEADS="${KV_HEADS:-1}"
+  QPROJ_OUTPUT_ROWS="${QPROJ_OUTPUT_ROWS:-$OUTPUT_ROWS}"
+  KPROJ_OUTPUT_ROWS="${KPROJ_OUTPUT_ROWS:-$OUTPUT_ROWS}"
+  VPROJ_OUTPUT_ROWS="${VPROJ_OUTPUT_ROWS:-$OUTPUT_ROWS}"
+  OPROJ_OUTPUT_ROWS="${OPROJ_OUTPUT_ROWS:-1024}"
+fi
+
+projection_parallel_tiles() {
+  local output_rows="$1"
+  local output_tiles=$((output_rows / OUTPUT_TILE_ROWS))
+  if (( output_tiles < 4 )); then
+    echo "$output_tiles"
+  else
+    echo 4
+  fi
+}
+
 IFS=',' read -r -a _token_parts <<< "$TOKEN_IDS"
 TOKEN_COUNT="${TOKEN_COUNT:-${#_token_parts[@]}}"
 if [[ "$BLOCKS_PER_ROW" != "4" ]]; then
   echo "pipeline_embed_norm currently targets full hidden_size=1024, so BLOCKS_PER_ROW must be 4." >&2
   exit 2
 fi
-if (( INCLUDE_QPROJ && (OUTPUT_TILE_ROWS <= 0 || OUTPUT_ROWS % OUTPUT_TILE_ROWS != 0) )); then
-  echo "OUTPUT_TILE_ROWS must be positive and divide OUTPUT_ROWS." >&2
+if (( INCLUDE_QPROJ && (OUTPUT_TILE_ROWS <= 0 || PROJECTION_SLICE_ROWS <= 0 || PROJECTION_SLICE_ROWS % OUTPUT_TILE_ROWS != 0 || QPROJ_OUTPUT_ROWS % PROJECTION_SLICE_ROWS != 0) )); then
+  echo "PROJECTION_SLICE_ROWS must be positive, divisible by OUTPUT_TILE_ROWS, and divide QPROJ_OUTPUT_ROWS." >&2
   exit 2
 fi
-if (( INCLUDE_ROPE && OUTPUT_ROWS != 128 )); then
-  echo "q/k norm+RoPE currently validates one 128-wide Qwen3 attention head, so OUTPUT_ROWS must be 128." >&2
+if (( INCLUDE_QKV && (KPROJ_OUTPUT_ROWS % PROJECTION_SLICE_ROWS != 0 || VPROJ_OUTPUT_ROWS % PROJECTION_SLICE_ROWS != 0) )); then
+  echo "PROJECTION_SLICE_ROWS must divide KPROJ_OUTPUT_ROWS and VPROJ_OUTPUT_ROWS." >&2
+  exit 2
+fi
+if (( INCLUDE_OPROJ && OPROJ_OUTPUT_ROWS % PROJECTION_SLICE_ROWS != 0 )); then
+  echo "PROJECTION_SLICE_ROWS must divide OPROJ_OUTPUT_ROWS." >&2
+  exit 2
+fi
+if (( INCLUDE_ROPE && (QPROJ_OUTPUT_ROWS != Q_HEADS * HEAD_DIM || KPROJ_OUTPUT_ROWS != KV_HEADS * HEAD_DIM) )); then
+  echo "q/k norm+RoPE requires QPROJ_OUTPUT_ROWS=Q_HEADS*128 and KPROJ_OUTPUT_ROWS=KV_HEADS*128." >&2
+  exit 2
+fi
+if (( INCLUDE_ATTENTION && VPROJ_OUTPUT_ROWS != KV_HEADS * HEAD_DIM )); then
+  echo "attention_core requires VPROJ_OUTPUT_ROWS=KV_HEADS*128." >&2
   exit 2
 fi
 if (( INCLUDE_ATTENTION && (TOKEN_COUNT % QUERY_TILE_ROWS != 0 || TOKEN_COUNT % KEY_TILE_ROWS != 0) )); then
@@ -105,6 +165,7 @@ NORM_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_input_layernorm.ml
 QPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_proj.mlir"
 KPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_proj.mlir"
 VPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_v_proj.mlir"
+OPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_o_proj.mlir"
 ROPE_TABLE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_rope_table.mlir"
 Q_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_norm_rope.mlir"
 K_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_norm_rope.mlir"
@@ -121,22 +182,22 @@ if (( INCLUDE_QPROJ )); then
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
     --stage q_proj \
     --gguf "$GGUF_PATH" \
-    --sequence-length "$TOKEN_COUNT" \
-    --output-rows "$OUTPUT_ROWS" \
+    --sequence-length 1 \
+    --output-rows "$PROJECTION_SLICE_ROWS" \
     --output-tile-rows "$OUTPUT_TILE_ROWS"
 fi
 if (( INCLUDE_QKV )); then
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
     --stage k_proj \
     --gguf "$GGUF_PATH" \
-    --sequence-length "$TOKEN_COUNT" \
-    --output-rows "$OUTPUT_ROWS" \
+    --sequence-length 1 \
+    --output-rows "$PROJECTION_SLICE_ROWS" \
     --output-tile-rows "$OUTPUT_TILE_ROWS"
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
     --stage v_proj \
     --gguf "$GGUF_PATH" \
-    --sequence-length "$TOKEN_COUNT" \
-    --output-rows "$OUTPUT_ROWS" \
+    --sequence-length 1 \
+    --output-rows "$PROJECTION_SLICE_ROWS" \
     --output-tile-rows "$OUTPUT_TILE_ROWS"
 fi
 if (( INCLUDE_ROPE )); then
@@ -147,11 +208,15 @@ if (( INCLUDE_ROPE )); then
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
     --stage q_norm_rope \
     --gguf "$GGUF_PATH" \
-    --sequence-length "$TOKEN_COUNT"
+    --sequence-length "$TOKEN_COUNT" \
+    --q-heads "$Q_HEADS" \
+    --kv-heads "$KV_HEADS"
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
     --stage k_norm_rope \
     --gguf "$GGUF_PATH" \
-    --sequence-length "$TOKEN_COUNT"
+    --sequence-length "$TOKEN_COUNT" \
+    --q-heads "$Q_HEADS" \
+    --kv-heads "$KV_HEADS"
 fi
 if (( INCLUDE_ATTENTION )); then
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
@@ -159,7 +224,17 @@ if (( INCLUDE_ATTENTION )); then
     --gguf "$GGUF_PATH" \
     --sequence-length "$TOKEN_COUNT" \
     --query-tile-rows "$QUERY_TILE_ROWS" \
-    --key-tile-rows "$KEY_TILE_ROWS"
+    --key-tile-rows "$KEY_TILE_ROWS" \
+    --q-heads "$Q_HEADS" \
+    --kv-heads "$KV_HEADS"
+fi
+if (( INCLUDE_OPROJ )); then
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage o_proj \
+    --gguf "$GGUF_PATH" \
+    --sequence-length 1 \
+    --output-rows "$PROJECTION_SLICE_ROWS" \
+    --output-tile-rows "$OUTPUT_TILE_ROWS"
 fi
 
 check_contains "$EMBED_MLIR" 'scf\.parallel' 'embed_tokens explicit tile loop'
@@ -183,7 +258,7 @@ compile_air_dma_fixture "$NORM_DMA" "${STEM}_input_layernorm"
 NORM_AIE="$AIE_IR"
 if (( INCLUDE_QPROJ )); then
   HERD_ROWS=1
-  HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
+  HERD_COLS="$(projection_parallel_tiles "$PROJECTION_SLICE_ROWS")"
   PROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
   check_contains "$QPROJ_MLIR" 'air\.launch' 'q_proj official AIR launch'
   check_contains "$QPROJ_MLIR" 'air\.herd' 'q_proj official AIR herd'
@@ -194,6 +269,7 @@ if (( INCLUDE_QPROJ )); then
   compile_air_dma_fixture "$QPROJ_MLIR" "${STEM}_q_proj"
   QPROJ_AIE="$AIE_IR"
   if (( INCLUDE_QKV )); then
+    HERD_COLS="$(projection_parallel_tiles "$PROJECTION_SLICE_ROWS")"
     check_contains "$KPROJ_MLIR" 'air\.launch' 'k_proj official AIR launch'
     check_contains "$KPROJ_MLIR" 'air\.herd' 'k_proj official AIR herd'
     check_contains "$KPROJ_MLIR" 'air\.dma_memcpy_nd' 'k_proj explicit AIR DMA'
@@ -203,6 +279,7 @@ if (( INCLUDE_QPROJ )); then
     compile_air_dma_fixture "$KPROJ_MLIR" "${STEM}_k_proj"
     KPROJ_AIE="$AIE_IR"
     VPROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 106))"
+    HERD_COLS="$(projection_parallel_tiles "$PROJECTION_SLICE_ROWS")"
     check_contains "$VPROJ_MLIR" 'air\.launch' 'v_proj official AIR launch'
     check_contains "$VPROJ_MLIR" 'air\.herd' 'v_proj official AIR herd'
     check_contains "$VPROJ_MLIR" 'air\.dma_memcpy_nd' 'v_proj explicit AIR DMA'
@@ -222,9 +299,12 @@ if (( INCLUDE_QPROJ )); then
       compile_air_dma_fixture "$ROPE_TABLE_MLIR" "${STEM}_rope_table"
       ROPE_TABLE_AIE="$AIE_IR"
 
+      HERD_ROWS=1
+      HERD_COLS=1
       check_contains "$Q_NORM_ROPE_MLIR" 'air\.launch' 'q_norm_rope official AIR launch'
       check_contains "$Q_NORM_ROPE_MLIR" 'air\.herd' 'q_norm_rope official AIR herd'
-      check_contains "$Q_NORM_ROPE_MLIR" 'air\.dma_memcpy_nd' 'q_norm_rope explicit AIR DMA'
+      check_contains "$Q_NORM_ROPE_MLIR" 'air\.channel\.put' 'q_norm_rope explicit AIR channel put'
+      check_contains "$Q_NORM_ROPE_MLIR" 'air\.channel\.get' 'q_norm_rope explicit AIR channel get'
       check_contains "$Q_NORM_ROPE_MLIR" 'func\.call @rms_norm_rope_tile' 'q_norm_rope external tile kernel call'
       check_contains "$Q_NORM_ROPE_MLIR" 'link_with = "rms_norm_rope\.o"' 'q_norm_rope external link object'
       compile_air_dma_fixture "$Q_NORM_ROPE_MLIR" "${STEM}_q_norm_rope"
@@ -232,13 +312,16 @@ if (( INCLUDE_QPROJ )); then
 
       check_contains "$K_NORM_ROPE_MLIR" 'air\.launch' 'k_norm_rope official AIR launch'
       check_contains "$K_NORM_ROPE_MLIR" 'air\.herd' 'k_norm_rope official AIR herd'
-      check_contains "$K_NORM_ROPE_MLIR" 'air\.dma_memcpy_nd' 'k_norm_rope explicit AIR DMA'
+      check_contains "$K_NORM_ROPE_MLIR" 'air\.channel\.put' 'k_norm_rope explicit AIR channel put'
+      check_contains "$K_NORM_ROPE_MLIR" 'air\.channel\.get' 'k_norm_rope explicit AIR channel get'
       check_contains "$K_NORM_ROPE_MLIR" 'func\.call @rms_norm_rope_tile' 'k_norm_rope external tile kernel call'
       check_contains "$K_NORM_ROPE_MLIR" 'link_with = "rms_norm_rope\.o"' 'k_norm_rope external link object'
       compile_air_dma_fixture "$K_NORM_ROPE_MLIR" "${STEM}_k_norm_rope"
       K_NORM_ROPE_AIE="$AIE_IR"
 
       if (( INCLUDE_ATTENTION )); then
+        HERD_ROWS=1
+        HERD_COLS=1
         check_contains "$ATTENTION_MLIR" 'air\.launch' 'attention_core official AIR launch'
         check_contains "$ATTENTION_MLIR" 'air\.herd' 'attention_core official AIR herd'
         check_contains "$ATTENTION_MLIR" 'air\.channel\.put' 'attention_core explicit AIR channel put'
@@ -249,6 +332,20 @@ if (( INCLUDE_QPROJ )); then
         check_contains "$ATTENTION_MLIR" 'link_with = "attention_core\.o"' 'attention_core external link object'
         compile_air_dma_fixture "$ATTENTION_MLIR" "${STEM}_attention_core"
         ATTENTION_AIE="$AIE_IR"
+      fi
+      if (( INCLUDE_OPROJ )); then
+        HERD_ROWS=1
+        HERD_COLS="$(projection_parallel_tiles "$PROJECTION_SLICE_ROWS")"
+        OPROJ_BLOCKS_PER_ROW="$((QPROJ_OUTPUT_ROWS / 256))"
+        OPROJ_WEIGHT_WORDS="$((OPROJ_BLOCKS_PER_ROW * 38))"
+        check_contains "$OPROJ_MLIR" 'air\.launch' 'o_proj official AIR launch'
+        check_contains "$OPROJ_MLIR" 'air\.herd' 'o_proj official AIR herd'
+        check_contains "$OPROJ_MLIR" 'air\.dma_memcpy_nd' 'o_proj explicit AIR DMA'
+        check_contains "$OPROJ_MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${OPROJ_WEIGHT_WORDS}xi32, 2" 'o_proj packed Q4_K weight L1 tile'
+        check_contains "$OPROJ_MLIR" 'func\.call @q4k_linear_tile' 'o_proj external Q4_K tile kernel call'
+        check_contains "$OPROJ_MLIR" 'link_with = "q4k_linear\.o"' 'o_proj external Q4_K link object'
+        compile_air_dma_fixture "$OPROJ_MLIR" "${STEM}_o_proj"
+        OPROJ_AIE="$AIE_IR"
       fi
     fi
   fi
@@ -287,7 +384,8 @@ RUNNER_ARGS=(
 if (( INCLUDE_QPROJ )); then
   RUNNER_ARGS+=(
     --qproj-aie-mlir "$QPROJ_AIE"
-    --output-rows "$OUTPUT_ROWS"
+    --output-rows "$QPROJ_OUTPUT_ROWS"
+    --qproj-output-rows "$QPROJ_OUTPUT_ROWS"
     --output-tile-rows "$OUTPUT_TILE_ROWS"
   )
 fi
@@ -295,6 +393,8 @@ if (( INCLUDE_QKV )); then
   RUNNER_ARGS+=(
     --kproj-aie-mlir "$KPROJ_AIE"
     --vproj-aie-mlir "$VPROJ_AIE"
+    --kproj-output-rows "$KPROJ_OUTPUT_ROWS"
+    --vproj-output-rows "$VPROJ_OUTPUT_ROWS"
   )
 fi
 if (( INCLUDE_ROPE )); then
@@ -303,6 +403,8 @@ if (( INCLUDE_ROPE )); then
     --q-norm-rope-aie-mlir "$Q_NORM_ROPE_AIE"
     --k-norm-rope-aie-mlir "$K_NORM_ROPE_AIE"
     --start-position "$START_POSITION"
+    --q-heads "$Q_HEADS"
+    --kv-heads "$KV_HEADS"
   )
 fi
 if (( INCLUDE_ATTENTION )); then
@@ -310,6 +412,12 @@ if (( INCLUDE_ATTENTION )); then
     --attention-aie-mlir "$ATTENTION_AIE"
     --query-tile-rows "$QUERY_TILE_ROWS"
     --key-tile-rows "$KEY_TILE_ROWS"
+  )
+fi
+if (( INCLUDE_OPROJ )); then
+  RUNNER_ARGS+=(
+    --oproj-aie-mlir "$OPROJ_AIE"
+    --oproj-output-rows "$OPROJ_OUTPUT_ROWS"
   )
 fi
 

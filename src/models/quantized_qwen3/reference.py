@@ -182,3 +182,16 @@ def run_v_proj(
         inputs={'input': input},
         output_bindings={'linear': 'linear'},
     )
+
+
+def run_o_proj(
+    *,
+    input: ReferenceInput,
+    model: Qwen3ForCausalLM | None = None,
+) -> ReferenceOutput:
+    root = get_model() if model is None else model
+    return _execute_module(
+        _attention_proj(root, 'o_proj'),
+        inputs={'input': input},
+        output_bindings={'linear': 'linear'},
+    )

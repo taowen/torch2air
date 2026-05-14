@@ -14,6 +14,7 @@ from air.backend.xrt import XRTBackend, XRTCompileArtifact
 from torch2air.weights.gguf import GGUFTensorEntry, load_gguf_index, read_tensor_bytes
 
 from . import reference
+from .air_runtime import compile_runtime, installed_tool
 from .reference_runtime import (
     check_close_rocm,
     first_values,
@@ -24,8 +25,6 @@ from .reference_runtime import (
 from .run_embed_tokens import (
     DEFAULT_GGUF,
     EmbedInputInfo,
-    compile_runtime,
-    installed_tool,
     parse_token_ids,
     prepare_inputs,
 )
@@ -156,9 +155,13 @@ def _prepare_q4_k_projection_weights(
     if selected.physical_dtype != "uint32" or len(selected.physical_shape) != 2:
         raise ValueError(f"Expected rank-2 uint32 Q4_K tensor, got {selected}")
     if int(selected.logical_shape[1]) != hidden_size:
-        raise ValueError(f"{selected.name} input size must be {hidden_size}, got {selected.logical_shape}")
+        raise ValueError(
+            f"{selected.name} input size must be {hidden_size}, got {selected.logical_shape}"
+        )
     if output_rows <= 0 or output_rows > int(selected.physical_shape[0]):
-        raise ValueError(f"output_rows must be in [1, {selected.physical_shape[0]}], got {output_rows}")
+        raise ValueError(
+            f"output_rows must be in [1, {selected.physical_shape[0]}], got {output_rows}"
+        )
 
     row_words = int(selected.physical_shape[1])
     if row_words % 36 != 0:
@@ -177,11 +180,7 @@ def _prepare_q4_k_projection_weights(
     raw_blocks = np.frombuffer(payload, dtype=np.uint8).reshape(output_rows * blocks_per_row, 144)
     block_scales = q4k_block_f16_scales_rocm(raw_blocks).reshape(output_rows, blocks_per_row, 2)
     scale_bits = (
-        block_scales.detach()
-        .cpu()
-        .numpy()
-        .reshape(output_rows, blocks_per_row * 2)
-        .view(np.int32)
+        block_scales.detach().cpu().numpy().reshape(output_rows, blocks_per_row * 2).view(np.int32)
     )
     packed_with_scales = np.concatenate([packed_weights, scale_bits], axis=1)
     return packed_with_scales, blocks_per_row
@@ -197,9 +196,13 @@ def _prepare_q6_k_projection_weights(
     if selected.physical_dtype != "uint16" or len(selected.physical_shape) != 2:
         raise ValueError(f"Expected rank-2 uint16 Q6_K tensor, got {selected}")
     if int(selected.logical_shape[1]) != hidden_size:
-        raise ValueError(f"{selected.name} input size must be {hidden_size}, got {selected.logical_shape}")
+        raise ValueError(
+            f"{selected.name} input size must be {hidden_size}, got {selected.logical_shape}"
+        )
     if output_rows <= 0 or output_rows > int(selected.physical_shape[0]):
-        raise ValueError(f"output_rows must be in [1, {selected.physical_shape[0]}], got {output_rows}")
+        raise ValueError(
+            f"output_rows must be in [1, {selected.physical_shape[0]}], got {output_rows}"
+        )
 
     row_halfwords = int(selected.physical_shape[1])
     if row_halfwords % 105 != 0:
@@ -214,7 +217,9 @@ def _prepare_q6_k_projection_weights(
         offset=0,
         size=output_rows * row_halfwords * 2,
     )
-    packed_halfwords = np.frombuffer(payload, dtype=np.uint16).copy().reshape(output_rows, row_halfwords)
+    packed_halfwords = (
+        np.frombuffer(payload, dtype=np.uint16).copy().reshape(output_rows, row_halfwords)
+    )
     raw_blocks = packed_halfwords.reshape(output_rows * blocks_per_row, 105)
     d_scales = q6k_block_f16_scales_rocm(raw_blocks).reshape(output_rows, blocks_per_row)
     scale_bits = d_scales.detach().cpu().numpy().view(np.int32).reshape(output_rows, blocks_per_row)
@@ -405,7 +410,9 @@ def run_on_npu(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a quantized_qwen3 attention projection on real NPU.")
+    parser = argparse.ArgumentParser(
+        description="Run a quantized_qwen3 attention projection on real NPU."
+    )
     parser.add_argument("--proj-name", choices=ATTENTION_PROJ_NAMES, default=DEFAULT_PROJ_NAME)
     parser.add_argument("--gguf", type=Path, default=DEFAULT_GGUF)
     parser.add_argument("--tensor", default=None)
