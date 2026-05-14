@@ -52,7 +52,7 @@ src/
       reference_runtime.py  # small ROCm check/debug helpers
       run.py                # thin CLI dispatch for model runners
       run_embed_tokens.py   # embed_tokens XRT execution and reference check
-      run_q_proj.py         # q_proj external-kernel XRT execution
+      run_q_proj.py         # attention projection external-kernel XRT execution
       generated/            # ignored generated files
 scripts/
   install-air-tools.sh
@@ -133,10 +133,11 @@ that into `air.launch`, `air.herd`, `air.dma_memcpy_nd`, channels, and AIE IR.
 Some kernels need the official AIR external-kernel style earlier than the
 pure-MLIR body is practical. In that case the exported artifact is still MLIR
 that owns the AIR launch/segment/herd shape and L3<->L1 DMA, while the native
-object owns only the tile-local compute body. `quantized_qwen3.q_proj` follows
-that pattern with `q4k_linear_tile`: the template emits direct AIR plus a
-private `func.func` carrying `link_with = "q4k_linear.o"`, and the Peano object
-lives under `torch2air.export.kernels`.
+object owns only the tile-local compute body. `quantized_qwen3` attention
+projections follow that pattern with `q4k_linear_tile` and `q6k_linear_tile`:
+the templates emit direct AIR plus private `func.func` declarations carrying
+`link_with = "q4k_linear.o"` or `link_with = "q6k_linear.o"`, and the Peano
+objects live under `torch2air.export.kernels`.
 
 Reusable operator bodies belong under `torch2air.export.kernels`. The model
 package chooses a stage and passes concrete Qwen3 shapes, tensor names, and
@@ -157,26 +158,27 @@ GGUF packed weights are real inputs to the AIR path. `torch2air.weights.gguf`
 owns reading GGUF metadata and packed byte ranges. The export path should record
 or reference GGUF tensor names only where needed by generated code.
 
-Do not host-dequantize Q4_K weight values for NPU execution. The NPU path should
-consume the packed blocks and decode the quantized values inside the generated
-tile body.
+Do not host-dequantize quantized weight values for NPU execution. The NPU path
+should consume packed GGUF blocks and decode quantized values inside the
+generated tile body.
 
-The current Q4_K runners have one temporary exception: the GGUF Q4_K block-level
-f16 values `d` and `dmin` are decoded on the host into small f32 side inputs
-(`block_f16_scales` for `embed_tokens`, appended sidecar words for `q_proj`).
-The NPU still reads real packed Q4_K blocks and decodes the per-subblock
-scale/min bytes and q4 nibbles. This keeps the tiled stages runnable while the
-AIE f16 scalar conversion issue is isolated. Remove this exception once
-f16-to-f32 lowering is validated.
+The current Q4_K/Q6_K runners have one temporary exception: block-level f16
+scale values are decoded on the host into small f32 side inputs
+(`block_f16_scales` for `embed_tokens`, appended sidecar words for attention
+projection kernels). The NPU still reads real packed Q4_K/Q6_K quantized values
+and decodes subblock scales/mins and q nibbles/bits in the tile body. The Q6_K
+path also temporarily widens GGUF halfwords to i32 words for the external kernel
+ABI. Remove these exceptions once f16 scalar conversion and compact i16 L1 DMA
+are validated.
 
 Host-side full dequantization is allowed only for debug checks or focused tests.
 For `quantized_qwen3` runners, the default reference path is generated from the
 same `torch.export` boundaries used by the stage exporter. `reference.py` loads
 the local `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
 `run_embed_tokens`, `run_input_layernorm`, `run_embed_tokens_input_layernorm`,
-and `run_q_proj`. Expected tensors, `allclose`, and max-abs reporting are
-computed with torch tensors on the ROCm device. NumPy is only used to slice GGUF
-bytes and pass host buffers to XRT.
+`run_q_proj`, `run_k_proj`, and `run_v_proj`. Expected tensors, `allclose`, and
+max-abs reporting are computed with torch tensors on the ROCm device. NumPy is
+only used to slice GGUF bytes and pass host buffers to XRT.
 
 ## Operator Handoff
 
@@ -199,11 +201,12 @@ the stitched module currently overflows AIE program memory for the full Q4_K
 embedding body, so the runnable path remains separate xclbins with a shared BO
 until the ELF binding or a smaller embedded body is available.
 
-`embed_tokens -> input_layernorm -> q_proj` extends the same runnable boundary:
-three stage xclbins share pyxrt BOs for the hidden and normalized-hidden
-memrefs. This is intentionally close to the torch2vk model: separate compiled
-programs can hand off through device buffers without inventing a torch2air
-runtime object.
+`embed_tokens -> input_layernorm -> q/k/v` extends the same runnable boundary:
+stage xclbins share pyxrt BOs for the hidden and normalized-hidden memrefs. The
+q/k/v projections run sequentially from the same normalized-hidden BO and write
+separate output BOs. This is intentionally close to the torch2vk model: separate
+compiled programs can hand off through device buffers without inventing a
+torch2air runtime object.
 
 When two adjacent operators can be fused without changing the schedule shape,
 keep that as an explicit experiment. The current
@@ -242,7 +245,7 @@ Initial useful milestone:
 - Traverse the returned `ExportedProgram` directly.
 - Render one concrete file from the traversed nodes.
 - That file is a tiled `.mlir` file consumed by `air-opt`.
-- Keep Q4_K packed weight handling tied to real GGUF tensor metadata.
+- Keep quantized packed weight handling tied to real GGUF tensor metadata.
 
 Only broaden from there once the simple path produces a real artifact that the
 next compile/run step can consume.
@@ -254,7 +257,7 @@ next compile/run step can consume.
 - No export manifest layer.
 - No AirRegistry/AirVariant abstraction.
 - No pyxrt runtime wrapper.
-- No host-side Q4_K dequantization in the NPU execution path.
+- No host-side quantized weight dequantization in the NPU execution path.
 - No IREE `vmfb` path for this project.
 
 The working rule is: direct `export_one(...)`, direct PyTorch graph traversal,

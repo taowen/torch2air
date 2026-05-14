@@ -13,10 +13,12 @@ from torch2air.export import (
     render_to_file,
 )
 from torch2air.export.kernels import TEMPLATE_DIR as KERNEL_TEMPLATE_DIR
+from torch2air.weights.gguf import load_gguf_index
 
 
 DEFAULT_GGUF = Path("/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf")
 DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
+ATTENTION_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
 TEMPLATE_DIR = Path(__file__).with_name("templates")
 
 
@@ -189,50 +191,87 @@ def export_input_layernorm(
     )
 
 
-def export_q_proj(
+def export_attention_proj(
     *,
+    proj_name: str,
     model_id: str,
     output_dir: Path,
     sequence_length: int,
+    gguf_path: Path = DEFAULT_GGUF,
     output_rows_override: int | None = None,
     output_tile_rows: int = 16,
 ) -> None:
+    if proj_name not in ATTENTION_PROJ_NAMES:
+        raise ValueError(f"proj_name must be one of {ATTENTION_PROJ_NAMES}, got {proj_name!r}")
     config = AutoConfig.from_pretrained(model_id, local_files_only=True)
     model_hidden_size = int(config.hidden_size)
     if model_hidden_size % 256 != 0:
         raise ValueError(f"Q4_K hidden_size must be divisible by 256, got {model_hidden_size}")
     blocks_per_row = model_hidden_size // 256
-    q_proj_output_size = int(config.num_attention_heads) * int(config.head_dim)
+    with torch.device("meta"):
+        model = Qwen3ForCausalLM(config)
+    module = getattr(model.model.layers[0].self_attn, proj_name)
+    proj_output_size = int(module.out_features)
     output_rows = output_rows_override or 64
-    if output_rows <= 0 or output_rows > q_proj_output_size:
-        raise ValueError(f"output_rows must be in [1, {q_proj_output_size}], got {output_rows}")
+    if output_rows <= 0 or output_rows > proj_output_size:
+        raise ValueError(f"output_rows must be in [1, {proj_output_size}], got {output_rows}")
     if output_tile_rows <= 0 or output_rows % output_tile_rows != 0:
         raise ValueError(
             f"output_tile_rows must be positive and divide output_rows={output_rows}, got {output_tile_rows}"
         )
-    with torch.device("meta"):
-        model = Qwen3ForCausalLM(config)
+    tensor_name = f"model.layers.0.self_attn.{proj_name}.weight"
+    tensor_entry = load_gguf_index(gguf_path).tensors[tensor_name]
+    if tensor_entry.ggml_type == "Q4_K":
+        template_name = "q4k_linear.mlir.j2"
+        weight_words = blocks_per_row * 38
+    elif tensor_entry.ggml_type == "Q6_K":
+        template_name = "q6k_linear.mlir.j2"
+        weight_words = blocks_per_row * 106
+    else:
+        raise ValueError(f"{tensor_name} is {tensor_entry.ggml_type}, not Q4_K or Q6_K")
     export_one(
-        "run_q_proj",
-        model.model.layers[0].self_attn.q_proj,
+        f"run_{proj_name}",
+        module,
         args=(torch.zeros((1, sequence_length, model_hidden_size), dtype=torch.float32, device="meta"),),
         output_dir=output_dir,
         template_dir=KERNEL_TEMPLATE_DIR,
-        weight_prefix="model.layers.0.self_attn.q_proj.",
+        weight_prefix=f"model.layers.0.self_attn.{proj_name}.",
         shape_exprs={sequence_length: "sequence_length"},
-        template_name="q4k_linear.mlir.j2",
+        template_name=template_name,
         context={
+            "proj_name": proj_name,
+            "ggml_type": tensor_entry.ggml_type,
             "blocks_per_row": blocks_per_row,
             "hidden_size": model_hidden_size,
             "model_hidden_size": model_hidden_size,
             "output_rows": output_rows,
             "output_tile_rows": output_tile_rows,
             "output_tiles": output_rows // output_tile_rows,
-            "q_proj_output_size": q_proj_output_size,
+            "proj_output_size": proj_output_size,
             "row_words": blocks_per_row * 36,
-            "weight_words": blocks_per_row * 38,
+            "weight_words": weight_words,
             "sequence_length": sequence_length,
         },
+    )
+
+
+def export_q_proj(
+    *,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+    gguf_path: Path = DEFAULT_GGUF,
+    output_rows_override: int | None = None,
+    output_tile_rows: int = 16,
+) -> None:
+    export_attention_proj(
+        proj_name="q_proj",
+        model_id=model_id,
+        gguf_path=gguf_path,
+        output_dir=output_dir,
+        sequence_length=sequence_length,
+        output_rows_override=output_rows_override,
+        output_tile_rows=output_tile_rows,
     )
 
 
@@ -291,14 +330,17 @@ def export_reference_module(
             None,
             "_EmbedTokensInputLayerNorm(root)",
         ),
-        (
-            "q_proj",
-            model.model.layers[0].self_attn.q_proj,
-            (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
-            None,
-            "root.model.layers[0].self_attn.q_proj",
-        ),
     ]
+    for proj_name in ATTENTION_PROJ_NAMES:
+        exports.append(
+            (
+                proj_name,
+                getattr(model.model.layers[0].self_attn, proj_name),
+                (torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),),
+                None,
+                f"root.model.layers[0].self_attn.{proj_name}",
+            )
+        )
     reference_functions: list[str] = []
     for name, module, args, kwargs, module_expr in exports:
         program = torch.export.export(module, args, kwargs=kwargs, strict=False)
@@ -341,6 +383,8 @@ def main() -> int:
             "embed_tokens_input_layernorm",
             "pipeline_embed_norm",
             "q_proj",
+            "k_proj",
+            "v_proj",
         ],
         default="embed_tokens",
     )
@@ -362,7 +406,7 @@ def main() -> int:
         "--output-rows",
         type=int,
         default=None,
-        help="Q4_K linear output rows to export; q_proj defaults to 64.",
+        help="Q4_K attention projection output rows to export; defaults to 64.",
     )
     parser.add_argument(
         "--output-tile-rows",
@@ -413,9 +457,11 @@ def main() -> int:
             sequence_length=args.sequence_length,
             blocks_per_row_override=args.blocks_per_row,
         )
-    elif args.stage == "q_proj":
-        export_q_proj(
+    elif args.stage in ATTENTION_PROJ_NAMES:
+        export_attention_proj(
+            proj_name=args.stage,
             model_id=args.model_id,
+            gguf_path=args.gguf,
             output_dir=args.output_dir,
             sequence_length=args.sequence_length,
             output_rows_override=args.output_rows,

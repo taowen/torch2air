@@ -125,3 +125,29 @@ def run_q_proj(
         inputs={'input': input},
         output_bindings={'linear': 'linear'},
     )
+
+
+def run_k_proj(
+    *,
+    input: ReferenceInput,
+    model: torch.nn.Module | None = None,
+) -> ReferenceOutput:
+    root = get_model() if model is None else model
+    return _execute_module(
+        root.model.layers[0].self_attn.k_proj,
+        inputs={'input': input},
+        output_bindings={'linear': 'linear'},
+    )
+
+
+def run_v_proj(
+    *,
+    input: ReferenceInput,
+    model: torch.nn.Module | None = None,
+) -> ReferenceOutput:
+    root = get_model() if model is None else model
+    return _execute_module(
+        root.model.layers[0].self_attn.v_proj,
+        inputs={'input': input},
+        output_bindings={'linear': 'linear'},
+    )

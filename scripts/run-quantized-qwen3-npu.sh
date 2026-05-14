@@ -37,13 +37,13 @@ case "$STAGE" in
     RUNNER_MODULE="models.quantized_qwen3.run_embed_tokens_input_layernorm"
     DEFAULT_HERD_COLS="1"
     ;;
-  q_proj)
+  q_proj|k_proj|v_proj)
     if (( OUTPUT_TILE_ROWS <= 0 || OUTPUT_ROWS % OUTPUT_TILE_ROWS != 0 )); then
       echo "OUTPUT_TILE_ROWS must be positive and divide OUTPUT_ROWS." >&2
       exit 2
     fi
-    STEM="quantized_qwen3_q_proj"
-    FUNC="run_q_proj"
+    STEM="quantized_qwen3_${STAGE}"
+    FUNC="run_${STAGE}"
     RUNNER_MODULE="models.quantized_qwen3.run_q_proj"
     DEFAULT_HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
     ;;
@@ -75,12 +75,12 @@ EXPORT_ARGS=(
   --sequence-length "$TOKEN_COUNT" \
   --blocks-per-row "$BLOCKS_PER_ROW"
 )
-if [[ "$STAGE" == "q_proj" ]]; then
+if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then
   EXPORT_ARGS+=(--output-rows "$OUTPUT_ROWS" --output-tile-rows "$OUTPUT_TILE_ROWS")
 fi
 "$ROOT_DIR/scripts/export-quantized-qwen3.sh" "${EXPORT_ARGS[@]}"
 
-if [[ "$STAGE" == "q_proj" ]]; then
+if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then
   check_contains "$MLIR" 'air\.launch' 'official AIR launch in exported MLIR'
   check_contains "$MLIR" 'air\.segment' 'official AIR segment in exported MLIR'
 else
@@ -95,16 +95,24 @@ fi
 if [[ "$STAGE" == "input_layernorm" || "$STAGE" == "embed_tokens_input_layernorm" ]]; then
   check_contains "$MLIR" 'math\.rsqrt' 'RMSNorm inverse square root in fused MLIR'
 fi
-if [[ "$STAGE" == "q_proj" ]]; then
-  Q_PROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
-  check_contains "$MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${Q_PROJ_WEIGHT_WORDS}xi32, 2" 'packed Q4_K weight L1 tile'
-  check_contains "$MLIR" 'func\.call @q4k_linear_tile' 'external Q4_K tile kernel call'
-  check_contains "$MLIR" 'link_with = "q4k_linear\.o"' 'external Q4_K link object'
+if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then
+  if [[ "$STAGE" == "v_proj" ]]; then
+    PROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 106))"
+    PROJ_TILE_FUNC="q6k_linear_tile"
+    PROJ_LINK_OBJECT="q6k_linear.o"
+  else
+    PROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
+    PROJ_TILE_FUNC="q4k_linear_tile"
+    PROJ_LINK_OBJECT="q4k_linear.o"
+  fi
+  check_contains "$MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${PROJ_WEIGHT_WORDS}xi32, 2" 'packed quantized weight L1 tile'
+  check_contains "$MLIR" "func\\.call @${PROJ_TILE_FUNC}" 'external quantized tile kernel call'
+  check_contains "$MLIR" "link_with = \"${PROJ_LINK_OBJECT}\"" 'external quantized link object'
 fi
 if [[ "$STAGE" == "embed_tokens_input_layernorm" ]]; then
   check_contains "$MLIR" 'embed_tokens output in L1' 'documented L1 operator handoff'
 fi
-if [[ "$STAGE" == "q_proj" ]]; then
+if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then
   check_contains "$MLIR" 'air\.herd' 'official AIR herd in exported MLIR'
   check_contains "$MLIR" 'air\.dma_memcpy_nd' 'explicit AIR DMA in exported MLIR'
   compile_air_dma_fixture "$MLIR" "$STEM"
@@ -121,15 +129,15 @@ RUNNER_ARGS=(
   --warmup "$NPU_WARMUP"
   --iterations "$NPU_ITERATIONS"
 )
-if [[ "$STAGE" == "q_proj" ]]; then
-  RUNNER_ARGS+=(--output-rows "$OUTPUT_ROWS" --output-tile-rows "$OUTPUT_TILE_ROWS")
+if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then
+  RUNNER_ARGS+=(--proj-name "$STAGE" --output-rows "$OUTPUT_ROWS" --output-tile-rows "$OUTPUT_TILE_ROWS")
 else
   RUNNER_ARGS+=(--blocks-per-row "$BLOCKS_PER_ROW")
 fi
 if [[ "$STAGE" == "input_layernorm" || "$STAGE" == "embed_tokens_input_layernorm" ]]; then
   RUNNER_ARGS+=(--rms-norm-eps "$RMS_NORM_EPS")
 fi
-if [[ "$STAGE" == "q_proj" ]]; then
+if [[ "$STAGE" == "q_proj" || "$STAGE" == "k_proj" || "$STAGE" == "v_proj" ]]; then
   RUNNER_ARGS+=(--rms-norm-eps "$RMS_NORM_EPS")
 fi
 

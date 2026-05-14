@@ -1,4 +1,4 @@
-// Q4_K linear tile kernel for quantized_qwen3 q_proj.
+// Q4_K linear tile kernel for quantized_qwen3 attention projections.
 //
 // AIR supplies one token row, OUTPUT_TILE_ROWS packed Q4_K rows, and one output
 // tile in L1. Each packed row stores the original GGUF Q4_K words followed by

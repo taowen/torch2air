@@ -23,6 +23,16 @@ def q4k_block_f16_scales_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
     return torch.stack([d, dmin], dim=1)
 
 
+def q6k_block_f16_scales_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
+    if raw_blocks.dtype != np.uint16 or raw_blocks.ndim != 2 or raw_blocks.shape[1] != 105:
+        raise ValueError(
+            f"Expected uint16 Q6_K blocks with shape [N, 105], got {raw_blocks.shape} {raw_blocks.dtype}"
+        )
+    device = rocm_device()
+    d_bytes = np.array(raw_blocks[:, 104:105], copy=True, order="C").view(np.uint8).reshape(-1, 2)
+    return torch.as_tensor(d_bytes, device=device).view(torch.float16).to(torch.float32).reshape(-1)
+
+
 def dequantize_q4_k_blocks_rocm(raw_blocks: np.ndarray) -> torch.Tensor:
     if raw_blocks.dtype != np.uint8 or raw_blocks.ndim != 2 or raw_blocks.shape[1] != 144:
         raise ValueError(

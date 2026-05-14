@@ -204,11 +204,23 @@ AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 
 AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh k_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh v_proj
+
 AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
 
 AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
+
+AIR_DEVICE=npu2 TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 
 AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
@@ -261,22 +273,24 @@ Verified checks:
 - `embed_tokens_input_layernorm` is a fused L1 handoff spike. It keeps the
   dequantized embedding values in L1 and feeds RMSNorm without writing an
   intermediate global hidden buffer.
-- `q_proj` uses official-style AIR external kernel lowering: generated MLIR owns
-  `air.launch`, `air.segment`, `air.herd`, and `air.dma_memcpy_nd`, while
-  `q4k_linear.o` owns the tile-local Q4_K dot-product body.
-- Like `embed_tokens`, `q_proj` still uses the temporary Q4_K `d`/`dmin`
-  sidecar workaround for AIE scalar f16 conversion: the NPU receives real packed
-  Q4_K words plus f32 sidecar words for block-level scales.
-- `embed_tokens -> input_layernorm -> q_proj` runs three stage xclbins with
-  shared `pyxrt.bo` handoff buffers. It does not copy intermediate hidden states
+- `q_proj` and `k_proj` use official-style AIR external kernel lowering with
+  `q4k_linear.o`; `v_proj` uses the same AIR shape with `q6k_linear.o` because
+  the real GGUF tensor is Q6_K.
+- Attention projection kernels still use the temporary f32 sidecar workaround
+  for block-level f16 scales. The Q6_K path also temporarily widens GGUF
+  halfwords to i32 words for the external-kernel ABI; quantized values are still
+  decoded by the NPU tile body.
+- `embed_tokens -> input_layernorm -> q/k/v` runs stage xclbins with shared
+  `pyxrt.bo` handoff buffers. It does not copy intermediate hidden states
   through NumPy arrays between operators.
 - The `quantized_qwen3` reference path is generated from the same exported
   module boundaries. `src/models/quantized_qwen3/reference.py` loads the local
   `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
   `run_embed_tokens`, `run_input_layernorm`,
-  `run_embed_tokens_input_layernorm`, and `run_q_proj`. Expected tensors,
-  `allclose`, and max-abs metrics are computed on the ROCm device. NumPy is
-  used only for GGUF byte slicing and XRT host buffers.
+  `run_embed_tokens_input_layernorm`, `run_q_proj`, `run_k_proj`, and
+  `run_v_proj`. Expected tensors, `allclose`, and max-abs metrics are computed
+  on the ROCm device. NumPy is used only for GGUF byte slicing and XRT host
+  buffers.
 
 Latest real NPU results:
 
@@ -312,13 +326,37 @@ q_proj external Q4_K kernel, 1 token, output_rows 64:
   reference safetensors_pytorch_rocm AMD Radeon 890M
   max_abs 0.058996558
   allclose True rtol=0.05 atol=0.1
-  mean_ms 14.788
+  mean_ms 14.544
 
 q_proj external Q4_K kernel, 2 tokens, output_rows 64:
   reference safetensors_pytorch_rocm AMD Radeon 890M
   max_abs 0.058996558
   allclose True rtol=0.05 atol=0.1
   mean_ms 15.114
+
+k_proj external Q4_K kernel, 1 token, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.03157258
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 14.570
+
+k_proj external Q4_K kernel, 2 tokens, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.03342998
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 15.482
+
+v_proj external Q6_K kernel, 1 token, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.00775823
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 10.752
+
+v_proj external Q6_K kernel, 2 tokens, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.00775823
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 11.287
 
 pipeline_embed_norm_qproj shared BO handoff, 1 token, output_rows 64:
   reference safetensors_pytorch_rocm AMD Radeon 890M
@@ -335,6 +373,26 @@ pipeline_embed_norm_qproj shared BO handoff, 2 tokens, output_rows 64:
   qproj_max_abs 0.081097126
   allclose True rtol=0.05 atol=0.2
   mean_ms 17.821
+
+pipeline_embed_norm_qkv shared BO handoff, 1 token, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.031209335
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 41.817
+
+pipeline_embed_norm_qkv shared BO handoff, 2 tokens, output_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.037101876
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 43.504
 ```
 
 Notes:
@@ -343,6 +401,10 @@ Notes:
   the 1x4 and 2x4 variants, but still produces AIE IR, xclbin/insts, and a
   passing hardware result. Track this as a placement diagnostic issue, not as a
   runtime failure.
+- Q6_K projection variants currently print AIE bank allocation warnings because
+  the spike widens Q6_K halfwords to i32 in L1. The generated xclbin still runs
+  and matches the PyTorch ROCm reference. Compact i16 L1 DMA is the next
+  cleanup for that kernel.
 - Passing `aie.runtime_sequence`/`aiex.dma_configure_task_for` MLIR directly to
   `aiecc` is required for this flow. Pre-lowering to `aiex.npu` instructions
   before `aiecc` produced a hanging run.

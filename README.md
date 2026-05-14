@@ -121,23 +121,33 @@ shared `pyxrt.bo` hidden buffer. The intermediate hidden state stays on the NPU
 path between the two operators; it is copied back only after execution for
 verification.
 
-Run the first Q4_K linear projection:
+Run the first attention projections:
 
 ```bash
 AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh k_proj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh v_proj
 ```
 
-Run the current three-stage path:
+Run the current projection pipelines:
 
 ```bash
 AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
 ```
 
-The three-stage path runs `embed_tokens`, `input_layernorm`, and `q_proj` as
-separate xclbins with shared `pyxrt.bo` handoff buffers. Reference math and
-comparison are computed with PyTorch ROCm.
+These paths run `embed_tokens`, `input_layernorm`, and attention projections as
+separate xclbins with shared `pyxrt.bo` handoff buffers. `q_proj` and `k_proj`
+use Q4_K weights; `v_proj` uses the real Q6_K tensor from GGUF. Reference math
+and comparison are computed with PyTorch ROCm.
 
 There is also a fused L1 handoff spike for the first Q4_K block:
 

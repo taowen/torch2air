@@ -38,9 +38,9 @@ generates a stitched two-launch AIR artifact, but the runnable Python 3.12 path
 uses two stage xclbins with a shared `pyxrt.bo` because the upstream ELF loader
 is not exposed by the current `pyxrt` binding and the xclbin multi-launch path
 overflows program memory for the current Q4_K embedding body.
-The next verified step, `embed_tokens -> input_layernorm -> q_proj`, keeps the
-same shared-BO style and adds an official AIR external kernel for the Q4_K
-linear tile body.
+The next verified steps, `embed_tokens -> input_layernorm -> q_proj` and
+`embed_tokens -> input_layernorm -> q/k/v`, keep the same shared-BO style and
+add official AIR external kernels for Q4_K and Q6_K linear tile bodies.
 
 ## Baseline IR Shape
 

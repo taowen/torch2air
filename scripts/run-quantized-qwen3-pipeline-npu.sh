@@ -19,13 +19,21 @@ OUTPUT_TILE_ROWS="${OUTPUT_TILE_ROWS:-16}"
 case "$PIPELINE_STAGE" in
   embed_norm|pipeline_embed_norm)
     INCLUDE_QPROJ=0
+    INCLUDE_QKV=0
     STEM="quantized_qwen3_pipeline_embed_norm"
     FUNC="run_pipeline_embed_norm"
     ;;
   embed_norm_qproj|pipeline_embed_norm_qproj)
     INCLUDE_QPROJ=1
+    INCLUDE_QKV=0
     STEM="quantized_qwen3_pipeline_embed_norm_qproj"
     FUNC="run_pipeline_embed_norm_qproj"
+    ;;
+  embed_norm_qkv|pipeline_embed_norm_qkv)
+    INCLUDE_QPROJ=1
+    INCLUDE_QKV=1
+    STEM="quantized_qwen3_pipeline_embed_norm_qkv"
+    FUNC="run_pipeline_embed_norm_qkv"
     ;;
   *)
     echo "Unknown quantized_qwen3 pipeline stage: $PIPELINE_STAGE" >&2
@@ -54,6 +62,8 @@ source "$ROOT_DIR/scripts/verify-air-common.sh"
 EMBED_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_embed_tokens.mlir"
 NORM_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_input_layernorm.mlir"
 QPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_proj.mlir"
+KPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_proj.mlir"
+VPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_v_proj.mlir"
 PIPELINE_DMA="$OUT_DIR/$STEM.dma.mlir"
 WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
 
@@ -65,6 +75,20 @@ WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_C
 if (( INCLUDE_QPROJ )); then
   "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
     --stage q_proj \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT" \
+    --output-rows "$OUTPUT_ROWS" \
+    --output-tile-rows "$OUTPUT_TILE_ROWS"
+fi
+if (( INCLUDE_QKV )); then
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage k_proj \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT" \
+    --output-rows "$OUTPUT_ROWS" \
+    --output-tile-rows "$OUTPUT_TILE_ROWS"
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage v_proj \
     --gguf "$GGUF_PATH" \
     --sequence-length "$TOKEN_COUNT" \
     --output-rows "$OUTPUT_ROWS" \
@@ -86,16 +110,35 @@ EMBED_AIE="$AIE_IR"
 compile_air_dma_fixture "$NORM_DMA" "${STEM}_input_layernorm"
 NORM_AIE="$AIE_IR"
 if (( INCLUDE_QPROJ )); then
-  QPROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
+  HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
+  PROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
   check_contains "$QPROJ_MLIR" 'air\.launch' 'q_proj official AIR launch'
   check_contains "$QPROJ_MLIR" 'air\.herd' 'q_proj official AIR herd'
   check_contains "$QPROJ_MLIR" 'air\.dma_memcpy_nd' 'q_proj explicit AIR DMA'
-  check_contains "$QPROJ_MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${QPROJ_WEIGHT_WORDS}xi32, 2" 'q_proj packed Q4_K weight L1 tile'
+  check_contains "$QPROJ_MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${PROJ_WEIGHT_WORDS}xi32, 2" 'q_proj packed Q4_K weight L1 tile'
   check_contains "$QPROJ_MLIR" 'func\.call @q4k_linear_tile' 'q_proj external Q4_K tile kernel call'
   check_contains "$QPROJ_MLIR" 'link_with = "q4k_linear\.o"' 'q_proj external Q4_K link object'
-  HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
   compile_air_dma_fixture "$QPROJ_MLIR" "${STEM}_q_proj"
   QPROJ_AIE="$AIE_IR"
+  if (( INCLUDE_QKV )); then
+    check_contains "$KPROJ_MLIR" 'air\.launch' 'k_proj official AIR launch'
+    check_contains "$KPROJ_MLIR" 'air\.herd' 'k_proj official AIR herd'
+    check_contains "$KPROJ_MLIR" 'air\.dma_memcpy_nd' 'k_proj explicit AIR DMA'
+    check_contains "$KPROJ_MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${PROJ_WEIGHT_WORDS}xi32, 2" 'k_proj packed Q4_K weight L1 tile'
+    check_contains "$KPROJ_MLIR" 'func\.call @q4k_linear_tile' 'k_proj external Q4_K tile kernel call'
+    check_contains "$KPROJ_MLIR" 'link_with = "q4k_linear\.o"' 'k_proj external Q4_K link object'
+    compile_air_dma_fixture "$KPROJ_MLIR" "${STEM}_k_proj"
+    KPROJ_AIE="$AIE_IR"
+    VPROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 106))"
+    check_contains "$VPROJ_MLIR" 'air\.launch' 'v_proj official AIR launch'
+    check_contains "$VPROJ_MLIR" 'air\.herd' 'v_proj official AIR herd'
+    check_contains "$VPROJ_MLIR" 'air\.dma_memcpy_nd' 'v_proj explicit AIR DMA'
+    check_contains "$VPROJ_MLIR" "memref\\.alloc\\(\\) : memref<${OUTPUT_TILE_ROWS}x${VPROJ_WEIGHT_WORDS}xi32, 2" 'v_proj packed Q6_K weight L1 tile'
+    check_contains "$VPROJ_MLIR" 'func\.call @q6k_linear_tile' 'v_proj external Q6_K tile kernel call'
+    check_contains "$VPROJ_MLIR" 'link_with = "q6k_linear\.o"' 'v_proj external Q6_K link object'
+    compile_air_dma_fixture "$VPROJ_MLIR" "${STEM}_v_proj"
+    VPROJ_AIE="$AIE_IR"
+  fi
   HERD_COLS="$BLOCKS_PER_ROW"
 fi
 
@@ -133,6 +176,12 @@ if (( INCLUDE_QPROJ )); then
     --qproj-aie-mlir "$QPROJ_AIE"
     --output-rows "$OUTPUT_ROWS"
     --output-tile-rows "$OUTPUT_TILE_ROWS"
+  )
+fi
+if (( INCLUDE_QKV )); then
+  RUNNER_ARGS+=(
+    --kproj-aie-mlir "$KPROJ_AIE"
+    --vproj-aie-mlir "$VPROJ_AIE"
   )
 fi
 

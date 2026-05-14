@@ -18,13 +18,34 @@ from .reference_runtime import (
     first_values,
     max_abs_rocm,
     q4k_block_f16_scales_rocm,
+    q6k_block_f16_scales_rocm,
 )
 from .run_embed_tokens import DEFAULT_GGUF, compile_runtime, installed_tool, parse_token_ids, prepare_inputs
 from .run_embed_tokens_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR
 
 
+ATTENTION_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
+DEFAULT_PROJ_NAME = "q_proj"
 DEFAULT_Q_PROJ_WEIGHT_TENSOR = "model.layers.0.self_attn.q_proj.weight"
-KERNEL_SOURCE = Path(__file__).resolve().parents[2] / "torch2air" / "export" / "kernels" / "q4k_linear.cc"
+KERNEL_DIR = Path(__file__).resolve().parents[2] / "torch2air" / "export" / "kernels"
+Q4K_KERNEL_SOURCE = KERNEL_DIR / "q4k_linear.cc"
+Q6K_KERNEL_SOURCE = KERNEL_DIR / "q6k_linear.cc"
+
+
+def projection_weight_tensor(proj_name: str) -> str:
+    validate_projection_name(proj_name)
+    return f"model.layers.0.self_attn.{proj_name}.weight"
+
+
+def validate_projection_name(proj_name: str) -> None:
+    if proj_name not in ATTENTION_PROJ_NAMES:
+        raise ValueError(f"proj_name must be one of {ATTENTION_PROJ_NAMES}, got {proj_name!r}")
+
+
+def reference_projection(proj_name: str, hidden: torch.Tensor) -> torch.Tensor:
+    validate_projection_name(proj_name)
+    runner = getattr(reference, f"run_{proj_name}")
+    return runner(input=hidden)["linear"]
 
 
 def prepare_norm_hidden(
@@ -54,7 +75,7 @@ def prepare_norm_hidden(
     return np.ascontiguousarray(norm_hidden.detach().cpu().numpy()), norm_hidden, info
 
 
-def prepare_q_proj_weights(
+def prepare_projection_weights(
     *,
     gguf_path: Path,
     tensor_name: str,
@@ -63,12 +84,45 @@ def prepare_q_proj_weights(
 ) -> tuple[np.ndarray, dict[str, object]]:
     index = load_gguf_index(gguf_path)
     selected = index.tensors[tensor_name]
-    if selected.ggml_type != "Q4_K":
-        raise ValueError(f"{tensor_name} is {selected.ggml_type}, not Q4_K")
+    if selected.ggml_type == "Q4_K":
+        packed_with_scales, blocks_per_row = _prepare_q4_k_projection_weights(
+            index_path=index.path,
+            selected=selected,
+            output_rows=output_rows,
+            hidden_size=hidden_size,
+        )
+    elif selected.ggml_type == "Q6_K":
+        packed_with_scales, blocks_per_row = _prepare_q6_k_projection_weights(
+            index_path=index.path,
+            selected=selected,
+            output_rows=output_rows,
+            hidden_size=hidden_size,
+        )
+    else:
+        raise ValueError(f"{tensor_name} is {selected.ggml_type}, not Q4_K or Q6_K")
+    info = {
+        "tensor": selected.to_json(),
+        "output_rows": output_rows,
+        "blocks_per_row": blocks_per_row,
+        "hidden_size": hidden_size,
+    }
+    return (
+        np.ascontiguousarray(packed_with_scales),
+        info,
+    )
+
+
+def _prepare_q4_k_projection_weights(
+    *,
+    index_path: Path,
+    selected,
+    output_rows: int,
+    hidden_size: int,
+) -> tuple[np.ndarray, int]:
     if selected.physical_dtype != "uint32" or len(selected.physical_shape) != 2:
         raise ValueError(f"Expected rank-2 uint32 Q4_K tensor, got {selected}")
     if int(selected.logical_shape[1]) != hidden_size:
-        raise ValueError(f"{tensor_name} input size must be {hidden_size}, got {selected.logical_shape}")
+        raise ValueError(f"{selected.name} input size must be {hidden_size}, got {selected.logical_shape}")
     if output_rows <= 0 or output_rows > int(selected.physical_shape[0]):
         raise ValueError(f"output_rows must be in [1, {selected.physical_shape[0]}], got {output_rows}")
 
@@ -77,10 +131,10 @@ def prepare_q_proj_weights(
         raise ValueError(f"Q4_K row word width must be a multiple of 36, got {row_words}")
     blocks_per_row = row_words // 36
     if blocks_per_row * 256 != hidden_size:
-        raise ValueError(f"{tensor_name} row shape implies hidden_size={blocks_per_row * 256}")
+        raise ValueError(f"{selected.name} row shape implies hidden_size={blocks_per_row * 256}")
 
     payload = read_tensor_bytes(
-        index.path,
+        index_path,
         selected,
         offset=0,
         size=output_rows * row_words * 4,
@@ -96,20 +150,62 @@ def prepare_q_proj_weights(
         .view(np.int32)
     )
     packed_with_scales = np.concatenate([packed_weights, scale_bits], axis=1)
-    info = {
-        "tensor": selected.to_json(),
-        "output_rows": output_rows,
-        "blocks_per_row": blocks_per_row,
-        "hidden_size": hidden_size,
-    }
-    return (
-        np.ascontiguousarray(packed_with_scales),
-        info,
+    return packed_with_scales, blocks_per_row
+
+
+def _prepare_q6_k_projection_weights(
+    *,
+    index_path: Path,
+    selected,
+    output_rows: int,
+    hidden_size: int,
+) -> tuple[np.ndarray, int]:
+    if selected.physical_dtype != "uint16" or len(selected.physical_shape) != 2:
+        raise ValueError(f"Expected rank-2 uint16 Q6_K tensor, got {selected}")
+    if int(selected.logical_shape[1]) != hidden_size:
+        raise ValueError(f"{selected.name} input size must be {hidden_size}, got {selected.logical_shape}")
+    if output_rows <= 0 or output_rows > int(selected.physical_shape[0]):
+        raise ValueError(f"output_rows must be in [1, {selected.physical_shape[0]}], got {output_rows}")
+
+    row_halfwords = int(selected.physical_shape[1])
+    if row_halfwords % 105 != 0:
+        raise ValueError(f"Q6_K row halfword width must be a multiple of 105, got {row_halfwords}")
+    blocks_per_row = row_halfwords // 105
+    if blocks_per_row * 256 != hidden_size:
+        raise ValueError(f"{selected.name} row shape implies hidden_size={blocks_per_row * 256}")
+
+    payload = read_tensor_bytes(
+        index_path,
+        selected,
+        offset=0,
+        size=output_rows * row_halfwords * 2,
+    )
+    packed_halfwords = np.frombuffer(payload, dtype=np.uint16).copy().reshape(output_rows, row_halfwords)
+    raw_blocks = packed_halfwords.reshape(output_rows * blocks_per_row, 105)
+    d_scales = q6k_block_f16_scales_rocm(raw_blocks).reshape(output_rows, blocks_per_row)
+    scale_bits = d_scales.detach().cpu().numpy().view(np.int32).reshape(output_rows, blocks_per_row)
+    packed_with_scales = np.concatenate([packed_halfwords.astype(np.int32), scale_bits], axis=1)
+    return packed_with_scales, blocks_per_row
+
+
+def prepare_q_proj_weights(
+    *,
+    gguf_path: Path,
+    tensor_name: str,
+    output_rows: int,
+    hidden_size: int,
+) -> tuple[np.ndarray, dict[str, object]]:
+    return prepare_projection_weights(
+        gguf_path=gguf_path,
+        tensor_name=tensor_name,
+        output_rows=output_rows,
+        hidden_size=hidden_size,
     )
 
 
-def prepare_q_proj_inputs(
+def prepare_projection_inputs(
     *,
+    proj_name: str,
     gguf_path: Path,
     token_ids: list[int],
     tensor_name: str,
@@ -117,6 +213,7 @@ def prepare_q_proj_inputs(
     rms_weight_tensor: str,
     eps: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
+    validate_projection_name(proj_name)
     norm_hidden, norm_hidden_ref, info = prepare_norm_hidden(
         gguf_path=gguf_path,
         token_ids=token_ids,
@@ -130,19 +227,40 @@ def prepare_q_proj_inputs(
         hidden_size=norm_hidden.shape[1],
     )
     with torch.no_grad():
-        expected = reference.run_q_proj(input=norm_hidden_ref)["linear"].reshape(
+        expected = reference_projection(proj_name, norm_hidden_ref).reshape(
             len(token_ids),
             -1,
         )[:, :output_rows]
     output = np.zeros(tuple(expected.shape), dtype=np.float32)
-    info["q_proj_weight"] = weight_info["tensor"]
-    info["q_proj_output_rows"] = output_rows
+    info["projection"] = proj_name
+    info["projection_weight"] = weight_info["tensor"]
+    info["projection_output_rows"] = output_rows
     return (
         norm_hidden,
         packed_weights,
         output,
         expected,
         info,
+    )
+
+
+def prepare_q_proj_inputs(
+    *,
+    gguf_path: Path,
+    token_ids: list[int],
+    tensor_name: str,
+    output_rows: int,
+    rms_weight_tensor: str,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor, dict[str, object]]:
+    return prepare_projection_inputs(
+        proj_name="q_proj",
+        gguf_path=gguf_path,
+        token_ids=token_ids,
+        tensor_name=tensor_name,
+        output_rows=output_rows,
+        rms_weight_tensor=rms_weight_tensor,
+        eps=eps,
     )
 
 
@@ -154,7 +272,34 @@ def compile_q4k_linear_object(
     blocks_per_row: int,
     hidden_size: int,
 ) -> Path:
-    object_path = work_dir / "q4k_linear.o"
+    return compile_projection_object(
+        ggml_type="Q4_K",
+        work_dir=work_dir,
+        peano_install_dir=peano_install_dir,
+        output_tile_rows=output_tile_rows,
+        blocks_per_row=blocks_per_row,
+        hidden_size=hidden_size,
+    )
+
+
+def compile_projection_object(
+    *,
+    ggml_type: str,
+    work_dir: Path,
+    peano_install_dir: str,
+    output_tile_rows: int,
+    blocks_per_row: int,
+    hidden_size: int,
+) -> Path:
+    if ggml_type == "Q4_K":
+        object_name = "q4k_linear.o"
+        source = Q4K_KERNEL_SOURCE
+    elif ggml_type == "Q6_K":
+        object_name = "q6k_linear.o"
+        source = Q6K_KERNEL_SOURCE
+    else:
+        raise ValueError(f"Unsupported projection kernel type {ggml_type}")
+    object_path = work_dir / object_name
     object_path.parent.mkdir(parents=True, exist_ok=True)
     aie_opt = installed_tool("aie-opt", "MLIR_AIE_INSTALL_DIR")
     include_dir = Path(aie_opt).resolve().parent.parent / "include"
@@ -178,7 +323,7 @@ def compile_q4k_linear_object(
         f"-DBLOCKS_PER_ROW={blocks_per_row}",
         f"-DHIDDEN_SIZE={hidden_size}",
         "-c",
-        str(KERNEL_SOURCE),
+        str(source),
         "-o",
         str(object_path),
     ]
@@ -223,9 +368,10 @@ def run_on_npu(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run quantized_qwen3 q_proj on real NPU.")
+    parser = argparse.ArgumentParser(description="Run a quantized_qwen3 attention projection on real NPU.")
+    parser.add_argument("--proj-name", choices=ATTENTION_PROJ_NAMES, default=DEFAULT_PROJ_NAME)
     parser.add_argument("--gguf", type=Path, default=DEFAULT_GGUF)
-    parser.add_argument("--tensor", default=DEFAULT_Q_PROJ_WEIGHT_TENSOR)
+    parser.add_argument("--tensor", default=None)
     parser.add_argument("--token-ids", type=parse_token_ids, default=parse_token_ids("0"))
     parser.add_argument("--output-rows", type=int, default=64)
     parser.add_argument("--output-tile-rows", type=int, default=16)
@@ -233,7 +379,7 @@ def main() -> int:
     parser.add_argument("--rms-norm-eps", type=float, default=1e-6)
     parser.add_argument("--aie-mlir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("--instance-name", default="run_q_proj")
+    parser.add_argument("--instance-name", default=None)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--rtol", type=float, default=5e-2)
@@ -246,21 +392,26 @@ def main() -> int:
         raise SystemExit("PEANO_INSTALL_DIR is not set; source scripts/npu-common.sh first")
     os.environ.setdefault("XRT_HACK_UNSECURE_LOADING_XCLBIN", "1")
 
-    hidden, packed_weights, _, expected, info = prepare_q_proj_inputs(
+    tensor_name = args.tensor or projection_weight_tensor(args.proj_name)
+    instance_name = args.instance_name or f"run_{args.proj_name}"
+    hidden, packed_weights, _, expected, info = prepare_projection_inputs(
+        proj_name=args.proj_name,
         gguf_path=args.gguf,
         token_ids=args.token_ids,
-        tensor_name=args.tensor,
+        tensor_name=tensor_name,
         output_rows=args.output_rows,
         rms_weight_tensor=args.rms_weight_tensor,
         eps=args.rms_norm_eps,
     )
     print(f"input_source {info['tensor']['name']} -> {info['rms_weight']['name']}")
-    print(f"Q4_K weight {info['q_proj_weight']['name']} {info['q_proj_weight']['ggml_type']}")
+    print(f"projection {info['projection']}")
+    print(f"quantized weight {info['projection_weight']['name']} {info['projection_weight']['ggml_type']}")
     print(f"token_ids {','.join(str(v) for v in args.token_ids)}")
     print(f"output_rows {args.output_rows} hidden_size {hidden.shape[1]}")
     print(f"reference safetensors_pytorch_rocm {torch.cuda.get_device_name(0)}")
 
-    q4k_object = compile_q4k_linear_object(
+    projection_object = compile_projection_object(
+        ggml_type=info["projection_weight"]["ggml_type"],
         work_dir=args.work_dir,
         peano_install_dir=peano_install_dir,
         output_tile_rows=args.output_tile_rows,
@@ -270,14 +421,14 @@ def main() -> int:
     npu_mlir, xclbin, insts = compile_runtime(
         aie_mlir=args.aie_mlir,
         work_dir=args.work_dir,
-        instance_name=args.instance_name,
+        instance_name=instance_name,
         peano_install_dir=peano_install_dir,
-        link_objects=(q4k_object,),
+        link_objects=(projection_object,),
     )
     actual, latencies_ms = run_on_npu(
         xclbin=xclbin,
         insts=insts,
-        instance_name=args.instance_name,
+        instance_name=instance_name,
         hidden=hidden,
         packed_weights=packed_weights,
         expected=expected,
