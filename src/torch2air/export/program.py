@@ -90,14 +90,20 @@ def _render_body(program: ExportedProgram) -> list[str]:
     lines: list[str] = []
     for node in program.graph_module.graph.nodes:
         if node.op == "placeholder":
-            lines.append(f"    # placeholder {node.name}")
+            shape, dtype = _tensor_meta(node)
+            lines.append(
+                f"    builder.define_tensor({node.name!r}, shape={shape!r}, dtype={dtype!r})"
+            )
             continue
         if node.op == "output":
-            lines.append(f"    # output {_output_names(node)}")
+            for name in _output_name_tuple(node):
+                lines.append(f"    builder.mark_output({name!r})")
             continue
         if node.op != "call_function":
             raise RuntimeError(f"unsupported FX node op {node.op!r} on {node.name}")
 
+        shape, dtype = _tensor_meta(node)
+        lines.append(f"    builder.define_tensor({node.name!r}, shape={shape!r}, dtype={dtype!r})")
         target = str(node.target)
         if target in ALIAS_TARGETS:
             lines.append(_render_alias(node, target))
@@ -283,13 +289,19 @@ def _arg(node: Node, index: int) -> Argument:
         raise RuntimeError(f"{node.name} is missing argument {index}") from exc
 
 
-def _output_names(node: Node) -> str:
+def _output_name_tuple(node: Node) -> tuple[str, ...]:
     if not node.args:
-        return "()"
+        return ()
     output = node.args[0]
     if isinstance(output, Node):
-        return output.name
+        return (output.name,)
     if isinstance(output, (list, tuple)):
-        names = [item.name for item in output if isinstance(item, Node)]
-        return repr(tuple(names))
-    return repr(output)
+        return tuple(item.name for item in output if isinstance(item, Node))
+    return ()
+
+
+def _tensor_meta(node: Node) -> tuple[tuple[int, ...], str]:
+    tensor_meta = node.meta.get("tensor_meta")
+    shape_value = getattr(tensor_meta, "shape", ())
+    dtype_value = getattr(tensor_meta, "dtype", "")
+    return tuple(int(dim) for dim in shape_value), str(dtype_value).removeprefix("torch.")
