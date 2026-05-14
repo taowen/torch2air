@@ -155,8 +155,8 @@ def main() -> int:
         raise SystemExit("attention query tile rows must divide token count")
     if run_attention and len(args.token_ids) % args.key_tile_rows != 0:
         raise SystemExit("attention key tile rows must divide token count")
-    if run_attention and args.key_tile_rows != 4:
-        raise SystemExit("attention_core currently uses key_tile_rows=4")
+    if run_attention and args.key_tile_rows > 8:
+        raise SystemExit("attention_core currently validates key_tile_rows up to 8")
     qproj_prepared: QProjPrepared | None = None
     projection_prepared: QKVPrepared | None = None
     rope_prepared: QKVRopePrepared | None = None

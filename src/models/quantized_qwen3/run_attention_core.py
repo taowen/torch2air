@@ -132,8 +132,8 @@ def main() -> int:
         raise SystemExit("attention query tile rows must divide sequence length")
     if args.sequence_length % args.key_tile_rows != 0:
         raise SystemExit("attention key tile rows must divide sequence length")
-    if args.key_tile_rows != 4:
-        raise SystemExit("attention_core currently uses key_tile_rows=4")
+    if args.key_tile_rows > 8:
+        raise SystemExit("attention_core currently validates key_tile_rows up to 8")
     if args.q_heads <= 0 or args.kv_heads <= 0 or args.q_heads % args.kv_heads != 0:
         raise SystemExit("q_heads must be a positive multiple of kv_heads")
     if len(args.aie_mlir) != args.q_heads:

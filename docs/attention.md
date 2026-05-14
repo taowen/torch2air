@@ -410,15 +410,18 @@ full self_attn pipeline, 16 tokens:
 ## 当前限制
 
 - `HEAD_DIM` 固定为 128，匹配 Qwen3 当前 head。
-- `KEY_TILE_ROWS` 固定为 4。`attention_core.cc` 现在显式展开了 4 行 K/V，避免 AIE L1
-  栈数组带来的不稳定结果。
+- `KEY_TILE_ROWS` 已验证到 8。`KEY_TILE_ROWS=16` 可以编译，但真实 NPU 对拍会出现
+  stale zero 输出，所以正式入口限制在 8 以内。
 - `SEQUENCE_LENGTH` 必须能整除 `QUERY_TILE_ROWS` 和 `KEY_TILE_ROWS`。
-- 当前完整 full-head `self_attn` 已经验证到 16 tokens。更长 context 需要继续验证
-  token loop、channel FIFO 深度和 runtime sequence 的规模。
+- 一个 xclbin 串行处理 16 Q heads / 8 KV heads 已验证到 64 tokens。更长 context 主要是
+  性能问题，仍要继续验证 token loop、channel FIFO 深度和 runtime sequence 的规模。
+- `QUERY_TILE_ROWS=32` 在 64-token attention 上可以通过；`QUERY_TILE_ROWS=64` 会超过
+  单 tile 64 KiB L1，因为 Q/O 两个 64x128xf32 buffer 加 stack 后已经没有空间放 K/V。
 - 当前默认 `AIR_STACK_SIZE=4096`。它解决了 8-token attention_core 的 L1 状态污染，但
   会减少每个 tile 可用于显式 L1 buffer 的空间。
-- 16-head attention 现在依赖按需加载 xclbin 来避开 `hw_context` 数量上限；后续如果做
-  stage stitching 或 fusion，需要重新评估 context 生命周期和 BO 分配策略。
+- 16-head attention 可以由单个 attention xclbin 串行处理。多个 stage 之间仍可通过 shared
+  `pyxrt.bo` 交接；后续如果做 stage stitching 或 fusion，需要重新评估 context 生命周期和
+  BO 分配策略。
 - projection 和 o_proj 的量化权重 tile 对 L1 bank 压力较大。现在能跑通，但后续需要把
   Q4_K/Q6_K 的 tile 形状和 ABI 再压低。
 - `air-place-herds` 对部分形状会打印 `No valid placement found` 诊断，但当前记录里仍能

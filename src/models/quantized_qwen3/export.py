@@ -417,9 +417,11 @@ def export_attention_core(
             f"sequence_length={sequence_length} must be divisible by query_tile_rows={query_tile_rows}"
         )
     if sequence_length % key_tile_rows != 0:
-        raise ValueError(f"sequence_length={sequence_length} must be divisible by key_tile_rows={key_tile_rows}")
-    if key_tile_rows != 4:
-        raise ValueError("attention_core currently uses key_tile_rows=4")
+        raise ValueError(
+            f"sequence_length={sequence_length} must be divisible by key_tile_rows={key_tile_rows}"
+        )
+    if key_tile_rows > 8:
+        raise ValueError("attention_core currently validates key_tile_rows up to 8")
     if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
         raise ValueError(f"q_heads={q_heads} must be a positive multiple of kv_heads={kv_heads}")
     if attention_head_index < 0 or attention_head_index >= q_heads:
