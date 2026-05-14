@@ -84,6 +84,7 @@ def main() -> int:
     parser.add_argument("--q-heads", type=int, default=1)
     parser.add_argument("--kv-heads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--scale", type=float, default=0.25)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--rtol", type=float, default=1e-2)
@@ -109,13 +110,13 @@ def main() -> int:
         rows=args.sequence_length,
         cols=args.q_heads * args.head_dim,
         seed=args.seed,
-        scale=0.25,
+        scale=args.scale,
     )
     k_ref = deterministic_tensor(
         rows=args.sequence_length,
         cols=args.kv_heads * args.head_dim,
         seed=args.seed + 1,
-        scale=0.25,
+        scale=args.scale,
     )
     v_ref = deterministic_tensor(
         rows=args.sequence_length,

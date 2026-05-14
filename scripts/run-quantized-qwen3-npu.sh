@@ -18,23 +18,34 @@ OUTPUT_TILE_ROWS="${OUTPUT_TILE_ROWS:-32}"
 
 IFS=',' read -r -a _token_parts <<< "$TOKEN_IDS"
 TOKEN_COUNT="${TOKEN_COUNT:-${#_token_parts[@]}}"
+token_parallel_rows() {
+  local token_count="$1"
+  if (( token_count < 4 )); then
+    echo "$token_count"
+  else
+    echo 4
+  fi
+}
 case "$STAGE" in
   embed_tokens)
     STEM="quantized_qwen3_embed_tokens"
     FUNC="run_embed_tokens"
     RUNNER_MODULE="models.quantized_qwen3.run_embed_tokens"
+    DEFAULT_HERD_ROWS="1"
     DEFAULT_HERD_COLS="$BLOCKS_PER_ROW"
     ;;
   input_layernorm)
     STEM="quantized_qwen3_input_layernorm"
     FUNC="run_input_layernorm"
     RUNNER_MODULE="models.quantized_qwen3.run_input_layernorm"
+    DEFAULT_HERD_ROWS="$(token_parallel_rows "$TOKEN_COUNT")"
     DEFAULT_HERD_COLS="1"
     ;;
   embed_tokens_input_layernorm)
     STEM="quantized_qwen3_embed_tokens_input_layernorm"
     FUNC="run_embed_tokens_input_layernorm"
     RUNNER_MODULE="models.quantized_qwen3.run_embed_tokens_input_layernorm"
+    DEFAULT_HERD_ROWS="$(token_parallel_rows "$TOKEN_COUNT")"
     DEFAULT_HERD_COLS="1"
     ;;
   q_proj|k_proj|v_proj)
@@ -45,6 +56,7 @@ case "$STAGE" in
     STEM="quantized_qwen3_${STAGE}"
     FUNC="run_${STAGE}"
     RUNNER_MODULE="models.quantized_qwen3.run_q_proj"
+    DEFAULT_HERD_ROWS="1"
     DEFAULT_HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
     ;;
   *)
@@ -58,7 +70,7 @@ if [[ "$STAGE" == "embed_tokens_input_layernorm" && "$BLOCKS_PER_ROW" != "1" ]];
   exit 2
 fi
 
-AIR_HERD_ROWS="${AIR_HERD_ROWS:-$TOKEN_COUNT}"
+AIR_HERD_ROWS="${AIR_HERD_ROWS:-$DEFAULT_HERD_ROWS}"
 AIR_HERD_COLS="${AIR_HERD_COLS:-$DEFAULT_HERD_COLS}"
 export AIR_HERD_ROWS AIR_HERD_COLS
 

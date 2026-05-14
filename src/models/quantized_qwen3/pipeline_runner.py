@@ -16,6 +16,51 @@ from .stages.rope import HEAD_DIM, reference_norm_rope
 from .stages.self_attention import reference_oproj
 
 
+def run_embed_chunks(
+    *,
+    embed_kernel: xrt.kernel,
+    embed_instr_v: np.ndarray,
+    embed_bo_instr: xrt.bo,
+    bo_packed: xrt.bo,
+    bo_scales: xrt.bo,
+    bo_hidden: xrt.bo,
+    packed_rows: np.ndarray,
+    block_f16_scales: np.ndarray,
+    hidden: np.ndarray,
+    embed_chunk_rows: int,
+) -> None:
+    sequence_length, hidden_size = hidden.shape
+    if embed_chunk_rows <= 0 or sequence_length % embed_chunk_rows != 0:
+        raise ValueError("embed_chunk_rows must be positive and divide sequence length")
+    if packed_rows.shape[0] != sequence_length:
+        raise ValueError("packed_rows sequence length must match hidden")
+    if block_f16_scales.shape[0] != sequence_length:
+        raise ValueError("block_f16_scales sequence length must match hidden")
+
+    packed_row_bytes = packed_rows.shape[1] * packed_rows.dtype.itemsize
+    scales_row_bytes = (
+        block_f16_scales.shape[1] * block_f16_scales.shape[2] * block_f16_scales.dtype.itemsize
+    )
+    hidden_row_bytes = hidden_size * hidden.dtype.itemsize
+    packed_chunk_bytes = embed_chunk_rows * packed_row_bytes
+    scales_chunk_bytes = embed_chunk_rows * scales_row_bytes
+    hidden_chunk_bytes = embed_chunk_rows * hidden_row_bytes
+
+    for token_offset in range(0, sequence_length, embed_chunk_rows):
+        packed_chunk = xrt.bo(bo_packed, packed_chunk_bytes, token_offset * packed_row_bytes)
+        scales_chunk = xrt.bo(bo_scales, scales_chunk_bytes, token_offset * scales_row_bytes)
+        hidden_chunk = xrt.bo(bo_hidden, hidden_chunk_bytes, token_offset * hidden_row_bytes)
+        embed_run = embed_kernel(
+            3,
+            embed_bo_instr,
+            len(embed_instr_v),
+            packed_chunk,
+            scales_chunk,
+            hidden_chunk,
+        )
+        embed_run.wait()
+
+
 def run_on_npu(
     *,
     embed_xclbin: Path,
@@ -29,6 +74,7 @@ def run_on_npu(
     output: np.ndarray,
     embed_expected: torch.Tensor,
     expected: torch.Tensor,
+    embed_chunk_rows: int,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -105,8 +151,11 @@ def run_on_npu(
             bo_hidden=bo_hidden,
             bo_weight=bo_weight,
             bo_output=bo_output,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
             hidden=hidden,
             output=output,
+            embed_chunk_rows=embed_chunk_rows,
             embed_expected=embed_expected,
             expected=expected,
         )
@@ -129,8 +178,11 @@ def run_on_npu(
             bo_hidden=bo_hidden,
             bo_weight=bo_weight,
             bo_output=bo_output,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
             hidden=hidden,
             output=output,
+            embed_chunk_rows=embed_chunk_rows,
             embed_expected=embed_expected,
             expected=expected,
         )
@@ -162,6 +214,7 @@ def run_on_npu_qproj(
     embed_expected: torch.Tensor,
     norm_expected: torch.Tensor,
     qproj_expected: torch.Tensor,
+    embed_chunk_rows: int,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -250,11 +303,14 @@ def run_on_npu_qproj(
             bo_norm_output=bo_norm_output,
             bo_qproj_weights=bo_qproj_weights,
             bo_qproj_output=bo_qproj_output,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
             hidden=hidden,
             norm_output=norm_output,
             qproj_weights=qproj_weights,
             qproj_output=qproj_output,
             output_tile_rows=output_tile_rows,
+            embed_chunk_rows=embed_chunk_rows,
             embed_expected=embed_expected,
             norm_expected=norm_expected,
             qproj_expected=qproj_expected,
@@ -286,11 +342,14 @@ def run_shared_bo_qproj_once(
     bo_norm_output,
     bo_qproj_weights,
     bo_qproj_output,
+    packed_rows: np.ndarray,
+    block_f16_scales: np.ndarray,
     hidden: np.ndarray,
     norm_output: np.ndarray,
     qproj_weights: np.ndarray,
     qproj_output: np.ndarray,
     output_tile_rows: int,
+    embed_chunk_rows: int,
     embed_expected: torch.Tensor,
     norm_expected: torch.Tensor,
     qproj_expected: torch.Tensor,
@@ -303,8 +362,18 @@ def run_shared_bo_qproj_once(
         bo.write(array, 0)
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-    embed_run = embed_kernel(3, embed_bo_instr, len(embed_instr_v), bo_packed, bo_scales, bo_hidden)
-    embed_run.wait()
+    run_embed_chunks(
+        embed_kernel=embed_kernel,
+        embed_instr_v=embed_instr_v,
+        embed_bo_instr=embed_bo_instr,
+        bo_packed=bo_packed,
+        bo_scales=bo_scales,
+        bo_hidden=bo_hidden,
+        packed_rows=packed_rows,
+        block_f16_scales=block_f16_scales,
+        hidden=hidden,
+        embed_chunk_rows=embed_chunk_rows,
+    )
     norm_run = norm_kernel(
         3, norm_bo_instr, len(norm_instr_v), bo_hidden, bo_weight, bo_norm_output
     )
@@ -359,6 +428,7 @@ def run_on_npu_projections(
     embed_expected: torch.Tensor,
     norm_expected: torch.Tensor,
     projection_expected: dict[str, torch.Tensor],
+    embed_chunk_rows: int,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -456,11 +526,14 @@ def run_on_npu_projections(
             bo_norm_output=bo_norm_output,
             bo_projection_weights=bo_projection_weights,
             bo_projection_outputs=bo_projection_outputs,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
             hidden=hidden,
             norm_output=norm_output,
             projection_outputs=projection_outputs,
             projection_weights=projection_weights,
             output_tile_rows=output_tile_rows,
+            embed_chunk_rows=embed_chunk_rows,
             embed_expected=embed_expected,
             norm_expected=norm_expected,
             projection_expected=projection_expected,
@@ -493,11 +566,14 @@ def run_shared_bo_projections_once(
     bo_norm_output: xrt.bo,
     bo_projection_weights: dict[str, xrt.bo],
     bo_projection_outputs: dict[str, xrt.bo],
+    packed_rows: np.ndarray,
+    block_f16_scales: np.ndarray,
     hidden: np.ndarray,
     norm_output: np.ndarray,
     projection_outputs: dict[str, np.ndarray],
     projection_weights: dict[str, np.ndarray],
     output_tile_rows: int,
+    embed_chunk_rows: int,
     embed_expected: torch.Tensor,
     norm_expected: torch.Tensor,
     projection_expected: dict[str, torch.Tensor],
@@ -512,8 +588,18 @@ def run_shared_bo_projections_once(
         bo.write(projection_outputs[proj_name], 0)
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-    embed_run = embed_kernel(3, embed_bo_instr, len(embed_instr_v), bo_packed, bo_scales, bo_hidden)
-    embed_run.wait()
+    run_embed_chunks(
+        embed_kernel=embed_kernel,
+        embed_instr_v=embed_instr_v,
+        embed_bo_instr=embed_bo_instr,
+        bo_packed=bo_packed,
+        bo_scales=bo_scales,
+        bo_hidden=bo_hidden,
+        packed_rows=packed_rows,
+        block_f16_scales=block_f16_scales,
+        hidden=hidden,
+        embed_chunk_rows=embed_chunk_rows,
+    )
     norm_run = norm_kernel(
         3, norm_bo_instr, len(norm_instr_v), bo_hidden, bo_weight, bo_norm_output
     )
@@ -596,6 +682,7 @@ def run_on_npu_projections_rope(
     norm_rope_expected: dict[str, torch.Tensor],
     attention_expected: torch.Tensor | None,
     oproj_expected: torch.Tensor | None,
+    embed_chunk_rows: int,
     warmup: int,
     iterations: int,
     rtol: float,
@@ -807,11 +894,14 @@ def run_on_npu_projections_rope(
             oproj_kernel=oproj_kernel,
             bo_oproj_weights=bo_oproj_weights,
             bo_oproj_output=bo_oproj_output,
+            packed_rows=packed_rows,
+            block_f16_scales=block_f16_scales,
             hidden=hidden,
             norm_output=norm_output,
             projection_outputs=projection_outputs,
             projection_weights=projection_weights,
             output_tile_rows=output_tile_rows,
+            embed_chunk_rows=embed_chunk_rows,
             cos_output=cos_output,
             sin_output=sin_output,
             norm_rope_outputs=norm_rope_outputs,
@@ -955,11 +1045,14 @@ def run_shared_bo_projections_rope_once(
     oproj_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None,
     bo_oproj_weights: xrt.bo | None,
     bo_oproj_output: xrt.bo | None,
+    packed_rows: np.ndarray,
+    block_f16_scales: np.ndarray,
     hidden: np.ndarray,
     norm_output: np.ndarray,
     projection_outputs: dict[str, np.ndarray],
     projection_weights: dict[str, np.ndarray],
     output_tile_rows: int,
+    embed_chunk_rows: int,
     cos_output: np.ndarray,
     sin_output: np.ndarray,
     norm_rope_outputs: dict[str, np.ndarray],
@@ -1004,8 +1097,18 @@ def run_shared_bo_projections_rope_once(
         bo_oproj_output.write(oproj_output, 0)
         bo_oproj_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-    embed_run = embed_kernel(3, embed_bo_instr, len(embed_instr_v), bo_packed, bo_scales, bo_hidden)
-    embed_run.wait()
+    run_embed_chunks(
+        embed_kernel=embed_kernel,
+        embed_instr_v=embed_instr_v,
+        embed_bo_instr=embed_bo_instr,
+        bo_packed=bo_packed,
+        bo_scales=bo_scales,
+        bo_hidden=bo_hidden,
+        packed_rows=packed_rows,
+        block_f16_scales=block_f16_scales,
+        hidden=hidden,
+        embed_chunk_rows=embed_chunk_rows,
+    )
     norm_run = norm_kernel(
         3, norm_bo_instr, len(norm_instr_v), bo_hidden, bo_weight, bo_norm_output
     )
@@ -1164,8 +1267,11 @@ def run_shared_bo_once(
     bo_hidden,
     bo_weight,
     bo_output,
+    packed_rows: np.ndarray,
+    block_f16_scales: np.ndarray,
     hidden: np.ndarray,
     output: np.ndarray,
+    embed_chunk_rows: int,
     embed_expected: torch.Tensor,
     expected: torch.Tensor,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1174,8 +1280,18 @@ def run_shared_bo_once(
     bo_output.write(output, 0)
     bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-    embed_run = embed_kernel(3, embed_bo_instr, len(embed_instr_v), bo_packed, bo_scales, bo_hidden)
-    embed_run.wait()
+    run_embed_chunks(
+        embed_kernel=embed_kernel,
+        embed_instr_v=embed_instr_v,
+        embed_bo_instr=embed_bo_instr,
+        bo_packed=bo_packed,
+        bo_scales=bo_scales,
+        bo_hidden=bo_hidden,
+        packed_rows=packed_rows,
+        block_f16_scales=block_f16_scales,
+        hidden=hidden,
+        embed_chunk_rows=embed_chunk_rows,
+    )
     norm_run = norm_kernel(3, norm_bo_instr, len(norm_instr_v), bo_hidden, bo_weight, bo_output)
     norm_run.wait()
 

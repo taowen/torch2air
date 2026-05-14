@@ -124,6 +124,24 @@ projection_parallel_tiles() {
 
 IFS=',' read -r -a _token_parts <<< "$TOKEN_IDS"
 TOKEN_COUNT="${TOKEN_COUNT:-${#_token_parts[@]}}"
+token_parallel_rows() {
+  local token_count="$1"
+  if (( token_count < 4 )); then
+    echo "$token_count"
+  else
+    echo 4
+  fi
+}
+embed_chunk_rows() {
+  local token_count="$1"
+  if (( token_count < 8 )); then
+    echo "$token_count"
+  else
+    echo 8
+  fi
+}
+TOKEN_PARALLEL_ROWS="$(token_parallel_rows "$TOKEN_COUNT")"
+EMBED_CHUNK_ROWS="${EMBED_CHUNK_ROWS:-$(embed_chunk_rows "$TOKEN_COUNT")}"
 if [[ "$BLOCKS_PER_ROW" != "4" ]]; then
   echo "pipeline_embed_norm currently targets full hidden_size=1024, so BLOCKS_PER_ROW must be 4." >&2
   exit 2
@@ -152,8 +170,12 @@ if (( INCLUDE_ATTENTION && (TOKEN_COUNT % QUERY_TILE_ROWS != 0 || TOKEN_COUNT % 
   echo "QUERY_TILE_ROWS and KEY_TILE_ROWS must divide TOKEN_COUNT for attention_core." >&2
   exit 2
 fi
+if (( EMBED_CHUNK_ROWS <= 0 || TOKEN_COUNT % EMBED_CHUNK_ROWS != 0 )); then
+  echo "EMBED_CHUNK_ROWS must be positive and divide TOKEN_COUNT." >&2
+  exit 2
+fi
 
-AIR_HERD_ROWS="${AIR_HERD_ROWS:-$TOKEN_COUNT}"
+AIR_HERD_ROWS="${AIR_HERD_ROWS:-$TOKEN_PARALLEL_ROWS}"
 AIR_HERD_COLS="${AIR_HERD_COLS:-$BLOCKS_PER_ROW}"
 export AIR_HERD_ROWS AIR_HERD_COLS
 
@@ -174,7 +196,12 @@ PIPELINE_DMA="$OUT_DIR/$STEM.dma.mlir"
 WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
 
 "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
-  --stage pipeline_embed_norm \
+  --stage embed_tokens \
+  --gguf "$GGUF_PATH" \
+  --sequence-length "$EMBED_CHUNK_ROWS" \
+  --blocks-per-row "$BLOCKS_PER_ROW"
+"$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+  --stage input_layernorm \
   --gguf "$GGUF_PATH" \
   --sequence-length "$TOKEN_COUNT" \
   --blocks-per-row "$BLOCKS_PER_ROW"
@@ -252,7 +279,7 @@ HERD_ROWS=1
 HERD_COLS="$BLOCKS_PER_ROW"
 compile_air_dma_fixture "$EMBED_DMA" "${STEM}_embed_tokens"
 EMBED_AIE="$AIE_IR"
-HERD_ROWS="$TOKEN_COUNT"
+HERD_ROWS="$TOKEN_PARALLEL_ROWS"
 HERD_COLS=1
 compile_air_dma_fixture "$NORM_DMA" "${STEM}_input_layernorm"
 NORM_AIE="$AIE_IR"
@@ -289,11 +316,12 @@ if (( INCLUDE_QPROJ )); then
     compile_air_dma_fixture "$VPROJ_MLIR" "${STEM}_v_proj"
     VPROJ_AIE="$AIE_IR"
     if (( INCLUDE_ROPE )); then
-      HERD_ROWS="$TOKEN_COUNT"
+      HERD_ROWS=1
       HERD_COLS=1
       check_contains "$ROPE_TABLE_MLIR" 'air\.launch' 'rope_table official AIR launch'
       check_contains "$ROPE_TABLE_MLIR" 'air\.herd' 'rope_table official AIR herd'
-      check_contains "$ROPE_TABLE_MLIR" 'air\.dma_memcpy_nd' 'rope_table explicit AIR DMA'
+      check_contains "$ROPE_TABLE_MLIR" 'air\.channel\.put' 'rope_table explicit AIR channel put'
+      check_contains "$ROPE_TABLE_MLIR" 'air\.channel\.get' 'rope_table explicit AIR channel get'
       check_contains "$ROPE_TABLE_MLIR" 'func\.call @rope_table_tile' 'rope_table external tile kernel call'
       check_contains "$ROPE_TABLE_MLIR" 'link_with = "rope_table\.o"' 'rope_table external link object'
       compile_air_dma_fixture "$ROPE_TABLE_MLIR" "${STEM}_rope_table"
@@ -352,18 +380,22 @@ if (( INCLUDE_QPROJ )); then
   HERD_COLS="$BLOCKS_PER_ROW"
 fi
 
-"$UV" run --no-sync python -m models.quantized_qwen3.stitch_pipeline \
-  --embed-dma-mlir "$EMBED_DMA" \
-  --norm-dma-mlir "$NORM_DMA" \
-  --output "$PIPELINE_DMA" \
-  --sequence-length "$TOKEN_COUNT" \
-  --blocks-per-row "$BLOCKS_PER_ROW" \
-  --function-name "$FUNC"
+if (( EMBED_CHUNK_ROWS == TOKEN_COUNT )); then
+  "$UV" run --no-sync python -m models.quantized_qwen3.stitch_pipeline \
+    --embed-dma-mlir "$EMBED_DMA" \
+    --norm-dma-mlir "$NORM_DMA" \
+    --output "$PIPELINE_DMA" \
+    --sequence-length "$TOKEN_COUNT" \
+    --blocks-per-row "$BLOCKS_PER_ROW" \
+    --function-name "$FUNC"
 
-check_contains "$PIPELINE_DMA" "func.func @$FUNC" 'stitched pipeline function'
-check_count_ge "$PIPELINE_DMA" 'air\.launch' 2 'stitched air.launch'
-check_contains "$PIPELINE_DMA" '@emb_run_embed_tokens_0' 'renamed embed_tokens segment'
-check_contains "$PIPELINE_DMA" '@norm_run_input_layernorm_0' 'renamed input_layernorm segment'
+  check_contains "$PIPELINE_DMA" "func.func @$FUNC" 'stitched pipeline function'
+  check_count_ge "$PIPELINE_DMA" 'air\.launch' 2 'stitched air.launch'
+  check_contains "$PIPELINE_DMA" '@emb_run_embed_tokens_0' 'renamed embed_tokens segment'
+  check_contains "$PIPELINE_DMA" '@norm_run_input_layernorm_0' 'renamed input_layernorm segment'
+else
+  echo "skip stitched embed_norm: embed chunk rows $EMBED_CHUNK_ROWS differ from token count $TOKEN_COUNT"
+fi
 
 if [[ "${PIPELINE_DEBUG_AIE:-0}" == "1" ]]; then
   compile_air_dma_fixture "$PIPELINE_DMA" "$STEM"
@@ -376,6 +408,7 @@ RUNNER_ARGS=(
   --blocks-per-row "$BLOCKS_PER_ROW"
   --rms-norm-eps "$RMS_NORM_EPS"
   --embed-aie-mlir "$EMBED_AIE"
+  --embed-chunk-rows "$EMBED_CHUNK_ROWS"
   --norm-aie-mlir "$NORM_AIE"
   --work-dir "$WORK_DIR"
   --warmup "$NPU_WARMUP"

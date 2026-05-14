@@ -55,6 +55,7 @@ def main() -> int:
     parser.add_argument("--gguf", type=Path, default=DEFAULT_GGUF)
     parser.add_argument("--token-ids", type=parse_token_ids, default=parse_token_ids("0"))
     parser.add_argument("--blocks-per-row", type=int, required=True)
+    parser.add_argument("--embed-chunk-rows", type=int, default=None)
     parser.add_argument("--rms-weight-tensor", default=DEFAULT_RMS_WEIGHT_TENSOR)
     parser.add_argument("--rms-norm-eps", type=float, default=1e-6)
     parser.add_argument("--embed-aie-mlir", type=Path, required=True)
@@ -105,6 +106,9 @@ def main() -> int:
         "k_proj": args.kproj_output_rows or args.output_rows,
         "v_proj": args.vproj_output_rows or args.output_rows,
     }
+    embed_chunk_rows = args.embed_chunk_rows or len(args.token_ids)
+    if embed_chunk_rows <= 0 or len(args.token_ids) % embed_chunk_rows != 0:
+        raise SystemExit("embed_chunk_rows must be positive and divide token count")
 
     peano_install_dir = os.environ.get("PEANO_INSTALL_DIR")
     if not peano_install_dir:
@@ -377,6 +381,7 @@ def main() -> int:
             output=output,
             embed_expected=embed_expected,
             expected=expected,
+            embed_chunk_rows=embed_chunk_rows,
             warmup=args.warmup,
             iterations=args.iterations,
             rtol=args.rtol,
@@ -578,6 +583,7 @@ def main() -> int:
                 oproj_expected=(
                     self_attn_prepared.oproj_expected if self_attn_prepared is not None else None
                 ),
+                embed_chunk_rows=embed_chunk_rows,
                 warmup=args.warmup,
                 iterations=args.iterations,
                 rtol=args.rtol,
@@ -603,6 +609,7 @@ def main() -> int:
                 embed_expected=embed_expected,
                 norm_expected=expected,
                 projection_expected=projection_expected,
+                embed_chunk_rows=embed_chunk_rows,
                 warmup=args.warmup,
                 iterations=args.iterations,
                 rtol=args.rtol,
@@ -663,6 +670,7 @@ def main() -> int:
             embed_expected=embed_expected,
             norm_expected=expected,
             qproj_expected=qproj_expected,
+            embed_chunk_rows=embed_chunk_rows,
             warmup=args.warmup,
             iterations=args.iterations,
             rtol=args.rtol,

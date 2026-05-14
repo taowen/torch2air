@@ -10,6 +10,10 @@ TOKEN_COUNT="${TOKEN_COUNT:-8}"
 HEAD_DIM="${HEAD_DIM:-128}"
 QUERY_TILE_ROWS="${QUERY_TILE_ROWS:-4}"
 KEY_TILE_ROWS="${KEY_TILE_ROWS:-4}"
+Q_HEADS="${Q_HEADS:-1}"
+KV_HEADS="${KV_HEADS:-1}"
+ATTENTION_SEED="${ATTENTION_SEED:-1}"
+ATTENTION_SCALE="${ATTENTION_SCALE:-0.25}"
 NPU_WARMUP="${NPU_WARMUP:-0}"
 NPU_ITERATIONS="${NPU_ITERATIONS:-1}"
 ATTENTION_RTOL="${ATTENTION_RTOL:-0.05}"
@@ -18,7 +22,7 @@ ATTENTION_ATOL="${ATTENTION_ATOL:-0.05}"
 source "$ROOT_DIR/scripts/npu-common.sh"
 source "$ROOT_DIR/scripts/verify-air-common.sh"
 
-WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-attention-core-${TOKEN_COUNT}tok}"
+WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-attention-core-${TOKEN_COUNT}tok-q${Q_HEADS}-kv${KV_HEADS}}"
 
 ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core.mlir"
 
@@ -27,7 +31,9 @@ ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_cor
   --gguf "$GGUF_PATH" \
   --sequence-length "$TOKEN_COUNT" \
   --query-tile-rows "$QUERY_TILE_ROWS" \
-  --key-tile-rows "$KEY_TILE_ROWS"
+  --key-tile-rows "$KEY_TILE_ROWS" \
+  --q-heads "$Q_HEADS" \
+  --kv-heads "$KV_HEADS"
 
 check_contains "$ATTENTION_MLIR" 'air\.launch' 'attention_core official AIR launch'
 check_contains "$ATTENTION_MLIR" 'air\.herd' 'attention_core official AIR herd'
@@ -48,6 +54,10 @@ ATTENTION_AIE="$AIE_IR"
   --head-dim "$HEAD_DIM" \
   --query-tile-rows "$QUERY_TILE_ROWS" \
   --key-tile-rows "$KEY_TILE_ROWS" \
+  --q-heads "$Q_HEADS" \
+  --kv-heads "$KV_HEADS" \
+  --seed "$ATTENTION_SEED" \
+  --scale "$ATTENTION_SCALE" \
   --warmup "$NPU_WARMUP" \
   --iterations "$NPU_ITERATIONS" \
   --rtol "$ATTENTION_RTOL" \

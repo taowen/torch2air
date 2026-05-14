@@ -39,7 +39,7 @@ static inline void reduce_half_pi(float x, float &reduced, float &sin_sign, floa
     return;
   }
   if (x < -half_pi) {
-    reduced = -pi - x;
+    reduced = x + pi;
     sin_sign = -1.0f;
     cos_sign = -1.0f;
     return;

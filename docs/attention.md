@@ -20,6 +20,10 @@ MLIR-AIR 把一个算子的设备执行拆成几个层次：
   具体的 shim、memtile、core DMA 和同步。
 - `air.dma_memcpy_nd` 是显式多维 DMA。它适合简单的单输入/单输出 tile 搬运；如果多路
   输入之间需要严格顺序，直接使用 channel 更容易表达。
+- `air.launch` 和 `air.herd` 的 region 是隔离的。region 内要用的 index 常量需要在
+  region 内重新定义，不能依赖外层 SSA 值自然可见。
+- `--air-to-aie stack-size` 会占用 AIE tile L1。stack 太小时，external kernel 的局部
+  变量和调用帧可能覆盖相邻 L1 buffer，表现为运行结果被静默污染。
 
 所以 AIR 里真正重要的不是“写一个 C++ kernel”，而是让 MLIR 文件明确表达：
 
@@ -83,12 +87,13 @@ func.func @run_attention_core(
 
 ## 当前 tile 策略
 
-当前硬件验证过的参数是：
+当前硬件验证过的 attention 参数是：
 
 ```text
 HEAD_DIM=128
 QUERY_TILE_ROWS=4
 KEY_TILE_ROWS=4
+SEQUENCE_LENGTH=8
 ```
 
 MLIR 模板声明三个 channel：
@@ -140,8 +145,164 @@ L1 中保留三类状态：
 3. 用 online softmax 公式合并旧的 `(max, sum, acc)` 和当前 tile 的 score/value。
 4. 最后一个 KV tile 结束时，用 `1 / row_sum` 归一化 `out_l1`。
 
+4-token 路径满足 `SEQUENCE_LENGTH == KEY_TILE_ROWS`，因此 `attention_core.cc`
+会走更直接的 single-tile 分支。8-token 路径已经进入两个 KV tile 的 online softmax
+路径，并在真实 NPU 上通过了 full-head `attention` 和 `self_attn` 验证。
+
+真实 Qwen3 q/k 的 score 很容易出现非常尖锐的 softmax。当前 tile body 对
+`tile_max - second_max > 20` 的情况直接走 one-hot sharp softmax，避免在 AIE external
+kernel 里对实际贡献为 0 的项继续调用 `exp` 近似。非尖锐场景仍走近似 `exp`。
+
 这里没有把完整 `SxS` attention score materialize 到 L3 或 L1。score 只在 tile body
 里以标量形式存在，减少了中间 buffer 和 stage 间拷贝。
+
+## 调试经验
+
+这次 full-head `self_attn` 的失败最终收敛到 `attention_core`，经验是：
+
+- 先把问题从完整 pipeline 拆成 standalone kernel。`q/k/v -> attention_core` 用同一个
+  full-head AIE 产物、同一个真实 NPU 跑，证明 small-score 随机输入能过，大幅值 q/k
+  复现失败。这样排除了 shared BO 串接、RoPE、projection slicing 这些方向。
+- 不要只看最终 attention output。临时 debug external kernel 把 `score0..score3`、
+  `tile_max`、`weight0..weight3` 写回 output buffer，直接确认 AIE 上的 dot product
+  本身和 PyTorch ROCm 对得上。
+- score 对但 output 错，问题通常在 softmax/update path，而不是 channel 顺序。这里
+  具体表现是：引入较重的 `fast_exp` 路径后，AIE external kernel 的局部变量、整数转换
+  和 bit 拼装让部分 head 的 score/weight 被污染。
+- `double` 累加不是实用修复。它能表达更高精度，但在 AIE 上导致 program memory overflow。
+  对这个 kernel，减少 tile body 复杂度比盲目提高精度更重要。
+- 当前 4-token 场景不需要在线状态。`SEQUENCE_LENGTH == KEY_TILE_ROWS` 时走 single-tile
+  attention，既更简单，也避开了 first tile 后立刻从 L1 状态读回的风险。
+- sharp softmax 是必要的专门路径。真实模型的 q/k norm+RoPE 后幅值很大，score gap 经常
+  远大于 20；这时 PyTorch softmax 实际上已经接近 one-hot，NPU 侧也应该直接表达这个事实。
+- 调试产物只留在 `.cache` 或临时工作目录，不进入正式路径。确认结论后，只把简化后的
+  `attention_core.cc` 修复提交。
+
+这条定位链比直接改完整 pipeline 更可靠：先证明数据搬运和 score 正确，再缩小到
+softmax/update body，最后用真实模型链路回归。
+
+## 系统化调试机制
+
+MLIR-AIR/NPU 问题不要只靠调 tile 参数。现在按四层调试：
+
+第一层是 AIR graph 和 lowering。官方工具里已经有 dependency graph dump 和 pass 级 IR
+打印：
+
+```bash
+AIR_DUMP_DEP_GRAPHS=1 AIR_VERIFY_EACH=1 \
+  UV=uv scripts/run-quantized-qwen3-attention-npu.sh
+
+AIR_PRINT_IR_ROOT=.cache/debug-air/ir AIR_VERIFY_EACH=1 \
+  UV=uv scripts/run-quantized-qwen3-attention-npu.sh
+```
+
+`AIR_DUMP_DEP_GRAPHS=1` 会生成 `*.dep-graph/combined.dot`、`host.dot` 和 herd/core 子图。
+它适合检查 `air.channel.put/get` 是否成对、host runtime sequence 和 herd consumer 顺序
+是否一致，以及某个状态 buffer 是否跨 loop 被错误复用。
+
+`AIR_PRINT_IR_ROOT` 使用 MLIR 的 `--mlir-print-ir-after-all` 和
+`--mlir-print-ir-tree-dir`，每个 `air-opt` 阶段都会保存 pass 后 IR。它适合定位
+“哪一个 pass 把 DMA/channel/loop 变成了意外形态”。
+
+第二层是 AIE lowering 后的地址和锁。`aiecc` 生成的
+`<work_dir>/aiecc/input_with_addresses.mlir` 和 `*_core_*.ld.script` 是核心文件：
+
+- `input_with_addresses.mlir` 能看到每个 L1 buffer 的地址、bank、lock、DMA BD 和
+  `aie.runtime_sequence`。
+- link script 能看到 stack 起点和大小，以及显式 buffer 是否贴得太近。
+- 如果输出像“某一段 token/head 变成 0”或“后半段复用旧状态”，先看这里，而不是先改数值
+  代码。
+
+第三层是官方 runtime/trace 机制。MLIR-AIR 的 `aircc` / `XRTBackend` 支持
+`debug_ir`、`trace_size`、`trace_offset`、`use_lock_race_condition_fix`；trace 通过
+`air-to-aie insert-trace-packet-flow=true` 和 `airrt-to-npu trace-size/trace-offset`
+写到 output buffer 后缀。它主要看事件和时间线，不直接看数值。对我们的手写 runtime，
+trace 还需要把 output BO 预留 trace 后缀后再启用。
+
+第四层是数值状态探针。AIR/AIE 没有方便的 printf；定位 state corruption 最直接的办法是
+临时把内部状态写到 debug output：`q_base/kv_base/q_row`、`score0..3`、`tile_max`、
+`row_max/row_sum`、`weight0..3`、`out_l1` 的指定几个元素。这个 debug ABI 只进 `.cache`
+实验，不进入正式 stage ABI。
+
+还有两个实用开关：
+
+```bash
+AIR_USE_LOCK_RACE_CONDITION_FIX=1 ...
+AIR_STACK_SIZE=8192 ...
+```
+
+`AIR_USE_LOCK_RACE_CONDITION_FIX=1` 会把 `use-lock-race-condition-fix=true` 传给
+`air-to-aie`，对应官方 extra dummy DMA BD 的 race workaround。它可以排查 lock/BD race，
+但不是数值修复。当前 16-token/full-head/large-score standalone failure 在
+`QUERY_TILE_ROWS=1`、`AIR_STACK_SIZE=8192`、`AIR_USE_LOCK_RACE_CONDITION_FIX=1` 下仍然
+复现：
+
+```text
+attention_core mismatch: max_abs=0.932426393032074 index=(2,1560)
+actual=0.0 expected=0.932426393032074
+```
+
+这说明当前卡点不像单纯 stack 不够或 AIR lock race，更像 attention_core 的在线状态更新
+路径在长 sequence / 尖锐 softmax 下需要进一步插桩确认。
+
+复现这个 standalone 调试用例可以直接用：
+
+```bash
+TOKEN_COUNT=16 QUERY_TILE_ROWS=1 KEY_TILE_ROWS=4 \
+  Q_HEADS=16 KV_HEADS=8 ATTENTION_SCALE=4.0 \
+  ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.2 \
+  AIR_DUMP_DEP_GRAPHS=1 AIR_STACK_SIZE=8192 \
+  UV=uv scripts/run-quantized-qwen3-attention-npu.sh
+```
+
+## 8-token 机制实验结论
+
+把 `self_attn` 从 4 tokens 扩到 8 tokens 时，主要问题不在 attention 数学本身，而在
+AIR lowering 后的硬件资源和数据流顺序。
+
+第一类问题是 AIE stack。默认 `stack-size=1024` 时，8-token `attention_core` 会出现
+特定行输出重复或状态污染，例如后半段 query row 读到前面 row 的结果。检查
+`aiecc/input_with_addresses.mlir` 和 link script 后可以看到 stack 与 L1 buffer 在同一个
+tile memory 里相邻分配。把默认 stack 提到 4096 后，`QUERY_TILE_ROWS=4` 和
+`QUERY_TILE_ROWS=1` 的 8-token attention_core 都能稳定对拍通过。
+
+第二类问题是物理 herd 行数。npu2_4col 上把 token 数直接映射成 8 行 herd 会触发 shim
+DMA channel 和 placement 压力。现在的做法是把物理 token 并行度限制到 4 行，长一点的
+sequence 在每个 tile 内用 `token_i += physical_rows` 的 loop 继续处理。这已经应用到
+`input_layernorm`，8-token standalone norm 和完整 pipeline 都能通过。
+
+第三类问题是多输出 DMA 的顺序。`rope_table` 早期在 core loop 里连续写 cos/sin 两个
+输出，但 AIR lowering 会把 host 侧 runtime sequence 拆成“先取所有 cos，再取所有 sin”
+的形态，和 producer 的 per-token cos/sin 交错顺序不一致。改成显式
+`air.channel.put/get` 后，launch 侧和 herd 侧都按 token 顺序传递 cos 再 sin，8-token
+RoPE table 在真实 NPU 上通过。这个结论也说明：有顺序约束的多路输入/输出，优先用
+AIR channel 明确表达，不依赖循环里的多次 `air.dma_memcpy_nd` 被 lowering 成期望顺序。
+
+第四类问题是 L1 bank 压力。当前 Q/K 的 Q4_K 权重 tile 是 `32x152xi32`，O projection
+是 `32x304xi32`，V 的 Q6_K tile 是 `32x424xi32`。这些都超过或接近单个 16KB bank，
+`aiecc` 会提示 bank-aware allocation 失败并退到 sequential allocation。现在真实 NPU
+能跑通，但这是后续 projection/o_proj 性能和稳定性优化的主要卡点。
+
+## 后续定位规则
+
+遇到 attention 或后续 decode/prefill 的 NPU 问题时，按下面顺序定位：
+
+1. 先拆成 standalone kernel。完整 pipeline 只能说明最终错了，不能区分 shared BO 交接、
+   AIR channel 顺序、external kernel 数值路径和 L1 资源问题。
+2. standalone 也要用真实 NPU 和 PyTorch ROCm reference 对拍。NumPy 只能用于辅助观察，
+   不能作为正式 reference。
+3. 不只看最终 output。必要时临时把 score、tile max、softmax weight、running sum 或
+   running max 写回 output buffer，确认错在搬运、dot product、softmax 还是状态更新。
+4. 每次修改 MLIR 模板后检查生成物。重点看 `air.channel.put/get` 的顺序、`air.herd`
+   的物理规模、`memref<..., 2>` 的 L1 buffer 形状，以及 lowering 后 runtime sequence
+   是否和 producer/consumer 期望一致。
+5. 看到结果像“某一行重复前一行”或“后半段 token 被污染”时，优先检查 AIE stack 和 L1
+   address map。`aiecc/input_with_addresses.mlir`、link script 和 bank allocation warning
+   比最终 Python 异常更有信息量。
+6. `air-place-herds` 的 `No valid placement found` 目前可能是非致命诊断；是否真正失败
+   以 `air-to-aie`、`aiecc`、真实 NPU 运行和 PyTorch ROCm 对拍为准。
+7. 不把调试专用 ABI 留进正式路径。调试时可以临时写 debug buffer，但确认结论后，正式
+   kernel 仍保持简单的 stage ABI 和 shared `pyxrt.bo` 交接。
 
 ## lowering 和运行
 
@@ -167,11 +328,12 @@ TOKEN_COUNT=8 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 NPU_ITERATIONS=1 NPU_WARMUP=0 \
 然后编译 `attention_core.o`，通过 AIR/AIE 工具链生成 xclbin 和 insts，最后在真实 NPU
 上运行，并和 PyTorch ROCm reference 对拍。
 
-完整 Qwen3 attention pipeline 的当前验证命令是：
+完整 Qwen3 self-attn pipeline 的当前验证命令是：
 
 ```bash
-TOKEN_IDS=0,1,2,3 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 NPU_ITERATIONS=1 NPU_WARMUP=0 \
-  UV=uv scripts/run-quantized-qwen3-pipeline-npu.sh attention
+TOKEN_IDS=0,1,2,3,4,5,6,7 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 \
+  NPU_ITERATIONS=1 NPU_WARMUP=0 \
+  UV=uv scripts/run-quantized-qwen3-pipeline-npu.sh self_attn
 ```
 
 验证链路是：
@@ -183,6 +345,7 @@ embed_tokens
   -> rope_table
   -> q_norm_rope / k_norm_rope
   -> attention_core
+  -> o_proj
 ```
 
 所有 stage 都在真实 NPU 上跑。reference 来自同一边界上的 PyTorch ROCm tensor。
@@ -191,18 +354,29 @@ host 读取中间 buffer 只用于最终校验，不参与 operator 之间的交
 最近一次记录的结果：
 
 ```text
-standalone attention_core, 8 tokens:
+standalone attention_core, 4 tokens, 16 q heads / 8 kv heads, small-score input:
   reference pytorch_rocm AMD Radeon 890M
-  attention_core_max_abs 0.025021695
-  allclose True rtol=0.05 atol=0.05
-  mean_ms 2.699
-
-full attention pipeline, 4 tokens:
-  reference safetensors_pytorch_rocm AMD Radeon 890M
-  handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope->attention_core shared pyxrt BO
-  attention_core_max_abs 0.065862715
+  attention_core_max_abs 3.1739473e-05
   allclose True rtol=0.05 atol=0.2
-  mean_ms 293.233
+  mean_ms 9.670
+
+standalone attention_core, 4 tokens, 16 q heads / 8 kv heads, large q/k repro:
+  attention_core_max_abs 3.8504601e-05
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 8.974
+
+full self_attn pipeline, 8 tokens:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope->attention_core->o_proj shared pyxrt BO
+  rope_cos_max_abs 2.4806999e-05
+  rope_sin_max_abs 3.3974648e-06
+  q_norm_rope_max_abs 5.7220459e-06
+  k_norm_rope_max_abs 9.1552734e-05
+  attention_core_max_abs 0.00095266104
+  o_proj_max_abs 0.053668097
+  max_abs 0.16560259
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 9767.038
 ```
 
 ## 为什么现在这样做
@@ -226,18 +400,25 @@ full attention pipeline, 4 tokens:
 - `KEY_TILE_ROWS` 固定为 4。`attention_core.cc` 现在显式展开了 4 行 K/V，避免 AIE L1
   栈数组带来的不稳定结果。
 - `SEQUENCE_LENGTH` 必须能整除 `QUERY_TILE_ROWS` 和 `KEY_TILE_ROWS`。
-- standalone attention 已经到 8 tokens；完整 pipeline 的 8-token 路径目前卡在
-  attention 之前的 `input_layernorm` channel lowering，不是 `attention_core` 本身。
+- 当前完整 full-head `self_attn` 已经验证到 8 tokens。更长 context 需要继续验证
+  token loop、channel FIFO 深度和 runtime sequence 的规模。
+- 当前默认 `AIR_STACK_SIZE=4096`。它解决了 8-token attention_core 的 L1 状态污染，但
+  会减少每个 tile 可用于显式 L1 buffer 的空间。
+- projection 和 o_proj 的量化权重 tile 对 L1 bank 压力较大。现在能跑通，但后续需要把
+  Q4_K/Q6_K 的 tile 形状和 ABI 再压低。
 - `air-place-herds` 对部分形状会打印 `No valid placement found` 诊断，但当前记录里仍能
   生成 AIE IR、xclbin/insts，并得到通过的硬件结果。
-- 当前 softmax 使用 tile body 里的近似 `exp`，所以验证阈值按 NPU 数值路径设置为
-  `rtol=0.05`。
+- `q_norm_rope` / `k_norm_rope` 会因为单列输入 channel 压力超过 shim DMA limit 而被
+  auto-upgrade 到 `dma_packet`。当前运行正确，但后续多 stage 融合时要继续关注。
+- 当前 softmax 使用 tile body 里的近似 `exp`，并对尖锐 score 走 one-hot 分支，所以验证
+  阈值按 NPU 数值路径设置为 `rtol=0.05`。
 
 ## 后续工作
 
-1. 把 `input_layernorm`、`rope_table`、`q/k_norm_rope` 也改成 stage-local token loop，
-   让完整 pipeline 能稳定扩到 8 tokens 以上。
+1. 继续把 8-token 经验推广到 decode/prefill 更长 context，先验证 token loop 和 channel
+   顺序，再扩大 heads/tiles。
 2. 评估 `QUERY_TILE_ROWS` 和 `KEY_TILE_ROWS` 的组合，先保持单 herd，再考虑多 herd 或
    cascade。
 3. 在保持 q/k/v ABI 的前提下，继续减少内部 channel 和 L1 buffer 压力。
-4. 等多个 stage 的单独 xclbin 路径稳定后，再评估是否需要更紧的 stitched AIR 或 fusion。
+4. 优先降低 Q4_K/Q6_K projection 的 L1 weight tile 和 bank 压力，再评估 stitched AIR 或
+   fusion 是否值得做。

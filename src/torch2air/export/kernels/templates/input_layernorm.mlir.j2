@@ -6,6 +6,8 @@
 // owns the per-row RMSNorm body.
 
 module {
+  {% set physical_rows = sequence_length if sequence_length < 4 else 4 %}
+
   func.func private @rms_norm_tile(
       memref<1x{{ hidden_size }}xf32, 2>,
       memref<{{ hidden_size }}xf32, 2>,
@@ -16,16 +18,17 @@ module {
       %hidden: memref<{{ sequence_length }}x{{ hidden_size }}xf32>,
       %rms_weight: memref<{{ hidden_size }}xf32>,
       %output: memref<{{ sequence_length }}x{{ hidden_size }}xf32>) {
-    {% set index_constants = (range(0, 2) | list + [sequence_length, hidden_size]) | unique | list | sort %}
+    {% set index_constants = (range(0, 2) | list + [sequence_length, hidden_size, physical_rows]) | unique | list | sort %}
     {% for value in index_constants %}
     %idx{{ value }} = arith.constant {{ value }} : index
     {% endfor %}
 
     scf.parallel (%launch_i, %launch_j) = (%idx0, %idx0) to (%idx1, %idx1) step (%idx1, %idx1) {
-      scf.parallel (%tile_i, %tile_j) = (%idx0, %idx0) to (%idx{{ sequence_length }}, %idx1) step (%idx1, %idx1) {
-        %hidden_tile = memref.subview %hidden[%tile_i, %idx0] [1, {{ hidden_size }}] [1, 1]
+      scf.parallel (%tile_i, %tile_j) = (%idx0, %idx0) to (%idx{{ physical_rows }}, %idx1) step (%idx1, %idx1) {
+        scf.for %token_i = %tile_i to %idx{{ sequence_length }} step %idx{{ physical_rows }} {
+        %hidden_tile = memref.subview %hidden[%token_i, %idx0] [1, {{ hidden_size }}] [1, 1]
             : memref<{{ sequence_length }}x{{ hidden_size }}xf32> to memref<1x{{ hidden_size }}xf32, strided<[{{ hidden_size }}, 1], offset: ?>>
-        %out_tile = memref.subview %output[%tile_i, %idx0] [1, {{ hidden_size }}] [1, 1]
+        %out_tile = memref.subview %output[%token_i, %idx0] [1, {{ hidden_size }}] [1, 1]
             : memref<{{ sequence_length }}x{{ hidden_size }}xf32> to memref<1x{{ hidden_size }}xf32, strided<[{{ hidden_size }}, 1], offset: ?>>
 
         %hidden_l1 = memref.alloc() : memref<1x{{ hidden_size }}xf32, 2>
@@ -48,6 +51,7 @@ module {
         memref.dealloc %hidden_l1 : memref<1x{{ hidden_size }}xf32, 2>
         memref.dealloc %weight_l1 : memref<{{ hidden_size }}xf32, 2>
         memref.dealloc %out_l1 : memref<1x{{ hidden_size }}xf32, 2>
+        }
         scf.reduce
       }
       scf.reduce
