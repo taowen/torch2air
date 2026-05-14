@@ -39,9 +39,10 @@ module {
             memref<{{ output_rows }}x{{ weight_words }}xi32>,
             memref<{{ sequence_length }}x{{ output_rows }}xf32> {
         %seg_seq = arith.constant {{ sequence_length }} : index
+        %seg_rows = arith.constant 1 : index
         %seg_tiles = arith.constant {{ output_tiles }} : index
         air.herd @q4k_linear_herd tile (%tile_i, %tile_j)
-            in (%herd_s_i=%seg_seq, %herd_s_j=%seg_tiles)
+            in (%herd_s_i=%seg_rows, %herd_s_j=%seg_tiles)
             args(%herd_hidden=%seg_hidden, %herd_weights=%seg_weights, %herd_output=%seg_output)
             : memref<{{ sequence_length }}x{{ hidden_size }}xf32>,
               memref<{{ output_rows }}x{{ weight_words }}xi32>,
@@ -52,37 +53,42 @@ module {
           %hidx{{ output_rows }} = arith.constant {{ output_rows }} : index
           %hidx{{ weight_words }} = arith.constant {{ weight_words }} : index
           %hidx{{ hidden_size }} = arith.constant {{ hidden_size }} : index
+          %hseq = arith.constant {{ sequence_length }} : index
           %row_base = arith.muli %tile_j, %hidx{{ output_tile_rows }} : index
 
-          %hidden_l1 = memref.alloc() : memref<1x{{ hidden_size }}xf32, 2 : i32>
           %weight_l1 = memref.alloc() : memref<{{ output_tile_rows }}x{{ weight_words }}xi32, 2 : i32>
-          %out_l1 = memref.alloc() : memref<1x{{ output_tile_rows }}xf32, 2 : i32>
-
-          air.dma_memcpy_nd
-              (%hidden_l1[] [] [],
-               %herd_hidden[%tile_i, %hidx0] [%hidx1, %hidx{{ hidden_size }}] [%hidx{{ hidden_size }}, %hidx1])
-              : (memref<1x{{ hidden_size }}xf32, 2 : i32>,
-                 memref<{{ sequence_length }}x{{ hidden_size }}xf32>)
           air.dma_memcpy_nd
               (%weight_l1[] [] [],
                %herd_weights[%row_base, %hidx0] [%hidx{{ output_tile_rows }}, %hidx{{ weight_words }}] [%hidx{{ weight_words }}, %hidx1])
               : (memref<{{ output_tile_rows }}x{{ weight_words }}xi32, 2 : i32>,
                  memref<{{ output_rows }}x{{ weight_words }}xi32>)
 
-          func.call @q4k_linear_tile(%hidden_l1, %weight_l1, %out_l1)
-              : (memref<1x{{ hidden_size }}xf32, 2 : i32>,
-                 memref<{{ output_tile_rows }}x{{ weight_words }}xi32, 2 : i32>,
-                 memref<1x{{ output_tile_rows }}xf32, 2 : i32>) -> ()
+          scf.for %token_i = %hidx0 to %hseq step %hidx1 {
+            %hidden_l1 = memref.alloc() : memref<1x{{ hidden_size }}xf32, 2 : i32>
+            %out_l1 = memref.alloc() : memref<1x{{ output_tile_rows }}xf32, 2 : i32>
 
-          air.dma_memcpy_nd
-              (%herd_output[%tile_i, %row_base] [%hidx1, %hidx{{ output_tile_rows }}] [%hidx{{ output_rows }}, %hidx1],
-               %out_l1[] [] [])
-              : (memref<{{ sequence_length }}x{{ output_rows }}xf32>,
-                 memref<1x{{ output_tile_rows }}xf32, 2 : i32>)
+            air.dma_memcpy_nd
+                (%hidden_l1[] [] [],
+                 %herd_hidden[%token_i, %hidx0] [%hidx1, %hidx{{ hidden_size }}] [%hidx{{ hidden_size }}, %hidx1])
+                : (memref<1x{{ hidden_size }}xf32, 2 : i32>,
+                   memref<{{ sequence_length }}x{{ hidden_size }}xf32>)
 
-          memref.dealloc %hidden_l1 : memref<1x{{ hidden_size }}xf32, 2 : i32>
+            func.call @q4k_linear_tile(%hidden_l1, %weight_l1, %out_l1)
+                : (memref<1x{{ hidden_size }}xf32, 2 : i32>,
+                   memref<{{ output_tile_rows }}x{{ weight_words }}xi32, 2 : i32>,
+                   memref<1x{{ output_tile_rows }}xf32, 2 : i32>) -> ()
+
+            air.dma_memcpy_nd
+                (%herd_output[%token_i, %row_base] [%hidx1, %hidx{{ output_tile_rows }}] [%hidx{{ output_rows }}, %hidx1],
+                 %out_l1[] [] [])
+                : (memref<{{ sequence_length }}x{{ output_rows }}xf32>,
+                   memref<1x{{ output_tile_rows }}xf32, 2 : i32>)
+
+            memref.dealloc %hidden_l1 : memref<1x{{ hidden_size }}xf32, 2 : i32>
+            memref.dealloc %out_l1 : memref<1x{{ output_tile_rows }}xf32, 2 : i32>
+          }
+
           memref.dealloc %weight_l1 : memref<{{ output_tile_rows }}x{{ weight_words }}xi32, 2 : i32>
-          memref.dealloc %out_l1 : memref<1x{{ output_tile_rows }}xf32, 2 : i32>
         }
       }
     }

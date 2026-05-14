@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 UV="${UV:-uv}"
 PIPELINE_STAGE="${1:-embed_norm}"
 GGUF_PATH="${GGUF_PATH:-/var/home/taowen/projects/torch2vk/dist/quantized_qwen3/model.gguf}"
-TOKEN_IDS="${TOKEN_IDS:-0}"
+TOKEN_IDS="${TOKEN_IDS:-}"
 BLOCKS_PER_ROW="${BLOCKS_PER_ROW:-4}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/src/models/quantized_qwen3/generated/lowered}"
 NPU_WARMUP="${NPU_WARMUP:-0}"
@@ -16,12 +16,15 @@ RMS_NORM_EPS="${RMS_NORM_EPS:-0.000001}"
 OUTPUT_ROWS="${OUTPUT_ROWS:-128}"
 OUTPUT_TILE_ROWS="${OUTPUT_TILE_ROWS:-32}"
 START_POSITION="${START_POSITION:-0}"
+QUERY_TILE_ROWS="${QUERY_TILE_ROWS:-4}"
+KEY_TILE_ROWS="${KEY_TILE_ROWS:-4}"
 
 case "$PIPELINE_STAGE" in
   embed_norm|pipeline_embed_norm)
     INCLUDE_QPROJ=0
     INCLUDE_QKV=0
     INCLUDE_ROPE=0
+    INCLUDE_ATTENTION=0
     STEM="quantized_qwen3_pipeline_embed_norm"
     FUNC="run_pipeline_embed_norm"
     ;;
@@ -29,6 +32,7 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QPROJ=1
     INCLUDE_QKV=0
     INCLUDE_ROPE=0
+    INCLUDE_ATTENTION=0
     STEM="quantized_qwen3_pipeline_embed_norm_qproj"
     FUNC="run_pipeline_embed_norm_qproj"
     ;;
@@ -36,6 +40,7 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QPROJ=1
     INCLUDE_QKV=1
     INCLUDE_ROPE=0
+    INCLUDE_ATTENTION=0
     STEM="quantized_qwen3_pipeline_embed_norm_qkv"
     FUNC="run_pipeline_embed_norm_qkv"
     ;;
@@ -43,14 +48,31 @@ case "$PIPELINE_STAGE" in
     INCLUDE_QPROJ=1
     INCLUDE_QKV=1
     INCLUDE_ROPE=1
+    INCLUDE_ATTENTION=0
     STEM="quantized_qwen3_pipeline_embed_norm_qkv_rope"
     FUNC="run_pipeline_embed_norm_qkv_rope"
+    ;;
+  embed_norm_qkv_rope_attention|pipeline_embed_norm_qkv_rope_attention|attention)
+    INCLUDE_QPROJ=1
+    INCLUDE_QKV=1
+    INCLUDE_ROPE=1
+    INCLUDE_ATTENTION=1
+    STEM="quantized_qwen3_pipeline_embed_norm_qkv_rope_attention"
+    FUNC="run_pipeline_embed_norm_qkv_rope_attention"
     ;;
   *)
     echo "Unknown quantized_qwen3 pipeline stage: $PIPELINE_STAGE" >&2
     exit 2
     ;;
 esac
+
+if [[ -z "$TOKEN_IDS" ]]; then
+  if (( INCLUDE_ATTENTION )); then
+    TOKEN_IDS="0,1,2,3"
+  else
+    TOKEN_IDS="0"
+  fi
+fi
 
 IFS=',' read -r -a _token_parts <<< "$TOKEN_IDS"
 TOKEN_COUNT="${TOKEN_COUNT:-${#_token_parts[@]}}"
@@ -64,6 +86,10 @@ if (( INCLUDE_QPROJ && (OUTPUT_TILE_ROWS <= 0 || OUTPUT_ROWS % OUTPUT_TILE_ROWS 
 fi
 if (( INCLUDE_ROPE && OUTPUT_ROWS != 128 )); then
   echo "q/k norm+RoPE currently validates one 128-wide Qwen3 attention head, so OUTPUT_ROWS must be 128." >&2
+  exit 2
+fi
+if (( INCLUDE_ATTENTION && (TOKEN_COUNT % QUERY_TILE_ROWS != 0 || TOKEN_COUNT % KEY_TILE_ROWS != 0) )); then
+  echo "QUERY_TILE_ROWS and KEY_TILE_ROWS must divide TOKEN_COUNT for attention_core." >&2
   exit 2
 fi
 
@@ -82,6 +108,7 @@ VPROJ_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_v_proj.mlir"
 ROPE_TABLE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_rope_table.mlir"
 Q_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_q_norm_rope.mlir"
 K_NORM_ROPE_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_k_norm_rope.mlir"
+ATTENTION_MLIR="$ROOT_DIR/src/models/quantized_qwen3/generated/run_attention_core.mlir"
 PIPELINE_DMA="$OUT_DIR/$STEM.dma.mlir"
 WORK_DIR="${WORK_DIR:-$NPU_WORK_ROOT/quantized-qwen3-${PIPELINE_STAGE}-${TOKEN_COUNT}tok-${BLOCKS_PER_ROW}block}"
 
@@ -126,6 +153,14 @@ if (( INCLUDE_ROPE )); then
     --gguf "$GGUF_PATH" \
     --sequence-length "$TOKEN_COUNT"
 fi
+if (( INCLUDE_ATTENTION )); then
+  "$ROOT_DIR/scripts/export-quantized-qwen3.sh" \
+    --stage attention_core \
+    --gguf "$GGUF_PATH" \
+    --sequence-length "$TOKEN_COUNT" \
+    --query-tile-rows "$QUERY_TILE_ROWS" \
+    --key-tile-rows "$KEY_TILE_ROWS"
+fi
 
 check_contains "$EMBED_MLIR" 'scf\.parallel' 'embed_tokens explicit tile loop'
 check_contains "$EMBED_MLIR" 'memref\.subview' 'embed_tokens tile subview'
@@ -138,11 +173,16 @@ lower_air_fixture_to_dma "$EMBED_MLIR" "${STEM}_embed_tokens"
 EMBED_DMA="$DMA_IR"
 lower_air_fixture_to_dma "$NORM_MLIR" "${STEM}_input_layernorm"
 NORM_DMA="$DMA_IR"
+HERD_ROWS=1
+HERD_COLS="$BLOCKS_PER_ROW"
 compile_air_dma_fixture "$EMBED_DMA" "${STEM}_embed_tokens"
 EMBED_AIE="$AIE_IR"
+HERD_ROWS="$TOKEN_COUNT"
+HERD_COLS=1
 compile_air_dma_fixture "$NORM_DMA" "${STEM}_input_layernorm"
 NORM_AIE="$AIE_IR"
 if (( INCLUDE_QPROJ )); then
+  HERD_ROWS=1
   HERD_COLS="$((OUTPUT_ROWS / OUTPUT_TILE_ROWS))"
   PROJ_WEIGHT_WORDS="$((BLOCKS_PER_ROW * 38))"
   check_contains "$QPROJ_MLIR" 'air\.launch' 'q_proj official AIR launch'
@@ -172,6 +212,7 @@ if (( INCLUDE_QPROJ )); then
     compile_air_dma_fixture "$VPROJ_MLIR" "${STEM}_v_proj"
     VPROJ_AIE="$AIE_IR"
     if (( INCLUDE_ROPE )); then
+      HERD_ROWS="$TOKEN_COUNT"
       HERD_COLS=1
       check_contains "$ROPE_TABLE_MLIR" 'air\.launch' 'rope_table official AIR launch'
       check_contains "$ROPE_TABLE_MLIR" 'air\.herd' 'rope_table official AIR herd'
@@ -196,6 +237,19 @@ if (( INCLUDE_QPROJ )); then
       check_contains "$K_NORM_ROPE_MLIR" 'link_with = "rms_norm_rope\.o"' 'k_norm_rope external link object'
       compile_air_dma_fixture "$K_NORM_ROPE_MLIR" "${STEM}_k_norm_rope"
       K_NORM_ROPE_AIE="$AIE_IR"
+
+      if (( INCLUDE_ATTENTION )); then
+        check_contains "$ATTENTION_MLIR" 'air\.launch' 'attention_core official AIR launch'
+        check_contains "$ATTENTION_MLIR" 'air\.herd' 'attention_core official AIR herd'
+        check_contains "$ATTENTION_MLIR" 'air\.channel\.put' 'attention_core explicit AIR channel put'
+        check_contains "$ATTENTION_MLIR" 'air\.channel\.get' 'attention_core explicit AIR channel get'
+        check_contains "$ATTENTION_MLIR" 'scf\.for %q_block' 'attention_core q-block loop'
+        check_contains "$ATTENTION_MLIR" 'scf\.for %kv_block' 'attention_core kv-block loop'
+        check_contains "$ATTENTION_MLIR" 'func\.call @attention_core_tile' 'attention_core external tile kernel call'
+        check_contains "$ATTENTION_MLIR" 'link_with = "attention_core\.o"' 'attention_core external link object'
+        compile_air_dma_fixture "$ATTENTION_MLIR" "${STEM}_attention_core"
+        ATTENTION_AIE="$AIE_IR"
+      fi
     fi
   fi
   HERD_COLS="$BLOCKS_PER_ROW"
@@ -249,6 +303,13 @@ if (( INCLUDE_ROPE )); then
     --q-norm-rope-aie-mlir "$Q_NORM_ROPE_AIE"
     --k-norm-rope-aie-mlir "$K_NORM_ROPE_AIE"
     --start-position "$START_POSITION"
+  )
+fi
+if (( INCLUDE_ATTENTION )); then
+  RUNNER_ARGS+=(
+    --attention-aie-mlir "$ATTENTION_AIE"
+    --query-tile-rows "$QUERY_TILE_ROWS"
+    --key-tile-rows "$KEY_TILE_ROWS"
   )
 fi
 

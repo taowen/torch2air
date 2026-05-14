@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import argparse
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import pyxrt as xrt
+import torch
+
+from .reference_runtime import check_close_rocm, first_values, max_abs_rocm
+from .run_embed_tokens import compile_runtime
+from .run_pipeline import (
+    HEAD_DIM,
+    compile_attention_core_object,
+    load_xrt_kernel,
+    reference_attention_core,
+)
+
+
+def deterministic_tensor(*, rows: int, cols: int, seed: int, scale: float) -> torch.Tensor:
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return torch.randn((rows, cols), device=device, generator=generator, dtype=torch.float32) * scale
+
+
+def run_attention_core_on_npu(
+    *,
+    xclbin: Path,
+    insts: Path,
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    output: np.ndarray,
+    expected: torch.Tensor,
+    warmup: int,
+    iterations: int,
+    rtol: float,
+    atol: float,
+) -> tuple[np.ndarray, list[float]]:
+    device = xrt.device(0)
+    _, kernel, instr_v, bo_instr = load_xrt_kernel(device, xclbin=xclbin, insts=insts)
+
+    bo_q = xrt.bo(device, q.nbytes, xrt.bo.host_only, kernel.group_id(3))
+    bo_k = xrt.bo(device, k.nbytes, xrt.bo.host_only, kernel.group_id(4))
+    bo_v = xrt.bo(device, v.nbytes, xrt.bo.host_only, kernel.group_id(5))
+    bo_output = xrt.bo(device, output.nbytes, xrt.bo.host_only, kernel.group_id(6))
+    for bo, array in (
+        (bo_q, q),
+        (bo_k, k),
+        (bo_v, v),
+    ):
+        bo.write(array, 0)
+        bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+    actual = output
+    latencies_ms: list[float] = []
+    for iteration in range(warmup + iterations):
+        output.fill(0)
+        bo_output.write(output, 0)
+        bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        start = time.perf_counter()
+        run = kernel(3, bo_instr, len(instr_v), bo_q, bo_k, bo_v, bo_output)
+        run.wait()
+        if iteration >= warmup:
+            latencies_ms.append((time.perf_counter() - start) * 1000.0)
+        bo_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        actual = bo_output.read(output.nbytes, 0).view(output.dtype).reshape(tuple(output.shape))
+        check_close_rocm(actual, expected, rtol=rtol, atol=atol, label="attention_core")
+
+    return actual, latencies_ms
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run standalone quantized_qwen3 attention core on NPU.")
+    parser.add_argument("--aie-mlir", type=Path, required=True)
+    parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--sequence-length", type=int, required=True)
+    parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
+    parser.add_argument("--query-tile-rows", type=int, default=4)
+    parser.add_argument("--key-tile-rows", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--rtol", type=float, default=1e-2)
+    parser.add_argument("--atol", type=float, default=1e-2)
+    args = parser.parse_args()
+
+    if args.head_dim != HEAD_DIM:
+        raise SystemExit(f"attention_core currently targets head_dim={HEAD_DIM}")
+    if args.sequence_length % args.query_tile_rows != 0:
+        raise SystemExit("attention query tile rows must divide sequence length")
+    if args.sequence_length % args.key_tile_rows != 0:
+        raise SystemExit("attention key tile rows must divide sequence length")
+    if args.key_tile_rows != 4:
+        raise SystemExit("attention_core currently uses key_tile_rows=4")
+    peano_install_dir = os.environ.get("PEANO_INSTALL_DIR")
+    if not peano_install_dir:
+        raise SystemExit("PEANO_INSTALL_DIR is not set; source scripts/npu-common.sh first")
+    os.environ.setdefault("XRT_HACK_UNSECURE_LOADING_XCLBIN", "1")
+
+    q_ref = deterministic_tensor(
+        rows=args.sequence_length,
+        cols=args.head_dim,
+        seed=args.seed,
+        scale=0.25,
+    )
+    k_ref = deterministic_tensor(
+        rows=args.sequence_length,
+        cols=args.head_dim,
+        seed=args.seed + 1,
+        scale=0.25,
+    )
+    v_ref = deterministic_tensor(
+        rows=args.sequence_length,
+        cols=args.head_dim,
+        seed=args.seed + 2,
+        scale=0.25,
+    )
+    expected = reference_attention_core(q=q_ref, k=k_ref, v=v_ref)
+    q = np.ascontiguousarray(q_ref.detach().cpu().numpy())
+    k = np.ascontiguousarray(k_ref.detach().cpu().numpy())
+    v = np.ascontiguousarray(v_ref.detach().cpu().numpy())
+    output = np.zeros(tuple(expected.shape), dtype=np.float32)
+
+    object_path = compile_attention_core_object(
+        work_dir=args.work_dir,
+        peano_install_dir=peano_install_dir,
+        head_dim=args.head_dim,
+        sequence_length=args.sequence_length,
+        query_tile_rows=args.query_tile_rows,
+        key_tile_rows=args.key_tile_rows,
+    )
+    _, xclbin, insts = compile_runtime(
+        aie_mlir=args.aie_mlir,
+        work_dir=args.work_dir,
+        instance_name="run_attention_core",
+        peano_install_dir=peano_install_dir,
+        link_objects=(object_path,),
+    )
+    actual, latencies_ms = run_attention_core_on_npu(
+        xclbin=xclbin,
+        insts=insts,
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        expected=expected,
+        warmup=args.warmup,
+        iterations=args.iterations,
+        rtol=args.rtol,
+        atol=args.atol,
+    )
+
+    print(f"reference pytorch_rocm {torch.cuda.get_device_name(0)}")
+    print(
+        f"sequence_length {args.sequence_length} head_dim {args.head_dim} "
+        f"query_tile_rows {args.query_tile_rows} key_tile_rows {args.key_tile_rows}"
+    )
+    print(f"attention_core_xclbin {xclbin}")
+    print(f"attention_core_insts {insts}")
+    print(f"attention_core_first8 {actual.reshape(-1)[:8].tolist()}")
+    print(f"attention_core_expected_first8 {first_values(expected)}")
+    print(f"attention_core_max_abs {max_abs_rocm(actual, expected):.8g}")
+    print(f"allclose True rtol={args.rtol:g} atol={args.atol:g}")
+    if latencies_ms:
+        print(f"mean_ms {sum(latencies_ms) / len(latencies_ms):.3f}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -353,6 +353,41 @@ def export_norm_rope(
     )
 
 
+def export_attention_core(
+    *,
+    model_id: str,
+    output_dir: Path,
+    sequence_length: int,
+    query_tile_rows: int,
+    key_tile_rows: int,
+) -> None:
+    config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+    head_dim = _head_dim(config)
+    if sequence_length % query_tile_rows != 0:
+        raise ValueError(
+            f"sequence_length={sequence_length} must be divisible by query_tile_rows={query_tile_rows}"
+        )
+    if sequence_length % key_tile_rows != 0:
+        raise ValueError(f"sequence_length={sequence_length} must be divisible by key_tile_rows={key_tile_rows}")
+    if key_tile_rows != 4:
+        raise ValueError("attention_core currently uses key_tile_rows=4")
+    render_to_file(
+        KERNEL_TEMPLATE_DIR,
+        "attention_core.mlir.j2",
+        output_dir / "run_attention_core.mlir",
+        stage_name="run_attention_core",
+        weight_prefix="model.layers.0.self_attn.",
+        shape_exprs={sequence_length: "sequence_length"},
+        nodes=[],
+        aten_targets=[],
+        head_dim=head_dim,
+        key_tile_rows=key_tile_rows,
+        query_tile_rows=query_tile_rows,
+        sequence_length=sequence_length,
+    )
+    print("  run_attention_core: 0 aten ops")
+
+
 def export_pipeline_embed_norm(
     *,
     model_id: str,
@@ -473,6 +508,7 @@ def main() -> int:
             "rope_table",
             "q_norm_rope",
             "k_norm_rope",
+            "attention_core",
         ],
         default="embed_tokens",
     )
@@ -501,6 +537,18 @@ def main() -> int:
         type=int,
         default=32,
         help="Q4_K linear output rows computed per AIE tile.",
+    )
+    parser.add_argument(
+        "--query-tile-rows",
+        type=int,
+        default=4,
+        help="attention_core Q rows per tile.",
+    )
+    parser.add_argument(
+        "--key-tile-rows",
+        type=int,
+        default=4,
+        help="attention_core K/V rows per tile.",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -567,6 +615,14 @@ def main() -> int:
             model_id=args.model_id,
             output_dir=args.output_dir,
             sequence_length=args.sequence_length,
+        )
+    elif args.stage == "attention_core":
+        export_attention_core(
+            model_id=args.model_id,
+            output_dir=args.output_dir,
+            sequence_length=args.sequence_length,
+            query_tile_rows=args.query_tile_rows,
+            key_tile_rows=args.key_tile_rows,
         )
     export_reference_module(
         model_id=args.model_id,

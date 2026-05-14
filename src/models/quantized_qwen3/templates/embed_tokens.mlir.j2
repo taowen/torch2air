@@ -17,11 +17,11 @@
 {% macro emit_q4k_tile(prefix) -%}
       %{{ prefix }}_packed_col = arith.muli %tile_j, %idx36 : index
       %{{ prefix }}_out_col = arith.muli %tile_j, %idx256 : index
-      %{{ prefix }}_packed_tile = memref.subview %packed_rows[%tile_i, %{{ prefix }}_packed_col] [1, 36] [1, 1]
+      %{{ prefix }}_packed_tile = memref.subview %packed_rows[%token_i, %{{ prefix }}_packed_col] [1, 36] [1, 1]
           : memref<{{ sequence_length }}x{{ row_words }}xi32> to memref<1x36xi32, strided<[{{ row_words }}, 1], offset: ?>>
-      %{{ prefix }}_scale_tile = memref.subview %block_f16_scales[%tile_i, %tile_j, %idx0] [1, 1, 2] [1, 1, 1]
+      %{{ prefix }}_scale_tile = memref.subview %block_f16_scales[%token_i, %tile_j, %idx0] [1, 1, 2] [1, 1, 1]
           : memref<{{ sequence_length }}x{{ blocks_per_row }}x2xf32> to memref<1x1x2xf32, strided<[{{ blocks_per_row * 2 }}, 2, 1], offset: ?>>
-      %{{ prefix }}_out_tile = memref.subview %output[%tile_i, %{{ prefix }}_out_col] [1, 256] [1, 1]
+      %{{ prefix }}_out_tile = memref.subview %output[%token_i, %{{ prefix }}_out_col] [1, 256] [1, 1]
           : memref<{{ sequence_length }}x{{ hidden_size }}xf32> to memref<1x256xf32, strided<[{{ hidden_size }}, 1], offset: ?>>
 
       %{{ prefix }}_packed_l1 = memref.alloc() : memref<1x36xi32, 2>
@@ -108,8 +108,10 @@ module {
     {% endfor %}
 
     scf.parallel (%launch_i, %launch_j) = (%idx0, %idx0) to (%idx1, %idx1) step (%idx1, %idx1) {
-      scf.parallel (%tile_i, %tile_j) = (%idx0, %idx0) to (%idx{{ sequence_length }}, %idx{{ blocks_per_row }}) step (%idx1, %idx1) {
-        {{ emit_q4k_tile("tile") }}
+      scf.parallel (%tile_i, %tile_j) = (%idx0, %idx0) to (%idx1, %idx{{ blocks_per_row }}) step (%idx1, %idx1) {
+        scf.for %token_i = %idx0 to %idx{{ sequence_length }} step %idx1 {
+          {{ emit_q4k_tile("tile") }}
+        }
         scf.reduce
       }
       scf.reduce

@@ -47,24 +47,24 @@ scripts/install-python-deps.sh
 This installs PyTorch ROCm into the torch2air environment. It does not use the
 `torch2vk` virtual environment.
 
-## Spike Verification
+## Hardware Verification
 
-Run all verified AIR/NPU spikes in order:
+Run the official-style external-kernel smoke test first. This validates the
+current `npu2_4col` target, Peano object linking, and XRT execution path on the
+real NPU:
 
 ```bash
-scripts/verify-air-spikes.sh
+scripts/run-mlir-air-official-external-kernel-spike.sh
 ```
 
-Run one spike directly:
+Older AIR learning fixtures are still available when debugging lowering passes:
 
 ```bash
 scripts/verify-air-spike1.sh
-```
-
-or select a subset:
-
-```bash
-SPIKES="5 6" scripts/verify-air-spikes.sh
+scripts/verify-air-spike2-memory.sh
+scripts/verify-air-spike3-dma-order.sh
+scripts/verify-air-spike4-double-buffer.sh
+scripts/verify-air-spike6-flash-attn.sh
 ```
 
 Generated IR is written under:
@@ -148,6 +148,20 @@ These paths run `embed_tokens`, `input_layernorm`, and attention projections as
 separate xclbins with shared `pyxrt.bo` handoff buffers. `q_proj` and `k_proj`
 use Q4_K weights; `v_proj` uses the real Q6_K tensor from GGUF. Reference math
 and comparison are computed with PyTorch ROCm.
+
+Run the current full-head attention pipeline:
+
+```bash
+TOKEN_IDS=0,1,2,3 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 NPU_WARMUP=0 \
+  scripts/run-quantized-qwen3-pipeline-npu.sh attention
+```
+
+Standalone attention-core experiments can be run with:
+
+```bash
+TOKEN_COUNT=8 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.05 \
+  scripts/run-quantized-qwen3-attention-npu.sh
+```
 
 There is also a fused L1 handoff spike for the first Q4_K block:
 

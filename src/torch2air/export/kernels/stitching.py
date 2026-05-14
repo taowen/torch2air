@@ -30,6 +30,10 @@ def extract_affine_maps(mlir_text: str) -> list[str]:
     return [line for line in mlir_text.splitlines() if line.startswith("#map")]
 
 
+def extract_private_func_declarations(mlir_text: str) -> list[str]:
+    return [line.strip() for line in mlir_text.splitlines() if line.strip().startswith("func.func private @")]
+
+
 def rename_all(text: str, prefix: str) -> str:
     for name in sorted(set(re.findall(r"#map\d*", text)), key=len, reverse=True):
         text = re.sub(re.escape(name) + r"(?!\w)", f"#{prefix}_{name[1:]}", text)
@@ -80,7 +84,14 @@ def stitch_quantized_qwen3_embed_norm(
     if maps_text:
         maps_text += "\n"
 
+    private_decls = [
+        *[rename_all(line, "emb") for line in extract_private_func_declarations(embed_dma_mlir)],
+        *[rename_all(line, "norm") for line in extract_private_func_declarations(norm_dma_mlir)],
+    ]
+    private_decls_text = "".join(f"  {line}\n" for line in private_decls)
+
     return f"""{maps_text}module {{
+{private_decls_text}\
   func.func @{function_name}(
       %arg0: memref<{sequence_length}x{row_words}xi32>,
       %arg1: memref<{sequence_length}x{blocks_per_row}x2xf32>,

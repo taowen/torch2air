@@ -45,6 +45,7 @@ from .run_q_proj import (
 DEFAULT_Q_NORM_WEIGHT_TENSOR = "model.layers.0.self_attn.q_norm.weight"
 DEFAULT_K_NORM_WEIGHT_TENSOR = "model.layers.0.self_attn.k_norm.weight"
 HEAD_DIM = 128
+ATTENTION_CORE_KERNEL_SOURCE = KERNEL_DIR / "attention_core.cc"
 ROPE_TABLE_KERNEL_SOURCE = KERNEL_DIR / "rope_table.cc"
 RMS_NORM_ROPE_KERNEL_SOURCE = KERNEL_DIR / "rms_norm_rope.cc"
 RMS_NORM_KERNEL_SOURCE = KERNEL_DIR / "rms_norm.cc"
@@ -102,6 +103,13 @@ class QKVRopePrepared:
     k_norm_weight_tensor: GGUFTensorEntry
     rope_theta: float
     rope_start_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionPrepared:
+    rope: QKVRopePrepared
+    attention_output: np.ndarray
+    attention_expected: torch.Tensor
 
 
 def prepare_embed_norm(
@@ -327,6 +335,44 @@ def prepare_qkv_rope(
     )
 
 
+def prepare_attention(
+    *,
+    gguf_path: Path,
+    token_ids: list[int],
+    blocks_per_row: int,
+    rms_weight_tensor: str,
+    eps: float,
+    projection_tensors: dict[str, str],
+    output_rows: int,
+    q_norm_weight_tensor: str,
+    k_norm_weight_tensor: str,
+    start_position: int,
+) -> AttentionPrepared:
+    rope = prepare_qkv_rope(
+        gguf_path=gguf_path,
+        token_ids=token_ids,
+        blocks_per_row=blocks_per_row,
+        rms_weight_tensor=rms_weight_tensor,
+        eps=eps,
+        projection_tensors=projection_tensors,
+        output_rows=output_rows,
+        q_norm_weight_tensor=q_norm_weight_tensor,
+        k_norm_weight_tensor=k_norm_weight_tensor,
+        start_position=start_position,
+    )
+    attention_expected = reference_attention_core(
+        q=rope.norm_rope_expected["q_norm_rope"],
+        k=rope.norm_rope_expected["k_norm_rope"],
+        v=rope.projection.projection_expected["v_proj"],
+    )
+    attention_output = np.zeros(tuple(attention_expected.shape), dtype=np.float32)
+    return AttentionPrepared(
+        rope=rope,
+        attention_output=attention_output,
+        attention_expected=attention_expected,
+    )
+
+
 def read_f32_vector(*, gguf_path: Path, tensor_name: str, length: int) -> tuple[np.ndarray, GGUFTensorEntry]:
     index = load_gguf_index(gguf_path)
     selected = index.tensors[tensor_name]
@@ -402,6 +448,20 @@ def reference_norm_rope(
     return output.reshape(sequence_length, head_dim).to(torch.float32)
 
 
+def reference_attention_core(*, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    q_t = q.to(torch.float32)
+    k_t = k.to(device=q_t.device, dtype=torch.float32)
+    v_t = v.to(device=q_t.device, dtype=torch.float32)
+    _, head_dim = q_t.shape
+    scores = torch.matmul(q_t, k_t.transpose(0, 1)) * (1.0 / math.sqrt(float(head_dim)))
+    mask = torch.triu(
+        torch.ones(tuple(scores.shape), device=scores.device, dtype=torch.bool),
+        diagonal=1,
+    )
+    probs = torch.softmax(scores.masked_fill(mask, float("-inf")), dim=-1)
+    return torch.matmul(probs, v_t).to(torch.float32)
+
+
 def compile_rope_table_object(
     *,
     work_dir: Path,
@@ -458,6 +518,29 @@ def compile_rms_norm_rope_object(
         defines={
             "HEAD_DIM": head_dim,
             "RMS_NORM_EPS_BITS": f"0x{eps_bits:08x}",
+        },
+    )
+
+
+def compile_attention_core_object(
+    *,
+    work_dir: Path,
+    peano_install_dir: str,
+    head_dim: int,
+    sequence_length: int,
+    query_tile_rows: int,
+    key_tile_rows: int,
+) -> Path:
+    return compile_external_kernel_object(
+        source=ATTENTION_CORE_KERNEL_SOURCE,
+        object_name="attention_core.o",
+        work_dir=work_dir,
+        peano_install_dir=peano_install_dir,
+        defines={
+            "HEAD_DIM": head_dim,
+            "SEQUENCE_LENGTH": sequence_length,
+            "QUERY_TILE_ROWS": query_tile_rows,
+            "KEY_TILE_ROWS": key_tile_rows,
         },
     )
 
@@ -1052,6 +1135,8 @@ def run_on_npu_projections_rope(
     rope_table_insts: Path,
     norm_rope_xclbins: dict[str, Path],
     norm_rope_insts: dict[str, Path],
+    attention_xclbin: Path | None,
+    attention_insts: Path | None,
     packed_rows: np.ndarray,
     block_f16_scales: np.ndarray,
     rms_weight: np.ndarray,
@@ -1065,18 +1150,30 @@ def run_on_npu_projections_rope(
     cos_output: np.ndarray,
     sin_output: np.ndarray,
     norm_rope_outputs: dict[str, np.ndarray],
+    attention_output: np.ndarray | None,
     embed_expected: torch.Tensor,
     norm_expected: torch.Tensor,
     projection_expected: dict[str, torch.Tensor],
     cos_expected: torch.Tensor,
     sin_expected: torch.Tensor,
     norm_rope_expected: dict[str, torch.Tensor],
+    attention_expected: torch.Tensor | None,
     warmup: int,
     iterations: int,
     rtol: float,
     atol: float,
     verbose: bool,
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, np.ndarray], list[float]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray | None,
+    torch.Tensor | None,
+    list[float],
+]:
     if verbose:
         print("pyxrt", xrt.__file__)
     device = xrt.device(0)
@@ -1111,6 +1208,14 @@ def run_on_npu_projections_rope(
             insts=norm_rope_insts[stage_name],
         )
         norm_rope_kernels[stage_name] = (kernel, instr_v, bo_instr)
+    attention_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None = None
+    if attention_xclbin is not None and attention_insts is not None:
+        _, kernel, instr_v, bo_instr = load_xrt_kernel(
+            device,
+            xclbin=attention_xclbin,
+            insts=attention_insts,
+        )
+        attention_kernel = (kernel, instr_v, bo_instr)
 
     bo_packed = xrt.bo(device, packed_rows.nbytes, xrt.bo.host_only, embed_kernel.group_id(3))
     bo_scales = xrt.bo(device, block_f16_scales.nbytes, xrt.bo.host_only, embed_kernel.group_id(4))
@@ -1140,6 +1245,16 @@ def run_on_npu_projections_rope(
         output = norm_rope_outputs[stage_name]
         bo_norm_rope_weights[stage_name] = xrt.bo(device, weight.nbytes, xrt.bo.host_only, kernel.group_id(4))
         bo_norm_rope_outputs[stage_name] = xrt.bo(device, output.nbytes, xrt.bo.host_only, kernel.group_id(7))
+    bo_attention_output: xrt.bo | None = None
+    if attention_kernel is not None:
+        assert attention_output is not None
+        attention_kernel_object = attention_kernel[0]
+        bo_attention_output = xrt.bo(
+            device,
+            attention_output.nbytes,
+            xrt.bo.host_only,
+            attention_kernel_object.group_id(6),
+        )
 
     for bo, array in (
         (bo_packed, packed_rows),
@@ -1162,6 +1277,8 @@ def run_on_npu_projections_rope(
     actual_cos = cos_output
     actual_sin = sin_output
     actual_norm_rope = norm_rope_outputs
+    actual_attention = attention_output
+    actual_attention_expected = attention_expected
     latencies_ms: list[float] = []
     for iteration in range(warmup + iterations):
         hidden.fill(0)
@@ -1172,6 +1289,8 @@ def run_on_npu_projections_rope(
             output.fill(0)
         for output in norm_rope_outputs.values():
             output.fill(0)
+        if attention_output is not None:
+            attention_output.fill(0)
         start = time.perf_counter()
         (
             actual_hidden,
@@ -1180,6 +1299,7 @@ def run_on_npu_projections_rope(
             actual_cos,
             actual_sin,
             actual_norm_rope,
+            actual_attention,
         ) = run_shared_bo_projections_rope_once(
             embed_kernel=embed_kernel,
             embed_instr_v=embed_instr_v,
@@ -1204,12 +1324,15 @@ def run_on_npu_projections_rope(
             bo_sin=bo_sin,
             bo_norm_rope_weights=bo_norm_rope_weights,
             bo_norm_rope_outputs=bo_norm_rope_outputs,
+            attention_kernel=attention_kernel,
+            bo_attention_output=bo_attention_output,
             hidden=hidden,
             norm_output=norm_output,
             projection_outputs=projection_outputs,
             cos_output=cos_output,
             sin_output=sin_output,
             norm_rope_outputs=norm_rope_outputs,
+            attention_output=attention_output,
             embed_expected=embed_expected,
             norm_expected=norm_expected,
             projection_expected=projection_expected,
@@ -1246,8 +1369,42 @@ def run_on_npu_projections_rope(
             )
         for stage_name, actual in actual_norm_rope.items():
             check_close_rocm(actual, norm_rope_expected[stage_name], rtol=rtol, atol=atol, label=stage_name)
+        if actual_attention is not None:
+            q_t = torch.as_tensor(
+                np.ascontiguousarray(actual_norm_rope["q_norm_rope"]),
+                device=reference_device,
+                dtype=torch.float32,
+            )
+            k_t = torch.as_tensor(
+                np.ascontiguousarray(actual_norm_rope["k_norm_rope"]),
+                device=reference_device,
+                dtype=torch.float32,
+            )
+            v_t = torch.as_tensor(
+                np.ascontiguousarray(actual_projections["v_proj"]),
+                device=reference_device,
+                dtype=torch.float32,
+            )
+            actual_attention_expected = reference_attention_core(q=q_t, k=k_t, v=v_t)
+            check_close_rocm(
+                actual_attention,
+                actual_attention_expected,
+                rtol=rtol,
+                atol=atol,
+                label="attention_core",
+            )
 
-    return actual_hidden, actual_norm, actual_projections, actual_cos, actual_sin, actual_norm_rope, latencies_ms
+    return (
+        actual_hidden,
+        actual_norm,
+        actual_projections,
+        actual_cos,
+        actual_sin,
+        actual_norm_rope,
+        actual_attention,
+        actual_attention_expected,
+        latencies_ms,
+    )
 
 
 def run_shared_bo_projections_rope_once(
@@ -1275,19 +1432,30 @@ def run_shared_bo_projections_rope_once(
     bo_sin: xrt.bo,
     bo_norm_rope_weights: dict[str, xrt.bo],
     bo_norm_rope_outputs: dict[str, xrt.bo],
+    attention_kernel: tuple[xrt.kernel, np.ndarray, xrt.bo] | None,
+    bo_attention_output: xrt.bo | None,
     hidden: np.ndarray,
     norm_output: np.ndarray,
     projection_outputs: dict[str, np.ndarray],
     cos_output: np.ndarray,
     sin_output: np.ndarray,
     norm_rope_outputs: dict[str, np.ndarray],
+    attention_output: np.ndarray | None,
     embed_expected: torch.Tensor,
     norm_expected: torch.Tensor,
     projection_expected: dict[str, torch.Tensor],
     cos_expected: torch.Tensor,
     sin_expected: torch.Tensor,
     norm_rope_expected: dict[str, torch.Tensor],
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray | None,
+]:
     for bo, array in (
         (bo_hidden, hidden),
         (bo_norm_output, norm_output),
@@ -1302,6 +1470,9 @@ def run_shared_bo_projections_rope_once(
     for stage_name, bo in bo_norm_rope_outputs.items():
         bo.write(norm_rope_outputs[stage_name], 0)
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    if bo_attention_output is not None and attention_output is not None:
+        bo_attention_output.write(attention_output, 0)
+        bo_attention_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
     embed_run = embed_kernel(3, embed_bo_instr, len(embed_instr_v), bo_packed, bo_scales, bo_hidden)
     embed_run.wait()
@@ -1343,6 +1514,19 @@ def run_shared_bo_projections_rope_once(
             bo_norm_rope_outputs[stage_name],
         )
         norm_rope_run.wait()
+    if attention_kernel is not None:
+        assert bo_attention_output is not None
+        kernel, instr_v, bo_instr = attention_kernel
+        attention_run = kernel(
+            3,
+            bo_instr,
+            len(instr_v),
+            bo_norm_rope_outputs["q_norm_rope"],
+            bo_norm_rope_outputs["k_norm_rope"],
+            bo_projection_outputs["v_proj"],
+            bo_attention_output,
+        )
+        attention_run.wait()
 
     for bo in (bo_hidden, bo_norm_output, bo_cos, bo_sin):
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
@@ -1350,6 +1534,8 @@ def run_shared_bo_projections_rope_once(
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
     for bo in bo_norm_rope_outputs.values():
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+    if bo_attention_output is not None:
+        bo_attention_output.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
 
     actual_hidden = bo_hidden.read(hidden.nbytes, 0).view(hidden.dtype).reshape(tuple(embed_expected.shape))
     actual_norm = (
@@ -1375,7 +1561,14 @@ def run_shared_bo_projections_rope_once(
             .view(output.dtype)
             .reshape(tuple(norm_rope_expected[stage_name].shape))
         )
-    return actual_hidden, actual_norm, actual_projections, actual_cos, actual_sin, actual_norm_rope
+    actual_attention: np.ndarray | None = None
+    if bo_attention_output is not None and attention_output is not None:
+        actual_attention = (
+            bo_attention_output.read(attention_output.nbytes, 0)
+            .view(attention_output.dtype)
+            .reshape(tuple(attention_output.shape))
+        )
+    return actual_hidden, actual_norm, actual_projections, actual_cos, actual_sin, actual_norm_rope, actual_attention
 
 
 def run_shared_bo_once(
@@ -1433,11 +1626,14 @@ def main() -> int:
     parser.add_argument("--rope-table-aie-mlir", type=Path, default=None)
     parser.add_argument("--q-norm-rope-aie-mlir", type=Path, default=None)
     parser.add_argument("--k-norm-rope-aie-mlir", type=Path, default=None)
+    parser.add_argument("--attention-aie-mlir", type=Path, default=None)
     parser.add_argument("--q-norm-weight-tensor", default=DEFAULT_Q_NORM_WEIGHT_TENSOR)
     parser.add_argument("--k-norm-weight-tensor", default=DEFAULT_K_NORM_WEIGHT_TENSOR)
     parser.add_argument("--start-position", type=int, default=0)
     parser.add_argument("--output-rows", type=int, default=128)
     parser.add_argument("--output-tile-rows", type=int, default=32)
+    parser.add_argument("--query-tile-rows", type=int, default=4)
+    parser.add_argument("--key-tile-rows", type=int, default=4)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=1)
@@ -1452,6 +1648,7 @@ def main() -> int:
     rope_table_aie_mlir: Path | None = args.rope_table_aie_mlir
     q_norm_rope_aie_mlir: Path | None = args.q_norm_rope_aie_mlir
     k_norm_rope_aie_mlir: Path | None = args.k_norm_rope_aie_mlir
+    attention_aie_mlir: Path | None = args.attention_aie_mlir
 
     peano_install_dir = os.environ.get("PEANO_INSTALL_DIR")
     if not peano_install_dir:
@@ -1476,10 +1673,20 @@ def main() -> int:
             "q/k norm+RoPE pipeline requires q/k/v projections plus "
             "--rope-table-aie-mlir, --q-norm-rope-aie-mlir, and --k-norm-rope-aie-mlir"
         )
+    run_attention = attention_aie_mlir is not None
+    if run_attention and not run_rope:
+        raise SystemExit("attention pipeline requires q/k/v projections plus q/k norm+RoPE")
+    if run_attention and len(args.token_ids) % args.query_tile_rows != 0:
+        raise SystemExit("attention query tile rows must divide token count")
+    if run_attention and len(args.token_ids) % args.key_tile_rows != 0:
+        raise SystemExit("attention key tile rows must divide token count")
+    if run_attention and args.key_tile_rows != 4:
+        raise SystemExit("attention_core currently uses key_tile_rows=4")
 
     qproj_prepared: QProjPrepared | None = None
     projection_prepared: QKVPrepared | None = None
     rope_prepared: QKVRopePrepared | None = None
+    attention_prepared: AttentionPrepared | None = None
     projection_weights: dict[str, np.ndarray]
     projection_outputs: dict[str, np.ndarray]
     projection_expected: dict[str, torch.Tensor]
@@ -1501,7 +1708,26 @@ def main() -> int:
         assert qproj_aie_mlir is not None
         assert kproj_aie_mlir is not None
         assert vproj_aie_mlir is not None
-        if run_rope:
+        if run_attention:
+            attention_prepared = prepare_attention(
+                gguf_path=args.gguf,
+                token_ids=args.token_ids,
+                blocks_per_row=args.blocks_per_row,
+                rms_weight_tensor=args.rms_weight_tensor,
+                eps=args.rms_norm_eps,
+                projection_tensors={
+                    "q_proj": args.qproj_tensor,
+                    "k_proj": args.kproj_tensor,
+                    "v_proj": args.vproj_tensor,
+                },
+                output_rows=args.output_rows,
+                q_norm_weight_tensor=args.q_norm_weight_tensor,
+                k_norm_weight_tensor=args.k_norm_weight_tensor,
+                start_position=args.start_position,
+            )
+            rope_prepared = attention_prepared.rope
+            projection_prepared = rope_prepared.projection
+        elif run_rope:
             rope_prepared = prepare_qkv_rope(
                 gguf_path=args.gguf,
                 token_ids=args.token_ids,
@@ -1579,7 +1805,13 @@ def main() -> int:
             print(f"q_norm weight {rope_prepared.q_norm_weight_tensor.name} {rope_prepared.q_norm_weight_tensor.ggml_type}")
             print(f"k_norm weight {rope_prepared.k_norm_weight_tensor.name} {rope_prepared.k_norm_weight_tensor.ggml_type}")
             print(f"rope_start_position {rope_prepared.rope_start_position} rope_theta {rope_prepared.rope_theta:g}")
-            print("handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope shared pyxrt BO")
+            if run_attention:
+                print(
+                    "handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope"
+                    "->attention_core shared pyxrt BO"
+                )
+            else:
+                print("handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope shared pyxrt BO")
         else:
             print("handoff embed_tokens->input_layernorm->q/k/v shared pyxrt BO")
     else:
@@ -1639,6 +1871,10 @@ def main() -> int:
         actual_cos = None
         actual_sin = None
         actual_norm_rope = {}
+        attention_xclbin = None
+        attention_insts = None
+        actual_attention = None
+        actual_attention_expected = None
     elif run_qkv:
         assert qproj_aie_mlir is not None
         assert kproj_aie_mlir is not None
@@ -1705,6 +1941,26 @@ def main() -> int:
                     peano_install_dir=peano_install_dir,
                     link_objects=(rms_norm_rope_object,),
                 )
+            if run_attention:
+                assert attention_aie_mlir is not None
+                attention_core_object = compile_attention_core_object(
+                    work_dir=args.work_dir / "attention_core",
+                    peano_install_dir=peano_install_dir,
+                    head_dim=args.output_rows,
+                    sequence_length=len(args.token_ids),
+                    query_tile_rows=args.query_tile_rows,
+                    key_tile_rows=args.key_tile_rows,
+                )
+                _, attention_xclbin, attention_insts = compile_runtime(
+                    aie_mlir=attention_aie_mlir,
+                    work_dir=args.work_dir / "attention_core",
+                    instance_name="run_attention_core",
+                    peano_install_dir=peano_install_dir,
+                    link_objects=(attention_core_object,),
+                )
+            else:
+                attention_xclbin = None
+                attention_insts = None
             (
                 actual_hidden,
                 actual_output,
@@ -1712,6 +1968,8 @@ def main() -> int:
                 actual_cos,
                 actual_sin,
                 actual_norm_rope,
+                actual_attention,
+                actual_attention_expected,
                 latencies_ms,
             ) = run_on_npu_projections_rope(
                 embed_xclbin=embed_xclbin,
@@ -1724,6 +1982,8 @@ def main() -> int:
                 rope_table_insts=rope_table_insts,
                 norm_rope_xclbins=norm_rope_xclbins,
                 norm_rope_insts=norm_rope_insts,
+                attention_xclbin=attention_xclbin,
+                attention_insts=attention_insts,
                 packed_rows=packed_rows,
                 block_f16_scales=block_f16_scales,
                 rms_weight=rms_weight,
@@ -1737,12 +1997,18 @@ def main() -> int:
                 cos_output=np.zeros(tuple(rope_prepared.cos_expected.shape), dtype=np.float32),
                 sin_output=np.zeros(tuple(rope_prepared.sin_expected.shape), dtype=np.float32),
                 norm_rope_outputs=rope_prepared.norm_rope_outputs,
+                attention_output=(
+                    attention_prepared.attention_output if attention_prepared is not None else None
+                ),
                 embed_expected=embed_expected,
                 norm_expected=expected,
                 projection_expected=projection_expected,
                 cos_expected=rope_prepared.cos_expected,
                 sin_expected=rope_prepared.sin_expected,
                 norm_rope_expected=rope_prepared.norm_rope_expected,
+                attention_expected=(
+                    attention_prepared.attention_expected if attention_prepared is not None else None
+                ),
                 warmup=args.warmup,
                 iterations=args.iterations,
                 rtol=args.rtol,
@@ -1780,6 +2046,10 @@ def main() -> int:
             actual_cos = None
             actual_sin = None
             actual_norm_rope = {}
+            attention_xclbin = None
+            attention_insts = None
+            actual_attention = None
+            actual_attention_expected = None
         actual_qproj = actual_projections["q_proj"]
         qproj_xclbin = projection_xclbins["q_proj"]
         qproj_insts = projection_insts["q_proj"]
@@ -1834,6 +2104,10 @@ def main() -> int:
         actual_cos = None
         actual_sin = None
         actual_norm_rope = {}
+        attention_xclbin = None
+        attention_insts = None
+        actual_attention = None
+        actual_attention_expected = None
 
     hidden_max_abs = max_abs_rocm(actual_hidden, embed_expected)
     output_max_abs = max_abs_rocm(actual_output, expected)
@@ -1854,6 +2128,9 @@ def main() -> int:
         for stage_name in norm_rope_xclbins:
             print(f"{stage_name}_xclbin {norm_rope_xclbins[stage_name]}")
             print(f"{stage_name}_insts {norm_rope_insts[stage_name]}")
+    if attention_xclbin is not None and attention_insts is not None:
+        print(f"attention_core_xclbin {attention_xclbin}")
+        print(f"attention_core_insts {attention_insts}")
     print(f"hidden_first8 {actual_hidden.reshape(-1)[:8].tolist()}")
     print(f"output_first8 {actual_output.reshape(-1)[:8].tolist()}")
     if actual_projections:
@@ -1873,6 +2150,10 @@ def main() -> int:
         for stage_name, actual in actual_norm_rope.items():
             print(f"{stage_name}_first8 {actual.reshape(-1)[:8].tolist()}")
             print(f"{stage_name}_expected_first8 {first_values(rope_prepared.norm_rope_expected[stage_name])}")
+    if actual_attention is not None:
+        assert actual_attention_expected is not None
+        print(f"attention_core_first8 {actual_attention.reshape(-1)[:8].tolist()}")
+        print(f"attention_core_expected_first8 {first_values(actual_attention_expected)}")
     print(f"expected_first8 {first_values(expected)}")
     print(f"hidden_max_abs {hidden_max_abs:.8g}")
     print(f"max_abs {output_max_abs:.8g}")
@@ -1891,6 +2172,10 @@ def main() -> int:
         for stage_name, actual in actual_norm_rope.items():
             norm_rope_max_abs = max_abs_rocm(actual, rope_prepared.norm_rope_expected[stage_name])
             print(f"{stage_name}_max_abs {norm_rope_max_abs:.8g}")
+    if actual_attention is not None:
+        assert actual_attention_expected is not None
+        attention_max_abs = max_abs_rocm(actual_attention, actual_attention_expected)
+        print(f"attention_core_max_abs {attention_max_abs:.8g}")
     print(f"allclose True rtol={args.rtol:g} atol={args.atol:g}")
     if latencies_ms:
         print(f"mean_ms {sum(latencies_ms) / len(latencies_ms):.3f}")

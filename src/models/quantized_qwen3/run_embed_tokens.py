@@ -191,6 +191,8 @@ def _dedupe_private_func_declarations(path: Path) -> None:
     output: list[str] = []
     for line in path.read_text().splitlines():
         stripped = line.strip()
+        if stripped.startswith("aie.device("):
+            seen.clear()
         if stripped.startswith("func.func private @"):
             symbol = stripped.split("@", 1)[1].split("(", 1)[0]
             if symbol in seen:

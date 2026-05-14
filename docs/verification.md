@@ -129,45 +129,6 @@ Verified checks:
 Conclusion: double buffering should be emitted directly in the schedule rather
 than left to a generic optimizer.
 
-## Spike 5: Real Q4_K Linear Tile
-
-Run:
-
-```bash
-scripts/verify-air-spike5-q4k-linear.sh
-```
-
-Inputs:
-
-```text
-/var/home/taowen/projects/torch2vk/dist/llama_cpp_qwen3/qwen3-0.6b-q4_k_m.gguf
-tensor: token_embd.weight
-format: GGUF Q4_K
-physical shape: [151936, 144] uint32
-```
-
-Verified checks:
-
-- The AIR fixture consumes packed Q4_K-shaped `uint32` tiles.
-- The host manifest records the exact GGUF tensor metadata.
-- The NPU path compiles `examples/amd_aie_experiments/q4k_matvec.cc` with
-  Peano and runs `examples/amd_aie_experiments/npu_q4k_matvec.py`.
-- The NPU kernel reads real packed Q4_K blocks from GGUF, dequantizes them on
-  the AIE tile, and computes a float32 matvec.
-- Current default validation uses 64 rows, `k=1024`, and 4 Q4_K blocks per
-  row. Payload SHA256:
-  `e6d93e48b795cf0ed2844feac19a89ea92708904889c05901dae1da6aec4d56a`.
-- The NPU result matches the host Q4_K dequantization reference and reports
-  `PASS!`.
-
-Conclusion: packed Q4_K weights do not need to be host-dequantized for this
-path. Practical quantized kernels may eventually need a native compute boundary,
-but that should not replace the tiled MLIR artifact as the export product.
-
-Note: this is a lower-level historical fixture for validating a native Q4_K
-compute body. It is not the `models.quantized_qwen3` export path. The model path
-below emits tiled MLIR directly and does not use a `.cc` kernel.
-
 ## Quantized Qwen3: Generated Embed Tokens
 
 Run:
@@ -303,14 +264,31 @@ Verified checks:
   runs seven stage xclbins with shared `pyxrt.bo` handoff buffers. The verifier
   reads intermediate buffers only after the NPU chain finishes, then compares
   against PyTorch ROCm.
+- `attention_core` follows the same MLIR-AIR external-kernel style used by
+  upstream programming examples such as `softmax`: AIR owns
+  `air.launch`/`air.segment`/`air.herd`, L3-to-L1 channel movement, and L1 buffer lifetime;
+  `attention_core.o` owns the per-tile causal softmax and value accumulation.
+  The current template keeps one `4x128` Q/O tile resident, streams K and V
+  through one shared AIR FIFO channel, and updates online softmax state per
+  query row.
+- `scripts/run-quantized-qwen3-attention-npu.sh` is the standalone MLIR-AIR
+  learning spike for attention. It runs only the attention AIR artifact on the
+  real NPU and compares against a PyTorch ROCm reference, so AIR/channel/softmax
+  issues are not hidden by the larger Qwen3 pipeline.
+- `embed_tokens -> input_layernorm -> q/k/v -> rope_table -> q/k_norm_rope
+  -> attention_core` runs for four tokens with shared `pyxrt.bo`
+  handoff buffers. The attention input buffers are the `q_norm_rope`,
+  `k_norm_rope`, and `v_proj` device buffers; the host reads them only after the
+  chain finishes for verification.
 - The `quantized_qwen3` reference path is generated from the same exported
   module boundaries. `src/models/quantized_qwen3/reference.py` loads the local
   `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
   `run_embed_tokens`, `run_input_layernorm`,
   `run_embed_tokens_input_layernorm`, `run_q_proj`, `run_k_proj`, and
-  `run_v_proj`. Expected tensors, `allclose`, and max-abs metrics are computed
-  on the ROCm device. NumPy is used only for GGUF byte slicing and XRT host
-  buffers.
+  `run_v_proj`. `run_pipeline.py` builds the RoPE, q/k norm+RoPE, and causal
+  attention references from those same PyTorch ROCm tensors. Expected tensors,
+  `allclose`, and max-abs metrics are computed on the ROCm device. NumPy is
+  used only for GGUF byte slicing and XRT host buffers.
 
 Latest real NPU results:
 
@@ -383,6 +361,12 @@ q_proj external Q4_K kernel, 1 token, output_rows 128, output_tile_rows 32:
   max_abs 0.058996558
   allclose True rtol=0.05 atol=0.1
   mean_ms 27.872
+
+q_proj external Q4_K kernel, 1 token, output_rows 128, output_tile_rows 64:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  max_abs 0.058996558
+  allclose True rtol=0.05 atol=0.1
+  mean_ms 53.342
 
 q_proj external Q4_K kernel, 2 tokens, output_rows 128, output_tile_rows 32:
   reference safetensors_pytorch_rocm AMD Radeon 890M
@@ -482,6 +466,57 @@ pipeline_embed_norm_qkv_rope shared BO handoff, 1 token, output_rows 128, output
   allclose True rtol=0.05 atol=0.2
   mean_ms 81.063
 
+pipeline_embed_norm_qkv_rope_attention shared BO handoff, 1 token, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.031209335
+  rope_cos_max_abs 0
+  rope_sin_max_abs 0
+  q_norm_rope_max_abs 2.8610229e-06
+  k_norm_rope_max_abs 1.5258789e-05
+  attention_core_max_abs 0
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 81.621
+
+pipeline_embed_norm_qkv_rope_attention shared BO handoff, 2 tokens, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0054986477
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.037101876
+  rope_cos_max_abs 2.9802322e-07
+  rope_sin_max_abs 1.4901161e-07
+  q_norm_rope_max_abs 2.8610229e-06
+  k_norm_rope_max_abs 3.0517578e-05
+  attention_core_max_abs 0.18556878
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 152.201
+
+pipeline_embed_norm_qkv_rope_attention shared BO handoff, 4 tokens, output_rows 128, output_tile_rows 32:
+  reference safetensors_pytorch_rocm AMD Radeon 890M
+  hidden_max_abs 0.0059777498
+  max_abs 0.16560259
+  q_proj_max_abs 0.081097126
+  k_proj_max_abs 0.093719244
+  v_proj_max_abs 0.04088977
+  rope_cos_max_abs 2.4806999e-05
+  rope_sin_max_abs 3.3974648e-06
+  q_norm_rope_max_abs 2.8610229e-06
+  k_norm_rope_max_abs 3.0517578e-05
+  attention_core_max_abs 0.065862715
+  allclose True rtol=0.05 atol=0.2
+  mean_ms 293.233
+
+standalone tiled attention_core, 8 tokens, head_dim 128, q4/kv4:
+  reference pytorch_rocm AMD Radeon 890M
+  attention_core_max_abs 0.025021695
+  allclose True rtol=0.05 atol=0.05
+  mean_ms 2.699
+
 pipeline_embed_norm_qkv shared BO handoff, 2 tokens, output_rows 128, output_tile_rows 32:
   reference safetensors_pytorch_rocm AMD Radeon 890M
   hidden_max_abs 0.0054986477
@@ -500,13 +535,16 @@ Notes:
   passing hardware result. Track this as a placement diagnostic issue, not as a
   runtime failure.
 - Full-head projection verification uses `OUTPUT_ROWS=128` with
-  `OUTPUT_TILE_ROWS=32`. The `128/16` shape creates eight projection tiles; on
-  the current 4-column target and row anchor, `air-to-aie` emits an out-of-range
-  tile row and does not reach hardware execution.
+  `OUTPUT_TILE_ROWS=32`. The `128/16` shape creates eight projection tiles and
+  fails during channel lowering with `failed to map to shim dma channels: out of
+  channels`. Q4_K with `OUTPUT_TILE_ROWS=64` reaches hardware, but is slower
+  than 32 rows and emits larger L1 bank-allocation warnings.
 - Q6_K projection variants currently print AIE bank allocation warnings because
-  the spike widens Q6_K halfwords to i32 in L1. The generated xclbin still runs
-  and matches the PyTorch ROCm reference. Compact i16 L1 DMA is the next
-  cleanup for that kernel.
+  the spike widens Q6_K halfwords to i32 in L1. `OUTPUT_TILE_ROWS=32` still
+  runs and matches the PyTorch ROCm reference, but `OUTPUT_TILE_ROWS=64` fails
+  AIE allocation because the widened `memref<64x424xi32>` weight tile is
+  108544 bytes before the activation/output buffers. Compact i16 L1 DMA is the
+  next cleanup for that kernel.
 - Passing `aie.runtime_sequence`/`aiex.dma_configure_task_for` MLIR directly to
   `aiecc` is required for this flow. Pre-lowering to `aiex.npu` instructions
   before `aiecc` produced a hanging run.
@@ -517,12 +555,30 @@ Notes:
   `embed_tokens` followed by `input_layernorm`, with a direct hidden memref stage
   boundary.
 - The stitched AIR module for `embed_tokens -> input_layernorm` is generated and
-  contains two `air.launch` regions with the expected arg-map handoff. Running
-  that exact stitched module through the upstream ELF path is blocked in this
-  Python 3.12 environment because `pyxrt` does not expose `elf`/`ext`. Running
-  it through `aircc --output-format=xclbin` currently overflows program memory
-  for the full Q4_K embedding body. The verified hardware path therefore uses
-  two xclbins and one shared `pyxrt.bo` for the intermediate hidden buffer.
+  contains two `air.launch` regions with the expected arg-map handoff. The
+  stitched AIE lowering now keeps renamed private external declarations and
+  reaches AIE IR for the 4-token `embed_tokens -> input_layernorm` debug path.
+  Running that exact stitched module through the upstream ELF path is blocked in
+  this Python 3.12 environment because `pyxrt` does not expose `elf`/`ext`.
+  Running it through `aircc --output-format=xclbin` currently overflows program
+  memory for the full Q4_K embedding body. The verified hardware path therefore
+  uses two xclbins and one shared `pyxrt.bo` for the intermediate hidden buffer.
+- The full four-token attention pipeline now runs end to end on the real NPU.
+  The previous shim-DMA channel pressure was removed by keeping the token
+  dimension inside stage-local loops for `embed_tokens` and q/k/v projection,
+  while the herd maps only block or output-tile columns.
+- The full eight-token attention pipeline still fails before attention:
+  `input_layernorm` maps token rows directly to an 8-row herd and fails channel
+  lowering with `failed to map to shim dma channels: out of channels`. The next
+  full-pipeline scaling step is to apply the same stage-local token loop pattern
+  to `input_layernorm`, `rope_table`, and q/k norm+RoPE.
+- Standalone `attention_core` now reaches 8 tokens with a formal tiled
+  online-softmax schedule. It keeps q/k/v as runtime arguments, uses Q and K/V
+  AIR FIFO channels internally, and compares against PyTorch ROCm.
+- The one-token full attention pipeline remains a real Qwen3 handoff test, but
+  it is the causal-attention degenerate case where the output equals the first V
+  row. The full two-token run and the standalone 2-token and 4-token
+  `attention_core` runs cover non-degenerate causal softmax.
 
 ## Spike 6: FlashAttention Schedule Skeleton
 
@@ -561,26 +617,6 @@ Notes:
 
 Conclusion: the staged FlashAttention schedule is feasible, but valid tile
 sizes must respect AIE2p cascade width.
-
-## Full Spike Suite
-
-Run all verified spikes in order:
-
-```bash
-scripts/verify-air-spikes.sh
-```
-
-Select a subset with:
-
-```bash
-SPIKES="5 6" scripts/verify-air-spikes.sh
-```
-
-Latest full run on 2026-05-13:
-
-```text
-All requested AIR/NPU spikes passed: 1 2 3 4 5 6
-```
 
 ## NPU Hardware Smoke Test
 
