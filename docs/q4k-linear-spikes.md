@@ -278,7 +278,7 @@ Q4_K weight tile layout、多列 routing 限制。
   - `src/torch2air/export/q4k_linear.py`
   - `src/torch2air/export/kernels/q4k_linear.cc`
   - `src/torch2air/runtime/compile.py`
-  - `src/models/quantized_qwen3/run_q_proj.py`
+  - `src/models/quantized_qwen3/run_linear.py`
 - 导出路径：`models.quantized_qwen3.export --stage q_proj --sequence-length 1` 生成的
   Python kernel 直接喂给 `Q4KLinearAirBuilder`，没有再包装一层 graph。
 - 运行策略：decode `S=1`，每个 xclbin 计算 `64` 个 output rows；内部是 4-column herd，
@@ -294,12 +294,33 @@ Q4_K weight tile layout、多列 routing 限制。
 - 正式 `compile_runtime` 已改成显式检查 xclbin 和 insts 是否存在，避免把缺产物的编译误判为成功。
 - 稳定经验已沉淀到 `recipes/export-aten-linear-kernel.md`。
 
+2026-05-15 生产化更新：
+
+- 正式 runner 改为 `src/models/quantized_qwen3/run_linear.py`，通过 `--stage q_proj|k_proj|o_proj`
+  选择 projection。
+- `o_proj` export input shape 已修正为 `q_heads * head_dim = 2048`。
+- `S=8` prefill bucket 已接入正式 `Q4KLinearAirBuilder`；固定使用 `output_rows=16`、
+  `output_tile_rows=16`，更长序列由 host 拆 bucket。
+- 真实 NPU 结果：
+
+| stage | S | input | output_features | output_rows | max_abs |
+| --- | ---: | --- | ---: | ---: | ---: |
+| q_proj | 1 | embed + input_layernorm | 2048 | 64 | `2.8610229e-06` |
+| k_proj | 1 | embed + input_layernorm | 1024 | 64 | `2.8610229e-06` |
+| o_proj | 1 | deterministic f32 `1x2048` | 1024 | 64 | `3.3378601e-06` |
+| q_proj | 8 | embed + input_layernorm | 2048 | 16 | `4.2915344e-06` |
+| k_proj | 8 | embed + input_layernorm | 1024 | 16 | `3.3378601e-06` |
+| o_proj | 8 | deterministic f32 `8x2048` | 1024 | 16 | `5.4836273e-06` |
+
+- `o_proj` 的 `16x304xi32` L1 weight tile 会触发 bank-aware allocation warning，
+  但真实 NPU 对拍通过。后续要继续压低 Q4_K tile ABI 或做更细粒度 output chunk。
+
 ## 与 KV 动态长度的关系
 
 Q4_K projection 本身不管理 KV cache。后续 decode/prefill 的动态长度策略应该是：
 
 - device BO 为最大上下文或当前 batch bucket 预分配固定 shape。
-- NPU xclbin 使用固定 shape，例如 decode `S=1`、prefill `S=16`。
+- NPU xclbin 使用固定 shape，例如 decode `S=1`、prefill `S=8`。
 - host 传入 `start_position`、`valid_length` 这类标量或选择固定 bucket。
 - tail token 用 padding/mask 处理，而不是在 AIR 里创建动态 memref。
 

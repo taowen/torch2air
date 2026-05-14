@@ -4,16 +4,10 @@ AIR backend experiments for PyTorch-exported models.
 
 ## Current Layout
 
-The previous MLIR-template and C++ external-kernel implementation is preserved under:
-
-```text
-legacy/src/
-legacy/examples/
-```
-
-The active `src/` tree is being rebuilt around a simpler rule: traverse the
-`torch.export.ExportedProgram` directly, and map each aten op to one Python
-kernel in `torch2air.export.kernels`.
+The active `src/` tree follows one rule: traverse the
+`torch.export.ExportedProgram` directly, and map each supported aten op to one
+Python AIR builder. Do not use the removed `legacy/` implementation as a source
+for new code.
 
 Smoke-test the new exporter:
 
@@ -132,67 +126,29 @@ AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh input_layernorm
 ```
 
-Run the first full-hidden pipeline:
+Run the verified Q4_K attention projections:
 
 ```bash
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh
-```
-
-This exports `embed_tokens` and `input_layernorm`, lowers both stages, generates
-a stitched AIR module for inspection, then runs the two stage xclbins with a
-shared `pyxrt.bo` hidden buffer. The intermediate hidden state stays on the NPU
-path between the two operators; it is copied back only after execution for
-verification.
-
-Run the first full-head attention projections:
-
-```bash
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-npu.sh v_proj
+AIR_DEVICE=npu2 TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh o_proj
 ```
 
-Run the current projection pipelines:
+Run the fixed `S=8` Q4_K prefill bucket:
 
 ```bash
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
-
-AIR_DEVICE=npu2 TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
+AIR_DEVICE=npu2 TOKEN_IDS=0,1,2,3,4,5,6,7 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh q_proj
 ```
 
-These paths run `embed_tokens`, `input_layernorm`, and attention projections as
-separate xclbins with shared `pyxrt.bo` handoff buffers. `q_proj` and `k_proj`
-use Q4_K weights; `v_proj` uses the real Q6_K tensor from GGUF. Reference math
-and comparison are computed with PyTorch ROCm.
-
-Run the current full-head attention pipeline:
-
-```bash
-TOKEN_IDS=0,1,2,3 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 NPU_WARMUP=0 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh attention
-```
-
-Standalone attention-core experiments can be run with:
-
-```bash
-TOKEN_COUNT=8 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.05 \
-  scripts/run-quantized-qwen3-attention-npu.sh
-```
-
-There is also a fused L1 handoff spike for the first Q4_K block:
-
-```bash
-AIR_DEVICE=npu2 BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
-```
+`v_proj`, RoPE, attention core, and full self-attention are intentionally not
+wired to old scripts. They need fresh Python AIR experiments and real NPU
+verification before becoming production entrypoints.
 
 ## NPU Smoke Test
 

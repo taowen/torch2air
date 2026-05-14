@@ -52,7 +52,7 @@ src/
       reference_runtime.py  # small ROCm check/debug helpers
       run.py                # thin CLI dispatch for model runners
       run_embed_tokens.py   # embed_tokens XRT execution and reference check
-      run_q_proj.py         # attention projection external-kernel XRT execution
+      run_linear.py         # Q4_K linear external-kernel XRT execution
       generated/            # ignored generated files
 scripts/
   install-air-tools.sh
@@ -172,13 +172,9 @@ ABI. Remove these exceptions once f16 scalar conversion and compact i16 L1 DMA
 are validated.
 
 Host-side full dequantization is allowed only for debug checks or focused tests.
-For `quantized_qwen3` runners, the default reference path is generated from the
-same `torch.export` boundaries used by the stage exporter. `reference.py` loads
-the local `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
-`run_embed_tokens`, `run_input_layernorm`, `run_embed_tokens_input_layernorm`,
-`run_q_proj`, `run_k_proj`, and `run_v_proj`. Expected tensors, `allclose`, and
-max-abs reporting are computed with torch tensors on the ROCm device. NumPy is
-only used to slice GGUF bytes and pass host buffers to XRT.
+For `quantized_qwen3` runners, expected tensors, `allclose`, and max-abs
+reporting are computed with torch tensors on the ROCm device. NumPy is only
+used to slice GGUF bytes and pass host buffers to XRT.
 
 ## Operator Handoff
 

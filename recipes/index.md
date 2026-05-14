@@ -10,6 +10,8 @@
 | [producer-consumer-channel.md](producer-consumer-channel.md) | 同一 xclbin 内两个 stage 怎么交接 tile。 | 中间 tile 用 AIR channel，不写 host-visible BO。 |
 | [pack-multi-output-channel.md](pack-multi-output-channel.md) | 一个 stage 有多个强配对输出怎么传给下游。 | 先 pack 成一个 L1 payload，再用一条 channel。 |
 | [debug-air-lowering.md](debug-air-lowering.md) | routing 失败或 NPU 数值错时怎么定位。 | 按 AIR graph、AIE lowering、runtime sequence、L1 地址分层看。 |
+| [debug-runtime-dma-await.md](debug-runtime-dma-await.md) | score 对但输出缺贡献时怎么查输入 DMA。 | 先拆 standalone，再看 runtime sequence 是否 await 输入 task。 |
+| [debug-l1-state-corruption.md](debug-l1-state-corruption.md) | token 后半段变 0 或重复旧状态时怎么定位。 | 查 AIE address map、stack、bank warning、channel 顺序和 herd 规模。 |
 | [attention-head-loop.md](attention-head-loop.md) | 多 head attention 怎么避免 tile 程序膨胀。 | host 常量 offset，tile 内运行时 head loop。 |
 | [attention-tile-limits.md](attention-tile-limits.md) | attention tile size 先选多大。 | `KEY_TILE_ROWS=8`，`QUERY_TILE_ROWS<=32`。 |
 | [python-air-dsl-kernel.md](python-air-dsl-kernel.md) | Python kernel 应该怎么写。 | 用 MLIR-AIR Python DSL，不要用 Python 拼 MLIR 字符串。 |

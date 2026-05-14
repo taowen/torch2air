@@ -25,6 +25,14 @@ per tile:       small fixed number of tokens
 | `0..7` | `5.9604645e-07` | `27.306` |
 | `8..15` | `1.2516975e-06` | `27.174` |
 
+正式 Q4_K linear runner 已采用这个模式。验证记录：
+
+| stage | token ids | output chunk | max_abs |
+| --- | --- | ---: | ---: |
+| `q_proj` | `0..7` | 16 | `4.2915344e-06` |
+| `k_proj` | `0..7` | 16 | `3.3378601e-06` |
+| `o_proj` | `0..7` | 16 | `5.4836273e-06` |
+
 不要把太多 token 串在一个 tile 里：
 
 - `S=8, 1x1 herd` 会在后半 token 出现 0。

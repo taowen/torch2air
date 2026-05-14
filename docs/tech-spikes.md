@@ -44,55 +44,20 @@ Older herd/core-level `link_with` attachment is deprecated by AIRToAIE.
 
 ## Active Hardware Findings
 
-Current verified Qwen3 path:
+The current production entrypoints are the Python AIR `src/` runners. Verified
+Q4_K linear stages use:
 
 ```bash
-TOKEN_IDS=0,1,2,3 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 NPU_WARMUP=0 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh attention
+TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh q_proj
+
+TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh k_proj
 ```
 
-Result:
-
-```text
-reference safetensors_pytorch_rocm AMD Radeon 890M
-handoff embed_tokens->input_layernorm->q/k/v->rope_table->q/k_norm_rope->attention_core shared pyxrt BO
-hidden_max_abs 0.0059777498
-max_abs 0.16560259
-q_proj_max_abs 0.081097126
-k_proj_max_abs 0.093719244
-v_proj_max_abs 0.04088977
-rope_cos_max_abs 2.4806999e-05
-rope_sin_max_abs 3.3974648e-06
-q_norm_rope_max_abs 2.8610229e-06
-k_norm_rope_max_abs 3.0517578e-05
-attention_core_max_abs 0.065862715
-allclose True rtol=0.05 atol=0.2
-mean_ms 293.233
-```
-
-Key conclusions:
-
-- Full four-token Qwen3 attention is feasible with multiple xclbins and shared
-  `pyxrt.bo` handoff buffers.
-- Standalone `attention_core` now uses the formal tiled online-softmax path.
-  The exported MLIR keeps one `4x128` Q/O tile resident, streams K and V through
-  one shared AIR FIFO channel, and preserves the public q/k/v/output ABI:
-
-```bash
-TOKEN_COUNT=8 QUERY_TILE_ROWS=4 KEY_TILE_ROWS=4 ATTENTION_RTOL=0.05 ATTENTION_ATOL=0.05 \
-  scripts/run-quantized-qwen3-attention-npu.sh
-```
-
-```text
-attention_core_max_abs 0.025021695
-allclose True rtol=0.05 atol=0.05
-mean_ms 2.699
-```
-
-- The old packed-KV attention experiment was removed after the formal
-  `attention_core` path adopted the same tiling strategy. The production path
-  keeps q/k/v as separate runtime arguments and uses a shared K/V channel only
-  inside the generated AIR.
+The previous attention and pipeline scripts were removed with `legacy/`. Full
+self-attention must be re-established through fresh Python AIR experiments and
+recorded in `recipes/` before becoming a production entrypoint again.
 
 - Full eight-token Qwen3 attention currently fails before attention in
   `input_layernorm` channel lowering because that stage still maps token rows

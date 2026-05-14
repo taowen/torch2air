@@ -92,7 +92,7 @@ PyTorch ROCm 对拍通过
 ```text
 每个官方例子至少 lower 到 AIE MLIR
 至少一个多-herd/channel 例子生成 xclbin 并真实 NPU 运行
-把关键 IR 片段记录到 docs/attention.md 或本文件
+把关键 IR 片段记录到本文件；稳定调试经验沉淀到 `recipes/`
 ```
 
 停止条件：

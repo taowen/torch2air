@@ -26,14 +26,19 @@ from .reference_runtime import (
 from .run_embed_tokens import DEFAULT_GGUF, parse_token_ids
 from .run_input_layernorm import DEFAULT_RMS_WEIGHT_TENSOR, prepare_layernorm_inputs
 
-DEFAULT_Q_PROJ_TENSOR = "model.layers.0.self_attn.q_proj.weight"
+Q4K_LINEAR_STAGES = ("q_proj", "k_proj", "o_proj")
+DEFAULT_STAGE = "q_proj"
+DEFAULT_LAYER_INPUT_BLOCKS_PER_ROW = 4
 
 
 @dataclass(frozen=True, slots=True)
-class QProjInputInfo:
-    source: GGUFTensorEntry
-    rms_weight: GGUFTensorEntry
-    q_proj_weight: GGUFTensorEntry
+class Q4KLinearInputInfo:
+    stage: str
+    source_name: str
+    source_type: str
+    rms_weight_name: str
+    rms_weight_type: str
+    projection_weight: GGUFTensorEntry
     token_ids: list[int]
     hidden_size: int
     output_features: int
@@ -43,31 +48,35 @@ class QProjInputInfo:
     weight_words: int
 
 
-def prepare_q_proj_inputs(
+def projection_weight_tensor(stage: str) -> str:
+    validate_q4k_linear_stage(stage)
+    return f"model.layers.0.self_attn.{stage}.weight"
+
+
+def validate_q4k_linear_stage(stage: str) -> None:
+    if stage not in Q4K_LINEAR_STAGES:
+        raise ValueError(f"stage must be one of {Q4K_LINEAR_STAGES}, got {stage!r}")
+
+
+def prepare_q4k_linear_inputs(
     *,
+    stage: str,
     gguf_path: Path,
     token_ids: list[int],
-    blocks_per_row: int,
+    layer_input_blocks_per_row: int,
     rms_weight_tensor: str,
-    q_proj_tensor: str,
+    projection_tensor: str,
     output_rows: int,
     output_tile_rows: int,
     eps: float,
-) -> tuple[np.ndarray, np.ndarray, torch.Tensor, QProjInputInfo]:
-    if len(token_ids) != 1:
-        raise ValueError("formal q_proj runner currently validates decode sequence_length=1")
-
-    _, _, normed_hidden, layernorm_info = prepare_layernorm_inputs(
-        gguf_path=gguf_path,
-        token_ids=token_ids,
-        blocks_per_row=blocks_per_row,
-        rms_weight_tensor=rms_weight_tensor,
-        eps=eps,
-    )
+) -> tuple[np.ndarray, np.ndarray, torch.Tensor, Q4KLinearInputInfo]:
+    validate_q4k_linear_stage(stage)
+    if len(token_ids) not in {1, 8}:
+        raise ValueError("formal Q4_K linear supports decode S=1 or prefill S=8")
     index = load_gguf_index(gguf_path)
-    weight_entry = index.tensors[q_proj_tensor]
+    weight_entry = index.tensors[projection_tensor]
     if weight_entry.ggml_type != "Q4_K" or weight_entry.physical_dtype != "uint32":
-        raise ValueError(f"{q_proj_tensor} must be Q4_K uint32, got {weight_entry}")
+        raise ValueError(f"{projection_tensor} must be Q4_K uint32, got {weight_entry}")
     output_features, row_words = (int(dim) for dim in weight_entry.physical_shape)
     if output_features % output_rows != 0:
         raise ValueError(f"output_features={output_features} must be divisible by {output_rows}")
@@ -79,16 +88,15 @@ def prepare_q_proj_inputs(
         raise ValueError(f"Q4_K row word width must be a multiple of 36, got {row_words}")
     model_blocks_per_row = row_words // 36
     hidden_size = model_blocks_per_row * 256
-    if hidden_size != layernorm_info.hidden_size:
-        raise ValueError(
-            f"q_proj hidden_size={hidden_size} does not match "
-            f"layernorm hidden_size={layernorm_info.hidden_size}"
-        )
-    if blocks_per_row != model_blocks_per_row:
-        raise ValueError(
-            f"q_proj expects full rows with {model_blocks_per_row} Q4_K blocks, "
-            f"got {blocks_per_row}"
-        )
+    hidden, hidden_rocm, source_name, source_type, rms_name, rms_type = _prepare_linear_input(
+        stage=stage,
+        gguf_path=gguf_path,
+        token_ids=token_ids,
+        layer_input_blocks_per_row=layer_input_blocks_per_row,
+        rms_weight_tensor=rms_weight_tensor,
+        eps=eps,
+        hidden_size=hidden_size,
+    )
 
     payload = read_tensor_bytes(index.path, weight_entry, offset=0, size=weight_entry.nbytes)
     raw_blocks = np.frombuffer(payload, dtype=np.uint8).copy().reshape(
@@ -109,13 +117,17 @@ def prepare_q_proj_inputs(
         hidden_size=hidden_size,
         output_features=output_features,
     )
-    expected = reference(
-        normed_hidden.reshape(1, 1, hidden_size).to(device=rocm_device(), dtype=torch.float32)
-    ).reshape(1, output_features)
-    info = QProjInputInfo(
-        source=layernorm_info.source,
-        rms_weight=layernorm_info.rms_weight,
-        q_proj_weight=weight_entry,
+    expected = reference(hidden_rocm.reshape(1, len(token_ids), hidden_size)).reshape(
+        len(token_ids),
+        output_features,
+    )
+    info = Q4KLinearInputInfo(
+        stage=stage,
+        source_name=source_name,
+        source_type=source_type,
+        rms_weight_name=rms_name,
+        rms_weight_type=rms_type,
+        projection_weight=weight_entry,
         token_ids=token_ids,
         hidden_size=hidden_size,
         output_features=output_features,
@@ -125,11 +137,62 @@ def prepare_q_proj_inputs(
         weight_words=packed_weight.shape[1],
     )
     return (
-        np.ascontiguousarray(normed_hidden.detach().cpu().numpy().astype(np.float32, copy=False)),
+        hidden,
         np.ascontiguousarray(packed_weight),
         expected,
         info,
     )
+
+
+def _prepare_linear_input(
+    *,
+    stage: str,
+    gguf_path: Path,
+    token_ids: list[int],
+    layer_input_blocks_per_row: int,
+    rms_weight_tensor: str,
+    eps: float,
+    hidden_size: int,
+) -> tuple[np.ndarray, torch.Tensor, str, str, str, str]:
+    if stage in {"q_proj", "k_proj"}:
+        _, _, normed_hidden, layernorm_info = prepare_layernorm_inputs(
+            gguf_path=gguf_path,
+            token_ids=token_ids,
+            blocks_per_row=layer_input_blocks_per_row,
+            rms_weight_tensor=rms_weight_tensor,
+            eps=eps,
+        )
+        if hidden_size != layernorm_info.hidden_size:
+            raise ValueError(
+                f"{stage} hidden_size={hidden_size} does not match "
+                f"layernorm hidden_size={layernorm_info.hidden_size}"
+            )
+        return (
+            np.ascontiguousarray(normed_hidden.detach().cpu().numpy().astype(np.float32)),
+            normed_hidden.to(device=rocm_device(), dtype=torch.float32),
+            layernorm_info.source.name,
+            layernorm_info.source.ggml_type,
+            layernorm_info.rms_weight.name,
+            layernorm_info.rms_weight.ggml_type,
+        )
+    if stage == "o_proj":
+        hidden = deterministic_o_proj_input_rocm(token_ids=token_ids, hidden_size=hidden_size)
+        return (
+            np.ascontiguousarray(hidden.detach().cpu().numpy().astype(np.float32)),
+            hidden,
+            "deterministic_o_proj_input",
+            "F32",
+            "none",
+            "none",
+        )
+    raise ValueError(f"unsupported Q4_K linear stage: {stage}")
+
+
+def deterministic_o_proj_input_rocm(*, token_ids: list[int], hidden_size: int) -> torch.Tensor:
+    device = rocm_device()
+    tokens = torch.tensor(token_ids, device=device, dtype=torch.float32).reshape(-1, 1)
+    features = torch.arange(hidden_size, device=device, dtype=torch.float32).reshape(1, -1)
+    return torch.sin((tokens + 1.0) * 0.17 + (features + 1.0) * 0.013).to(torch.float32)
 
 
 def _append_q4k_scale_bits(
@@ -182,6 +245,7 @@ def run_on_npu(
     hidden: np.ndarray,
     packed_weight: np.ndarray,
     expected: torch.Tensor,
+    stage: str,
     output_rows: int,
     warmup: int,
     iterations: int,
@@ -207,7 +271,7 @@ def run_on_npu(
                 output_rows=output_rows,
                 expected_shape=expected_shape,
             )
-            check_close_rocm(actual, expected, rtol=rtol, atol=atol, label="q_proj")
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol, label=stage)
 
         for _ in range(warmup):
             actual = _run_output_chunks(
@@ -217,7 +281,7 @@ def run_on_npu(
                 output_rows=output_rows,
                 expected_shape=expected_shape,
             )
-            check_close_rocm(actual, expected, rtol=rtol, atol=atol, label="q_proj")
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol, label=stage)
 
         for _ in range(iterations):
             start = time.perf_counter()
@@ -229,7 +293,7 @@ def run_on_npu(
                 expected_shape=expected_shape,
             )
             latencies_ms.append((time.perf_counter() - start) * 1000.0)
-            check_close_rocm(actual, expected, rtol=rtol, atol=atol, label="q_proj")
+            check_close_rocm(actual, expected, rtol=rtol, atol=atol, label=stage)
     finally:
         backend.unload()
     return actual, latencies_ms
@@ -243,9 +307,10 @@ def _run_output_chunks(
     output_rows: int,
     expected_shape: tuple[int, ...],
 ) -> np.ndarray:
+    sequence_length = expected_shape[0]
     output_features = expected_shape[1]
     actual = np.zeros(expected_shape, dtype=np.float32)
-    output_chunk = np.zeros((1, output_rows), dtype=np.float32)
+    output_chunk = np.zeros((sequence_length, output_rows), dtype=np.float32)
     for row_offset in range(0, output_features, output_rows):
         output_chunk.fill(0)
         weight_chunk = np.ascontiguousarray(packed_weight[row_offset : row_offset + output_rows])
@@ -257,14 +322,15 @@ def _run_output_chunks(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile and run formal Q4_K q_proj kernel.")
+    parser = argparse.ArgumentParser(description="Compile and run formal Q4_K linear kernel.")
+    parser.add_argument("--stage", choices=Q4K_LINEAR_STAGES, default=DEFAULT_STAGE)
     parser.add_argument("--kernel-py", type=Path, required=True)
-    parser.add_argument("--function-name", default="run_q_proj")
+    parser.add_argument("--function-name")
     parser.add_argument("--gguf", type=Path, default=DEFAULT_GGUF)
     parser.add_argument("--token-ids", type=parse_token_ids, default=parse_token_ids("0"))
-    parser.add_argument("--blocks-per-row", type=int, default=4)
+    parser.add_argument("--blocks-per-row", type=int, default=DEFAULT_LAYER_INPUT_BLOCKS_PER_ROW)
     parser.add_argument("--rms-weight-tensor", default=DEFAULT_RMS_WEIGHT_TENSOR)
-    parser.add_argument("--q-proj-tensor", default=DEFAULT_Q_PROJ_TENSOR)
+    parser.add_argument("--projection-tensor")
     parser.add_argument("--output-rows", type=int, default=64)
     parser.add_argument("--output-tile-rows", type=int, default=16)
     parser.add_argument("--rms-norm-eps", type=float, default=1e-6)
@@ -277,32 +343,36 @@ def main() -> int:
     args = parser.parse_args()
 
     os.environ.setdefault("XRT_HACK_UNSECURE_LOADING_XCLBIN", "1")
-    hidden, packed_weight, expected, info = prepare_q_proj_inputs(
+    function_name = args.function_name or f"run_{args.stage}"
+    projection_tensor = args.projection_tensor or projection_weight_tensor(args.stage)
+    hidden, packed_weight, expected, info = prepare_q4k_linear_inputs(
+        stage=args.stage,
         gguf_path=args.gguf,
         token_ids=args.token_ids,
-        blocks_per_row=args.blocks_per_row,
+        layer_input_blocks_per_row=args.blocks_per_row,
         rms_weight_tensor=args.rms_weight_tensor,
-        q_proj_tensor=args.q_proj_tensor,
+        projection_tensor=projection_tensor,
         output_rows=args.output_rows,
         output_tile_rows=args.output_tile_rows,
         eps=args.rms_norm_eps,
     )
     sequence_length, hidden_size, output_features = _kernel_shape(
         args.kernel_py,
-        args.function_name,
+        function_name,
         args.output_rows,
         args.output_tile_rows,
     )
     if sequence_length != len(args.token_ids):
-        raise SystemExit("token count must match exported q_proj sequence length")
+        raise SystemExit(f"token count must match exported {args.stage} sequence length")
     if hidden_size != info.hidden_size:
-        raise SystemExit("blocks_per_row must match exported q_proj hidden size")
+        raise SystemExit(f"input width must match exported {args.stage} hidden size")
     if output_features != args.output_rows:
         raise SystemExit("compiled output rows must match Q4KLinearAirBuilder output shape")
 
-    print(f"input_source {info.source.name} {info.source.ggml_type}")
-    print(f"RMS weight {info.rms_weight.name} {info.rms_weight.ggml_type}")
-    print(f"Q4_K weight {info.q_proj_weight.name} {info.q_proj_weight.ggml_type}")
+    print(f"stage {info.stage}")
+    print(f"input_source {info.source_name} {info.source_type}")
+    print(f"RMS weight {info.rms_weight_name} {info.rms_weight_type}")
+    print(f"Q4_K weight {info.projection_weight.name} {info.projection_weight.ggml_type}")
     print(f"token_ids {','.join(str(v) for v in info.token_ids)}")
     print(f"hidden_size {info.hidden_size} output_features {info.output_features}")
     print(f"output_rows {info.output_rows} output_tile_rows {info.output_tile_rows}")
@@ -311,19 +381,20 @@ def main() -> int:
 
     source_mlir, aie_mlir, xclbin, insts, object_file = compile_q4k_linear_python_kernel(
         kernel_py=args.kernel_py,
-        function_name=args.function_name,
+        function_name=function_name,
         work_dir=args.work_dir,
-        instance_name=args.function_name,
+        instance_name=function_name,
         output_features=args.output_rows,
         output_tile_rows=args.output_tile_rows,
     )
     actual, latencies_ms = run_on_npu(
         xclbin=xclbin,
         insts=insts,
-        instance_name=args.function_name,
+        instance_name=function_name,
         hidden=hidden,
         packed_weight=packed_weight,
         expected=expected,
+        stage=args.stage,
         output_rows=args.output_rows,
         warmup=args.warmup,
         iterations=args.iterations,

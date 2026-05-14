@@ -166,9 +166,17 @@ def _stage_module_and_args(
         return EmbedTokensInputLayerNorm(model), (
             torch.zeros((1, sequence_length), dtype=torch.long, device="meta"),
         )
-    if stage in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+    if stage in {"q_proj", "k_proj", "v_proj"}:
         return cast(torch.nn.Module, getattr(attn, stage)), (
             torch.zeros((1, sequence_length, hidden_size), dtype=torch.float32, device="meta"),
+        )
+    if stage == "o_proj":
+        return cast(torch.nn.Module, getattr(attn, stage)), (
+            torch.zeros(
+                (1, sequence_length, q_heads * head_dim),
+                dtype=torch.float32,
+                device="meta",
+            ),
         )
     if stage == "q_norm_rope":
         return RMSNormRope(cast(torch.nn.Module, getattr(attn, "q_norm")), q_heads, head_dim), (

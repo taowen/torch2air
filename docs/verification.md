@@ -155,47 +155,20 @@ AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
 AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh input_layernorm
 
-AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1,2,3,4,5,6,7 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 
-AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
+AIR_DEVICE=npu2_4col TOKEN_IDS=0,1,2,3,4,5,6,7 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh k_proj
 
-AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-npu.sh v_proj
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-npu.sh v_proj
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qproj
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0,1 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv
-
-AIR_DEVICE=npu2_4col TOKEN_IDS=0 BLOCKS_PER_ROW=4 OUTPUT_ROWS=128 OUTPUT_TILE_ROWS=32 START_POSITION=1 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-pipeline-npu.sh embed_norm_qkv_rope
-
-AIR_DEVICE=npu2_4col BLOCKS_PER_ROW=1 NPU_ITERATIONS=1 \
-  scripts/run-quantized-qwen3-npu.sh embed_tokens_input_layernorm
+AIR_DEVICE=npu2_4col TOKEN_IDS=0 OUTPUT_ROWS=64 OUTPUT_TILE_ROWS=16 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh o_proj
 ```
 
 Inputs:
@@ -264,31 +237,13 @@ Verified checks:
   runs seven stage xclbins with shared `pyxrt.bo` handoff buffers. The verifier
   reads intermediate buffers only after the NPU chain finishes, then compares
   against PyTorch ROCm.
-- `attention_core` follows the same MLIR-AIR external-kernel style used by
-  upstream programming examples such as `softmax`: AIR owns
-  `air.launch`/`air.segment`/`air.herd`, L3-to-L1 channel movement, and L1 buffer lifetime;
-  `attention_core.o` owns the per-tile causal softmax and value accumulation.
-  The current template keeps one `4x128` Q/O tile resident, streams K and V
-  through one shared AIR FIFO channel, and updates online softmax state per
-  query row.
-- `scripts/run-quantized-qwen3-attention-npu.sh` is the standalone MLIR-AIR
-  learning spike for attention. It runs only the attention AIR artifact on the
-  real NPU and compares against a PyTorch ROCm reference, so AIR/channel/softmax
-  issues are not hidden by the larger Qwen3 pipeline.
-- `embed_tokens -> input_layernorm -> q/k/v -> rope_table -> q/k_norm_rope
-  -> attention_core` runs for four tokens with shared `pyxrt.bo`
-  handoff buffers. The attention input buffers are the `q_norm_rope`,
-  `k_norm_rope`, and `v_proj` device buffers; the host reads them only after the
-  chain finishes for verification.
-- The `quantized_qwen3` reference path is generated from the same exported
-  module boundaries. `src/models/quantized_qwen3/reference.py` loads the local
-  `Qwen/Qwen3-0.6B` safetensors model on PyTorch ROCm and exposes
-  `run_embed_tokens`, `run_input_layernorm`,
-  `run_embed_tokens_input_layernorm`, `run_q_proj`, `run_k_proj`, and
-  `run_v_proj`. `run_pipeline.py` builds the RoPE, q/k norm+RoPE, and causal
-  attention references from those same PyTorch ROCm tensors. Expected tensors,
-  `allclose`, and max-abs metrics are computed on the ROCm device. NumPy is
-  used only for GGUF byte slicing and XRT host buffers.
+- Attention and pipeline verification from the removed `legacy/` tree is not a
+  production source. `v_proj`, RoPE, attention core, and full self-attention
+  must be re-established through fresh Python AIR experiments before new
+  verification records are added here.
+- The current `quantized_qwen3` reference path computes expected tensors,
+  `allclose`, and max-abs metrics with torch tensors on the ROCm device. NumPy
+  is used only for GGUF byte slicing and XRT host buffers.
 
 Latest real NPU results:
 
