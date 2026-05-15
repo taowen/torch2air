@@ -7,6 +7,7 @@ import subprocess
 import sys
 import sysconfig
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -15,6 +16,8 @@ from torch2air.export.input_layernorm import InputLayerNormAirBuilder
 from torch2air.export.q4k_embedding import Q4KEmbeddingAirBuilder
 from torch2air.export.q4k_linear import Q4KLinearAirBuilder
 from torch2air.export.q6k_linear import Q6KLinearAirBuilder
+from torch2air.export.rope import BF16_ELEMENTWISE_LINK_OBJECT
+from torch2air.export.rope import RopeExportAirBuilder
 
 
 AIR_OPT_DIAGNOSTIC_FLAGS = (
@@ -25,6 +28,23 @@ Q4K_LINEAR_KERNEL_SOURCE = Path(__file__).resolve().parents[1] / "export" / "ker
 Q4K_LINEAR_LINK_OBJECT = "q4k_linear.o"
 Q6K_LINEAR_KERNEL_SOURCE = Path(__file__).resolve().parents[1] / "export" / "kernels" / "q6k_linear.cc"
 Q6K_LINEAR_LINK_OBJECT = "q6k_linear.o"
+BF16_ELEMENTWISE_KERNEL_SOURCE = (
+    Path(__file__).resolve().parents[1] / "export" / "kernels" / "bf16_elementwise.cc"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledRopeKernels:
+    rms_instance_name: str
+    rms_source_mlir: Path
+    rms_aie_mlir: Path
+    rms_xclbin: Path
+    rms_insts: Path
+    rope_instance_name: str
+    rope_source_mlir: Path
+    rope_aie_mlir: Path
+    rope_xclbin: Path
+    rope_insts: Path
 
 
 def compile_q4k_embedding_python_kernel(
@@ -178,6 +198,74 @@ def compile_q6k_linear_python_kernel(
     return source_mlir, aie_mlir, xclbin, insts, object_file
 
 
+def compile_rope_export_python_kernel(
+    *,
+    kernel_py: Path,
+    function_name: str,
+    work_dir: Path,
+    instance_name: str,
+    eps: float,
+) -> CompiledRopeKernels:
+    _, _, peano = prepend_air_tool_paths()
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    builder = RopeExportAirBuilder(function_name=instance_name)
+    load_kernel_function(kernel_py, function_name)(builder)
+    _, head_count, head_dim = builder.rope_shape()
+    rms_instance_name = f"{instance_name}_rms"
+    rope_instance_name = f"{instance_name}_rope"
+    rms_source_mlir = work_dir / f"{rms_instance_name}.air.mlir"
+    rope_source_mlir = work_dir / f"{rope_instance_name}.air.mlir"
+    rms_source_mlir.write_text(builder.render_rms_norm_air(function_name=rms_instance_name))
+    rope_source_mlir.write_text(builder.render_rope_air(function_name=rope_instance_name))
+    compile_bf16_elementwise_object(
+        work_dir=work_dir,
+        peano_install_dir=peano,
+        head_count=head_count,
+        head_dim=head_dim,
+        eps=eps,
+    )
+    rms_aie_mlir = lower_scf_air_to_aie(
+        source_mlir=rms_source_mlir,
+        work_dir=work_dir,
+        stem=rms_instance_name,
+        herd_rows=builder.herd_rows(),
+        herd_cols=builder.herd_cols(),
+    )
+    _, rms_xclbin, rms_insts = compile_runtime(
+        aie_mlir=rms_aie_mlir,
+        work_dir=work_dir,
+        instance_name=rms_instance_name,
+        peano_install_dir=str(peano),
+    )
+    rope_aie_mlir = lower_scf_air_to_aie(
+        source_mlir=rope_source_mlir,
+        work_dir=work_dir,
+        stem=rope_instance_name,
+        herd_rows=builder.herd_rows(),
+        herd_cols=builder.herd_cols(),
+    )
+    _, rope_xclbin, rope_insts = compile_runtime(
+        aie_mlir=rope_aie_mlir,
+        work_dir=work_dir,
+        instance_name=rope_instance_name,
+        peano_install_dir=str(peano),
+    )
+    return CompiledRopeKernels(
+        rms_instance_name=rms_instance_name,
+        rms_source_mlir=rms_source_mlir,
+        rms_aie_mlir=rms_aie_mlir,
+        rms_xclbin=rms_xclbin,
+        rms_insts=rms_insts,
+        rope_instance_name=rope_instance_name,
+        rope_source_mlir=rope_source_mlir,
+        rope_aie_mlir=rope_aie_mlir,
+        rope_xclbin=rope_xclbin,
+        rope_insts=rope_insts,
+    )
+
+
 def compile_q4k_linear_object(
     *,
     work_dir: Path,
@@ -252,6 +340,43 @@ def compile_q6k_linear_object(
     return object_file
 
 
+def compile_bf16_elementwise_object(
+    *,
+    work_dir: Path,
+    peano_install_dir: Path,
+    head_count: int,
+    head_dim: int,
+    eps: float,
+) -> Path:
+    object_file = work_dir / BF16_ELEMENTWISE_LINK_OBJECT
+    aieopt_dir = Path(installed_tool("aie-opt", "MLIR_AIE_INSTALL_DIR")).resolve().parent.parent
+    target_triple = f"{os.environ.get('AIE_TARGET', 'aie2p')}-none-unknown-elf"
+    subprocess.run(
+        [
+            str(peano_install_dir / "bin" / "clang++"),
+            "-O2",
+            "-std=c++20",
+            f"--target={target_triple}",
+            "-Wno-parentheses",
+            "-Wno-attributes",
+            "-Wno-macro-redefined",
+            "-Wno-empty-body",
+            "-Wno-unused-command-line-argument",
+            "-DNDEBUG",
+            f"-I{aieopt_dir / 'include'}",
+            f"-DHEAD_COUNT={head_count}",
+            f"-DHEAD_DIM={head_dim}",
+            f"-DRMS_NORM_EPS={eps:.9g}f",
+            "-c",
+            str(BF16_ELEMENTWISE_KERNEL_SOURCE),
+            "-o",
+            str(object_file),
+        ],
+        check=True,
+    )
+    return object_file
+
+
 def prepend_air_tool_paths() -> tuple[Path, Path, Path]:
     site_packages = Path(sysconfig.get_paths()["purelib"])
     mlir_air = Path(os.environ.get("MLIR_AIR_INSTALL_DIR", site_packages / "mlir_air"))
@@ -293,17 +418,26 @@ def lower_scf_air_to_aie(
             str(dma_mlir),
         ],
     )
-    run_air_opt(
-        [
-            str(air_opt),
-            str(dma_mlir),
-            *AIR_OPT_DIAGNOSTIC_FLAGS,
+    if herd_rows == 1:
+        channel_pipeline = [
             "--air-dependency",
             "--air-dma-to-channel",
             "--canonicalize",
             "--cse",
             f"--air-place-herds=num-rows={herd_rows} num-cols={herd_cols} "
             "row-anchor=2 col-anchor=0",
+        ]
+    else:
+        channel_pipeline = [
+            "--pass-pipeline="
+            + air_multirow_optimization_pipeline(herd_rows=herd_rows, herd_cols=herd_cols)
+        ]
+    run_air_opt(
+        [
+            str(air_opt),
+            str(dma_mlir),
+            *AIR_OPT_DIAGNOSTIC_FLAGS,
+            *channel_pipeline,
             "-o",
             str(channel_mlir),
         ],
@@ -323,6 +457,47 @@ def lower_scf_air_to_aie(
         ],
     )
     return aie_mlir
+
+
+def air_multirow_optimization_pipeline(*, herd_rows: int, herd_cols: int) -> str:
+    passes = [
+        "air-dependency",
+        "air-hoist-dma-in-accum-pattern",
+        "air-broadcast-detection",
+        "air-specialize-dma-broadcast",
+        "air-dma-to-channel",
+        "canonicalize",
+        "cse",
+        "air-dependency-canonicalize",
+        "canonicalize",
+        "cse",
+        "air-isolate-async-dma-loop-nests",
+        "canonicalize",
+        "cse",
+        "air-fuse-channels",
+        "canonicalize",
+        "cse",
+        "func.func(air-split-l2-memref)",
+        "canonicalize",
+        "cse",
+        "air-isolate-async-dma-loop-nests",
+        "canonicalize",
+        "cse",
+        "func.func(air-fuse-alloc-dealloc)",
+        "func.func(air-shrink-memref-sizes-by-access)",
+        "func.func(convert-linalg-to-loops)",
+        "func.func(air-opt-memtile-dma-bds{device=npu2_4col})",
+        "canonicalize",
+        "cse",
+        (
+            "air-place-herds{"
+            f"num-rows={herd_rows} num-cols={herd_cols} row-anchor=2 col-anchor=0"
+            "}"
+        ),
+        "canonicalize",
+        "cse",
+    ]
+    return f"builtin.module({','.join(passes)})"
 
 
 def compile_runtime(

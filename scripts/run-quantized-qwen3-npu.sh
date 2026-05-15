@@ -68,6 +68,20 @@ case "$STAGE" in
       --warmup "$NPU_WARMUP" \
       --iterations "$NPU_ITERATIONS"
     ;;
+  q_norm_rope|k_norm_rope)
+    START_POSITION="${START_POSITION:-0}"
+    "$UV" run --no-sync python -m models.quantized_qwen3.run_rope \
+      --stage "$STAGE" \
+      --kernel-py "$EXPORT_DIR/run_${STAGE}.py" \
+      --gguf "$GGUF_PATH" \
+      --token-ids "$TOKEN_IDS" \
+      --start-position "$START_POSITION" \
+      --blocks-per-row "$BLOCKS_PER_ROW" \
+      --rms-norm-eps "$RMS_NORM_EPS" \
+      --work-dir "$WORK_DIR" \
+      --warmup "$NPU_WARMUP" \
+      --iterations "$NPU_ITERATIONS"
+    ;;
   *)
     echo "Unsupported quantized_qwen3 NPU stage: $STAGE" >&2
     exit 2

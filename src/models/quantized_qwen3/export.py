@@ -179,24 +179,26 @@ def _stage_module_and_args(
             ),
         )
     if stage == "q_norm_rope":
-        return RMSNormRope(cast(torch.nn.Module, getattr(attn, "q_norm")), q_heads, head_dim), (
+        norm = cast(torch.nn.Module, getattr(attn, "q_norm")).to(dtype=torch.bfloat16)
+        return RMSNormRope(norm, q_heads, head_dim), (
             torch.zeros(
                 (1, sequence_length, q_heads * head_dim),
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device="meta",
             ),
-            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
-            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.bfloat16, device="meta"),
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.bfloat16, device="meta"),
         )
     if stage == "k_norm_rope":
-        return RMSNormRope(cast(torch.nn.Module, getattr(attn, "k_norm")), kv_heads, head_dim), (
+        norm = cast(torch.nn.Module, getattr(attn, "k_norm")).to(dtype=torch.bfloat16)
+        return RMSNormRope(norm, kv_heads, head_dim), (
             torch.zeros(
                 (1, sequence_length, kv_heads * head_dim),
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device="meta",
             ),
-            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
-            torch.zeros((1, sequence_length, head_dim), dtype=torch.float32, device="meta"),
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.bfloat16, device="meta"),
+            torch.zeros((1, sequence_length, head_dim), dtype=torch.bfloat16, device="meta"),
         )
     if stage == "attention_core":
         return AttentionCore(q_heads, kv_heads, head_dim), (

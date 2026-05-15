@@ -32,7 +32,16 @@ external C++ 函数使用扁平 pointer ABI：
 extern "C" void tile_body(float *input, uint32_t *weight, float *output);
 ```
 
-object file 必须放在 `aiecc` 工作目录，文件名要和 `link_with` 一致。
+object file 必须放在 backend 工作目录的 `air_project/` 下，文件名要和 `link_with` 一致。
+如果用 Makefile，通常流程是：
+
+```text
+build/rope.o -> build/air_project/rope.o
+cd build
+python kernel.py
+```
+
+Python 启动脚本不能偷偷改变 cwd，否则 backend 会在错误目录创建 `air_project/`。
 
 ## Lowering 规则
 
@@ -41,3 +50,5 @@ object file 必须放在 `aiecc` 工作目录，文件名要和 `link_with` 一�
   重名。
 - Python AIR 仍然拥有 stage boundary、tile shape、memory spaces 和 DMA；`.cc` 文件只写
   tile-local compute body。
+- `link_with` 应挂在 `func.func private` declaration 上。只依赖 core/herd 上的
+  `link_with` 会触发 deprecated warning，后续工具链可能不再支持。

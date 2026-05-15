@@ -219,7 +219,7 @@ def check_close_rocm(
     label: str = "NPU output",
 ) -> None:
     actual_t = torch.as_tensor(
-        np.ascontiguousarray(actual),
+        float32_host_array(actual),
         device=expected.device,
         dtype=torch.float32,
     )
@@ -240,11 +240,15 @@ def check_close_rocm(
 
 def max_abs_rocm(actual: np.ndarray, expected: torch.Tensor) -> float:
     actual_t = torch.as_tensor(
-        np.ascontiguousarray(actual),
+        float32_host_array(actual),
         device=expected.device,
         dtype=torch.float32,
     )
     return float(torch.max(torch.abs(actual_t - expected.to(torch.float32))).item())
+
+
+def float32_host_array(array: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(array.astype(np.float32, copy=False))
 
 
 def first_values(tensor: torch.Tensor, count: int = 8) -> list[float]:

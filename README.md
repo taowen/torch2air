@@ -129,9 +129,19 @@ AIR_DEVICE=npu2 TOKEN_IDS=0,1,2,3,4,5,6,7 NPU_ITERATIONS=1 \
   scripts/run-quantized-qwen3-npu.sh q_proj
 ```
 
-RoPE, attention core, and full self-attention are not production entrypoints
-yet. Add them only after they have current Python AIR implementations and real
-NPU verification.
+Run RoPE through the pure exported aten sequence:
+
+```bash
+AIR_DEVICE=npu2 TOKEN_IDS=0 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh q_norm_rope
+
+AIR_DEVICE=npu2 TOKEN_IDS=0 NPU_ITERATIONS=1 \
+  scripts/run-quantized-qwen3-npu.sh k_norm_rope
+```
+
+Attention core and full self-attention are not production entrypoints yet. Add
+them only after they have current Python AIR implementations and real NPU
+verification.
 
 ## NPU Smoke Test
 
